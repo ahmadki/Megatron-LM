@@ -128,9 +128,6 @@ def _get_param_groups(
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
-            # TODO: Figure out how to support backwards compatibility with param_groups
-            # with old keys (*, is_decoupled_lr).
-
             # TODO: Make sure there is a way to support old no_weight_decay_func functionality
             # and default_skip_embedding_weight_decay:
             #     or (default_skip_embedding_weight_decay and "embedding" in name)
@@ -172,27 +169,24 @@ def _get_param_groups(
             assert params == []
         else:
             config = configs_map[key]
+            assert config is not None
+
+        # TODO: Remove "backwards compatible" fields below eventually.
         param_group = {
             'params': params,
-            'wd_mult': wd_mult,
+            'wd_mult': wd_mult,  # For backwards compatibility.
             'lr_mult': 1.0,  # For backwards compatibility.
             'is_expert_parallel': is_expert_parallel,
-            'is_decoupled_lr': False,  # For backwards compatibility. Remove eventually.
-            'config': config,
+            'is_decoupled_lr': False,  # For backwards compatibility.
         }
-        # Ensure param_group has required keys for matching when loading optimizer state
-        # See MegatronOptimizer._filter_and_reorder_param_groups.
-        # TODO: Re-add this assertion.
-        # assert set(param_group.keys()) - set(param_group_identifier_keys) == {'params'}
-        param_groups.append(param_group)
 
-    # Update `max_lr` and `min_lr` in param_group.
-    # TODO: Also add functionality to update weight_decay?
-    for param_group in param_groups:
-        config_for_param = param_group['config']
-        if config_for_param is not None:
-            param_group['max_lr'] = config_for_param.lr
-            param_group['min_lr'] = config_for_param.min_lr
+        # Stick relevant fields into param_group from config object.
+        if config is not None:
+            param_group['max_lr'] = config.lr
+            param_group['min_lr'] = config.min_lr
+            # TODO: Add other relevant arguments (e.g., weight decay, optimizer)
+            # here as well.
+        param_groups.append(param_group)
 
     return param_groups
 
