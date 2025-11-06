@@ -1823,6 +1823,18 @@ class TransformerConfig(ModelParallelConfig):
                 f" but got {self.transformer_impl=}."
             )
 
+            if self.cp_comm_type is not None:
+                all_cp_comm_types_are_p2p = (
+                    all(item == "p2p" for item in self.cp_comm_type)
+                    if isinstance(self.cp_comm_type, list)
+                    else self.cp_comm_type == "p2p"
+                )
+                if not all_cp_comm_types_are_p2p:
+                    raise ValueError(
+                        f"fallback_to_eager_attn only supports p2p communication type "
+                        f"for context parallelism, but got {self.cp_comm_type=} instead."
+                    )
+
 
 @dataclass
 class MLATransformerConfig(TransformerConfig):
