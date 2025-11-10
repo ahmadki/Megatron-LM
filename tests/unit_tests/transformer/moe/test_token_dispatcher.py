@@ -417,10 +417,7 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
-@pytest.mark.skipif(
-    True,
-    reason="Deep EP and Hybrid EP are not available",
-)
+@pytest.mark.skipif(True, reason="Deep EP and Hybrid EP are not available")
 class TestFlexDispatcher:
     def setup_method(self, method):
         pass
