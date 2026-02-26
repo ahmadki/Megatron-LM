@@ -1,0 +1,67 @@
+# OpenTelemetry Collector configuration for Megatron-LM
+#
+# Handles the metrics pipeline only.  Traces go directly to Jaeger v2
+# (which natively accepts OTLP).
+#
+# Pipeline:
+#   Megatron (OTLP metrics) ──► Collector ──► Prometheus scrape endpoint
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Cap memory usage; drops data rather than OOM-crashing.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # Batch metrics before exporting — improves throughput.
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+  # Attach host-level resource attributes (hostname, OS, etc.).
+  resourcedetection:
+    detectors: [env, system]
+    timeout: 5s
+    override: false
+
+exporters:
+  # Expose metrics as a Prometheus scrape endpoint (Prometheus polls this).
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    send_timestamps: true
+    # After a training job ends, keep last-seen metric values for 3 h
+    # so Grafana doesn't show gaps between runs.
+    metric_expiration: 3h
+    # Promote resource attributes (service.name, host.name, …) to labels.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Debug: uncomment to log every received metric to the collector stdout.
+  # debug:
+  #   verbosity: detailed
+
+extensions:
+  # Health-check endpoint — used by docker-compose healthcheck.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+
+  telemetry:
+    logs:
+      level: warn
+
+  pipelines:
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters:  [prometheus]

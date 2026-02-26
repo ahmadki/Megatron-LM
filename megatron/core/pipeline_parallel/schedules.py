@@ -38,6 +38,11 @@ from .combined_1f1b import (
 )
 from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
+# OTel: managed_span handles group-gating, attach/detach, and span lifecycle.
+# It is a zero-overhead no-op when the span group is not enabled.
+from megatron.core.telemetry.helpers import managed_span as _otel_managed_span
+
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -401,49 +406,51 @@ def forward_step(
     """
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
-    if config.timers is not None:
-        config.timers('forward-compute', log_level=2).start()
+    _fwd_attrs = {} if current_microbatch is None else {'megatron.microbatch_id': current_microbatch}
+    with _otel_managed_span('microbatch', 'megatron.microbatch.forward', **_fwd_attrs):
+        if config.timers is not None:
+            config.timers('forward-compute', log_level=2).start()
 
-    if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
-        model.set_is_first_microbatch()
-    if current_microbatch is not None:
-        set_current_microbatch(model, current_microbatch)
+        if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
+            model.set_is_first_microbatch()
+        if current_microbatch is not None:
+            set_current_microbatch(model, current_microbatch)
 
-    unwrap_output_tensor = False
-    if not isinstance(input_tensor, list):
-        input_tensor = [input_tensor]
-        unwrap_output_tensor = True
+        unwrap_output_tensor = False
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_output_tensor = True
 
-    set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
-    set_input_tensor(input_tensor)
+        set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+        set_input_tensor(input_tensor)
 
-    if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
-    else:
-        context_manager = contextlib.nullcontext()
-    with context_manager:
-        if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+        if config.enable_autocast:
+            context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
         else:
-            output_tensor, loss_func = forward_step_func(
-                data_iterator, model, checkpoint_activations_microbatch
-            )
-    output_tensor, num_tokens = forward_step_calc_loss(
-        model,
-        output_tensor,
-        loss_func,
-        config,
-        vp_stage,
-        collect_non_loss_data,
-        num_microbatches,
-        forward_data_store,
-        cp_group_size,
-        is_last_stage,
-    )
+            context_manager = contextlib.nullcontext()
+        with context_manager:
+            if checkpoint_activations_microbatch is None:
+                output_tensor, loss_func = forward_step_func(data_iterator, model)
+            else:
+                output_tensor, loss_func = forward_step_func(
+                    data_iterator, model, checkpoint_activations_microbatch
+                )
+        output_tensor, num_tokens = forward_step_calc_loss(
+            model,
+            output_tensor,
+            loss_func,
+            config,
+            vp_stage,
+            collect_non_loss_data,
+            num_microbatches,
+            forward_data_store,
+            cp_group_size,
+            is_last_stage,
+        )
 
-    if unwrap_output_tensor:
-        return output_tensor, num_tokens
-    return [output_tensor], num_tokens
+        if unwrap_output_tensor:
+            return output_tensor, num_tokens
+        return [output_tensor], num_tokens
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -459,55 +466,56 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
 
-    if config.timers is not None:
-        config.timers('backward-compute', log_level=2).start()
+    with _otel_managed_span('microbatch', 'megatron.microbatch.backward'):
+        if config.timers is not None:
+            config.timers('backward-compute', log_level=2).start()
 
-    # Retain the grad on the input_tensor.
-    unwrap_input_tensor_grad = False
-    if not isinstance(input_tensor, list):
-        input_tensor = [input_tensor]
-        unwrap_input_tensor_grad = True
-    for x in input_tensor:
-        if x is not None:
-            x.retain_grad()
-
-    if not isinstance(output_tensor, list):
-        output_tensor = [output_tensor]
-    if not isinstance(output_tensor_grad, list):
-        output_tensor_grad = [output_tensor_grad]
-
-    # Backward pass.
-    if output_tensor_grad[0] is None and config.grad_scale_func is not None:
-        output_tensor[0] = config.grad_scale_func(output_tensor[0])
-
-    # In multi-modal models like VLM, some batches may not have images.
-    # When no image is present, the vision encoder (as a separate pipeline stage)
-    # will not participate in the computation.
-    # This results in a tensor that does not require gradients.
-    # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    if output_tensor[0].requires_grad:
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
-        else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
-
-    # Collect the grad of the input_tensor.
-    input_tensor_grad = [None]
-    if input_tensor is not None:
-        input_tensor_grad = []
+        # Retain the grad on the input_tensor.
+        unwrap_input_tensor_grad = False
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_input_tensor_grad = True
         for x in input_tensor:
-            if x is None:
-                input_tensor_grad.append(None)
+            if x is not None:
+                x.retain_grad()
+
+        if not isinstance(output_tensor, list):
+            output_tensor = [output_tensor]
+        if not isinstance(output_tensor_grad, list):
+            output_tensor_grad = [output_tensor_grad]
+
+        # Backward pass.
+        if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+            output_tensor[0] = config.grad_scale_func(output_tensor[0])
+
+        # In multi-modal models like VLM, some batches may not have images.
+        # When no image is present, the vision encoder (as a separate pipeline stage)
+        # will not participate in the computation.
+        # This results in a tensor that does not require gradients.
+        # In such cases, we intentionally skip the backward pass while preserving zero gradients.
+        if output_tensor[0].requires_grad:
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor[0], output_tensor_grad[0])
             else:
-                input_tensor_grad.append(x.grad)
+                torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
-    if unwrap_input_tensor_grad:
-        input_tensor_grad = input_tensor_grad[0]
+        # Collect the grad of the input_tensor.
+        input_tensor_grad = [None]
+        if input_tensor is not None:
+            input_tensor_grad = []
+            for x in input_tensor:
+                if x is None:
+                    input_tensor_grad.append(None)
+                else:
+                    input_tensor_grad.append(x.grad)
 
-    if config.timers is not None:
-        config.timers('backward-compute').stop()
+        if unwrap_input_tensor_grad:
+            input_tensor_grad = input_tensor_grad[0]
 
-    return input_tensor_grad
+        if config.timers is not None:
+            config.timers('backward-compute').stop()
+
+        return input_tensor_grad
 
 
 def check_first_val_step(first_val_step, forward_only, cond):

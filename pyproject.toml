@@ -81,7 +81,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api~=1.39.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "flash-linear-attention~=0.4.0",
@@ -99,13 +99,19 @@ dev = [
     "openai",
 ]
 
+otel = [
+    "opentelemetry-sdk>=1.39.1",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.39.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.39.1",
+]
+
 lts = [
     "tqdm",
     "einops~=0.8",
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "multi-storage-client~=0.27",
-    "opentelemetry-api~=1.33.1",
+    "opentelemetry-api~=1.39.1",
     "mamba-ssm~=2.2",
     "causal-conv1d~=1.5",
     "nv-grouped-gemm~=1.1",
