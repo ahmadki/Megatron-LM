@@ -380,23 +380,9 @@ class MetadataView:
                 pickle, references a forbidden class, or describes a chunk grid
                 that does not tile its tensor.
         """
-        path = Path(iter_dir) / METADATA_FILE
-        try:
-            payload = path.read_bytes()
-        except OSError as err:
-            raise IntegrityError(f"cannot read {path}: {err.strerror or err}") from err
-        unpickler = SafeMetadataUnpickler(io.BytesIO(payload))
-        try:
-            loaded = unpickler.load()
-        except Exception as err:  # parsing untrusted bytes can fail in any way: corrupt file
-            raise IntegrityError(f"cannot unpickle {path}: {type(err).__name__}: {err}") from err
-        metadata = _coerce_metadata(loaded, path)
-        torch_compat.drop_saver_plans(metadata)
+        loaded = read_metadata_file(Path(iter_dir))
         return cls(
-            Path(iter_dir),
-            metadata,
-            stubbed=frozenset(unpickler.stubbed),
-            metadata_sha256=hashlib.sha256(payload).hexdigest(),
+            Path(iter_dir), loaded.metadata, stubbed=loaded.stubbed, metadata_sha256=loaded.sha256
         )
 
     def fingerprint(self) -> str:
@@ -432,6 +418,45 @@ class MetadataView:
             storage_data={r.index: r.info for k in wanted for r in self._records[k]},
             planner_data=planner_data,
         )
+
+
+@dataclass(frozen=True)
+class LoadedMetadata:
+    """A ``.metadata`` file unpickled with :class:`SafeMetadataUnpickler`.
+
+    Attributes:
+        metadata: The DCP metadata (saver plan attachments dropped).
+        stubbed: Qualified names of the classes replaced by stubs.
+        sha256: SHA-256 of the file as read.
+    """
+
+    metadata: Metadata
+    stubbed: frozenset[str]
+    sha256: str
+
+
+def read_metadata_file(iter_dir: Path) -> LoadedMetadata:
+    """Read and safely unpickle ``iter_dir/.metadata``, without validating its tables.
+
+    Raises:
+        IntegrityError: The file is missing, unreadable, not a DCP metadata
+            pickle, or references a forbidden class.
+    """
+    path = iter_dir / METADATA_FILE
+    try:
+        payload = path.read_bytes()
+    except OSError as err:
+        raise IntegrityError(f"cannot read {path}: {err.strerror or err}") from err
+    unpickler = SafeMetadataUnpickler(io.BytesIO(payload))
+    try:
+        loaded = unpickler.load()
+    except Exception as err:  # parsing untrusted bytes can fail in any way: corrupt file
+        raise IntegrityError(f"cannot unpickle {path}: {type(err).__name__}: {err}") from err
+    metadata = _coerce_metadata(loaded, path)
+    torch_compat.drop_saver_plans(metadata)
+    return LoadedMetadata(
+        metadata, frozenset(unpickler.stubbed), hashlib.sha256(payload).hexdigest()
+    )
 
 
 class CachedMetadataFileSystemReader(FileSystemReader):

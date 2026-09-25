@@ -12,6 +12,7 @@ they can be planned from metadata alone and pickled to worker processes.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -128,3 +129,47 @@ def copy_pieces(entry: TensorEntry) -> tuple[Piece, ...]:
         )
         for chunk in entry.chunks
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedTensor:
+    """What the merged output must hold for one tensor.
+
+    Attributes:
+        key: Output tensor key.
+        global_shape: Its shape.
+        dtype: Its element type.
+        chunks: The planned chunk grid, sorted by offsets; it tiles the tensor.
+    """
+
+    key: str
+    global_shape: tuple[int, ...]
+    dtype: torch.dtype
+    chunks: tuple[Region, ...]
+
+
+def expected_tensors(pieces: Iterable[Piece]) -> dict[str, ExpectedTensor]:
+    """The output tensors a set of pieces describes, by key (sorted).
+
+    Raises:
+        InternalError: Pieces of one key disagree on its shape or dtype, or
+            their chunks do not tile the tensor exactly.
+    """
+    grouped: dict[str, list[Piece]] = {}
+    for piece in pieces:
+        grouped.setdefault(piece.key, []).append(piece)
+    expected = {}
+    for key in sorted(grouped):
+        first = grouped[key][0]
+        for piece in grouped[key]:
+            if (piece.global_shape, piece.dtype) != (first.global_shape, first.dtype):
+                raise InternalError(
+                    f"pieces of {key} disagree: {first.global_shape} {first.dtype} "
+                    f"and {piece.global_shape} {piece.dtype}"
+                )
+        chunks = tuple(sorted((p.chunk for p in grouped[key]), key=lambda r: r.offsets))
+        defect = find_tiling_defect(chunks, first.global_shape)
+        if defect is not None:
+            raise InternalError(f"the planned chunks of {key} do not tile it: {defect}")
+        expected[key] = ExpectedTensor(key, first.global_shape, first.dtype, chunks)
+    return expected

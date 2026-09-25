@@ -33,6 +33,7 @@ The public, stable fields ``Metadata.state_dict_metadata`` and
 from __future__ import annotations
 
 import copy
+import dataclasses
 import threading
 import warnings
 from collections.abc import Mapping, Sequence
@@ -47,6 +48,7 @@ from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     Metadata,
     MetadataIndex,
+    StorageMeta,
     TensorProperties,
 )
 from torch.distributed.checkpoint.planner import (
@@ -119,6 +121,54 @@ def storage_records(metadata: Metadata) -> list[StorageRecord]:
         )
         records.append(StorageRecord(index.fqn, offsets, location, index, info))
     return records
+
+
+def relocated_record(
+    record: StorageRecord, relative_path: str, index_hint: int | None
+) -> tuple[Any, Any]:
+    """The ``storage_data`` entry of ``record`` moved to data file ``relative_path``.
+
+    Returns:
+        ``(MetadataIndex, _StorageInfo)``; the index carries ``index_hint`` (the
+        chunk's position in its tensor's chunk list) and the storage info keeps
+        its offset, length and transform descriptors.
+    """
+    if record.offsets is None:
+        index = MetadataIndex(record.key)
+    else:
+        index = MetadataIndex(record.key, record.offsets, index_hint)
+    return index, dataclasses.replace(record.info, relative_path=relative_path)
+
+
+def build_metadata(
+    state_dict_metadata: dict[str, Any],
+    storage_data: dict[Any, Any],
+    planner_data: Any,
+    *,
+    checkpoint_id: str,
+    save_id: str,
+    version: str | None,
+) -> Metadata:
+    """A new ``Metadata`` with fresh storage identity.
+
+    ``version`` is recorded only if the installed torch's ``Metadata`` has that
+    field (torch 2.10 and newer); nothing else, in particular no saver plan
+    attachment, is carried over.
+    """
+    metadata = Metadata(
+        state_dict_metadata=state_dict_metadata,
+        planner_data=planner_data,
+        storage_data=storage_data,
+        storage_meta=StorageMeta(checkpoint_id=checkpoint_id, save_id=save_id),
+    )
+    if version is not None and metadata_has_version_field():
+        metadata.version = version
+    return metadata
+
+
+def metadata_has_version_field() -> bool:
+    """Whether the installed torch's ``Metadata`` records the DCP format version."""
+    return any(field.name == "version" for field in dataclasses.fields(Metadata))
 
 
 def metadata_version(metadata: Metadata) -> str | None:

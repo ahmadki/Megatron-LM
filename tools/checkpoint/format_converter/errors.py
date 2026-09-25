@@ -50,6 +50,9 @@ FC_R19 = "FC-R19"
 FC_A05 = "FC-A05"
 """``--from`` names a different format than the one detected from the store."""
 
+FC_E02 = "FC-E02"
+"""The staging directory is not on the destination's filesystem (hard links fail)."""
+
 MAX_LISTED_KEYS = 8
 """Number of offending keys printed in a refusal line before it is abbreviated."""
 
