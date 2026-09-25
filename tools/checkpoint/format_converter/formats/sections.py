@@ -1,63 +1,48 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Coarse key sections and a per-store census, by format-specific prefix rules.
+"""Key sections and a per-store census.
 
-The sections are descriptive (``inspect`` output); conversion uses its own,
-exact key grammar.
+torch_dist keys are classified by the exact rules of the torch_dist adapter
+(the ones conversion uses); fsdp_dtensor keys by descriptive prefix rules.
 """
 
 from __future__ import annotations
 
-import enum
 import re
 from collections import Counter
 from dataclasses import dataclass
 
 from ..engine.metadata import MetadataView, StoredChunk
-from .detect import (
-    FSDP_COMMON_ITEMS,
-    FSDP_DTENSOR,
-    FSDP_OPTIONAL_COMMON_ITEMS,
-    TORCH_DIST,
-    TORCH_DIST_COMMON_PREFIX,
-)
+from . import torch_dist
+from .base import Section
+from .detect import FSDP_COMMON_ITEMS, FSDP_DTENSOR, FSDP_OPTIONAL_COMMON_ITEMS, TORCH_DIST
 
-
-class Section(enum.Enum):
-    """Coarse role of a key in a store."""
-
-    MODEL = "model"
-    OPTIMIZER_STATE = "optimizer.state"
-    OPTIMIZER_OTHER = "optimizer other"
-    COMMON = "common"
-    RNG = "rng"
-    EXTRA_STATE = "extra_state"
-    OTHER = "other"
-
+__all__ = ["Census", "Section", "SectionTotals", "classify_key", "take_census"]
 
 _EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
-_CHAINED_OPTIMIZER = re.compile(r"^chained_\d+\.optimizer\.")
 
 
 def classify_key(fmt: str, key: str, *, is_bytes: bool) -> Section:
     """The section of ``key`` in a store of format ``fmt``."""
+    if fmt == TORCH_DIST:
+        return torch_dist.classify_key(key, is_bytes=is_bytes)
+    if fmt == FSDP_DTENSOR:
+        return _classify_fsdp(key)
+    raise ValueError(f"unknown format {fmt!r}")
+
+
+def _classify_fsdp(key: str) -> Section:
     if key.startswith("rng_state"):
         return Section.RNG
     if _EXTRA_STATE.search(key):
         return Section.EXTRA_STATE
     if key.startswith("optimizer.state."):
         return Section.OPTIMIZER_STATE
-    if key.startswith("optimizer.") or _CHAINED_OPTIMIZER.match(key):
+    if key.startswith("optimizer."):
         return Section.OPTIMIZER_OTHER
-    if fmt == TORCH_DIST:
-        if key.startswith(TORCH_DIST_COMMON_PREFIX):
-            return Section.COMMON
-        return Section.OTHER if is_bytes else Section.MODEL
-    if fmt == FSDP_DTENSOR:
-        if key in FSDP_COMMON_ITEMS or key in FSDP_OPTIONAL_COMMON_ITEMS:
-            return Section.COMMON
-        return Section.MODEL if key.startswith("model.") else Section.OTHER
-    raise ValueError(f"unknown format {fmt!r}")
+    if key in FSDP_COMMON_ITEMS or key in FSDP_OPTIONAL_COMMON_ITEMS:
+        return Section.COMMON
+    return Section.MODEL if key.startswith("model.") else Section.OTHER
 
 
 @dataclass(frozen=True, slots=True)

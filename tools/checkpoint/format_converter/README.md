@@ -145,7 +145,10 @@ Refusals print one line, `FC-xxx: <message> [keys...] hint: <what to do>`:
 |---|---|
 | `FC-R01` | Megatron-FSDP v2 store (`model.<fqn>` keys without `module.`) |
 | `FC-R02` | virtual-pipeline sections (`model<i>.` or `optimizer.<i>.` keys) |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, or a legacy `mp_rank_*` checkpoint |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, a legacy `mp_rank_*` checkpoint, an unknown byte item, or an unknown common-state key |
+| `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
+| `FC-R17` | a store saved with `singleton_local_shards` |
+| `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-A05` | `--from` disagrees with the detected format |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |

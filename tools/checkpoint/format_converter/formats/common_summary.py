@@ -24,15 +24,9 @@ from typing import Any
 
 from ..engine.metadata import Stub, decode_payload
 from ..engine.reader import SourceReader
-from ..errors import IntegrityError
-from .detect import (
-    FSDP_COMMON_ITEMS,
-    FSDP_OPTIONAL_COMMON_ITEMS,
-    LEGACY_COMMON_FILE,
-    TORCH_DIST,
-    TORCH_DIST_COMMON_ITEM,
-    Detection,
-)
+from .base import unwrap_common
+from .detect import FSDP_COMMON_ITEMS, FSDP_OPTIONAL_COMMON_ITEMS, TORCH_DIST, Detection
+from .torch_dist import TorchDistAdapter
 
 SUMMARY_ARGS = (
     "num_layers",
@@ -94,7 +88,7 @@ def summarize_common_state(detection: Detection, reader: SourceReader) -> Common
         IntegrityError: The common state cannot be decoded or has the wrong shape.
     """
     if detection.fmt == TORCH_DIST:
-        common, source, stubbed = _torch_dist_common(detection, reader)
+        common, source, stubbed = _torch_dist_common(reader)
     else:
         common, source, stubbed = _fsdp_common(reader)
     if common is None:
@@ -120,29 +114,18 @@ def to_plain(value: Any) -> Any:
     return repr(value) if isinstance(value, Stub) else str(value)
 
 
-def _torch_dist_common(
-    detection: Detection, reader: SourceReader
-) -> tuple[dict[str, Any] | None, str, frozenset[str]]:
-    legacy = detection.iter_dir / LEGACY_COMMON_FILE
-    if legacy.is_file():
-        try:
-            payload = legacy.read_bytes()
-        except OSError as err:
-            raise IntegrityError(f"cannot read {legacy}: {err.strerror or err}") from err
-        decoded = decode_payload(payload, label=str(legacy))
-        return (
-            _as_common_dict(decoded.value, LEGACY_COMMON_FILE),
-            LEGACY_COMMON_FILE,
-            decoded.stubbed,
-        )
-    if TORCH_DIST_COMMON_ITEM not in reader.view.byte_items:
+def _torch_dist_common(reader: SourceReader) -> tuple[dict[str, Any] | None, str, frozenset[str]]:
+    raw = TorchDistAdapter().read_common_raw(reader)
+    if raw is None:
         return None, "", frozenset()
-    payload = reader.read_bytes([TORCH_DIST_COMMON_ITEM])[TORCH_DIST_COMMON_ITEM]
-    decoded = decode_payload(payload, label=f"byte item {TORCH_DIST_COMMON_ITEM}")
-    value = decoded.value
-    if isinstance(value, list) and len(value) == 1:
-        value = value[0]
-    return _as_common_dict(value, TORCH_DIST_COMMON_ITEM), TORCH_DIST_COMMON_ITEM, decoded.stubbed
+    stubbed: set[str] = set()
+
+    def load(payload: bytes) -> Any:
+        decoded = decode_payload(payload, label=raw.source)
+        stubbed.update(decoded.stubbed)
+        return decoded.value
+
+    return unwrap_common(raw, load), raw.source, frozenset(stubbed)
 
 
 def _fsdp_common(reader: SourceReader) -> tuple[dict[str, Any] | None, str, frozenset[str]]:
@@ -158,14 +141,6 @@ def _fsdp_common(reader: SourceReader) -> tuple[dict[str, Any] | None, str, froz
         common[key] = decoded.value
         stubbed |= decoded.stubbed
     return common, f"byte items {', '.join(keys)}", frozenset(stubbed)
-
-
-def _as_common_dict(value: Any, source: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise IntegrityError(
-            f"{source} does not hold a common-state dict (found {type(value).__name__})"
-        )
-    return value
 
 
 def _selected_args(args: Any) -> dict[str, Any]:

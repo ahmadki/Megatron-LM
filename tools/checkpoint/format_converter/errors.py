@@ -44,6 +44,15 @@ FC_R02 = "FC-R02"
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""
 
+FC_R14 = "FC-R14"
+"""Model tensors are stored in the legacy N-D reformulated layout (``mcore_data``)."""
+
+FC_R17 = "FC-R17"
+"""The checkpoint was saved with ``singleton_local_shards``."""
+
+FC_R18 = "FC-R18"
+"""The checkpoint holds a ModelOpt state (``modelopt_state``)."""
+
 FC_R19 = "FC-R19"
 """The ``fsdp_dtensor`` store holds split fused-projection sub-keys (unknown layout)."""
 

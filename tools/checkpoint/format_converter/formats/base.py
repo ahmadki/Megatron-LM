@@ -1,12 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Format-neutral descriptions shared by the format adapters.
+"""Format-neutral types shared by the format adapters.
 
-The common (non-tensor) state of a store is carried around undecoded as a
-:class:`RawCommon`: its payloads plus the layout that says how the common dict
-is stored in them. Decoding and encoding the payloads is the job of the
-common-state codec (``mcore_state.common_state``), which decides which classes
-may be unpickled; the layout rules live here.
+* :class:`Section`: the role of a key in a store (model, optimizer, common, ...).
+* :class:`FormatAdapter`: what the conversion needs to know about a format.
+* :class:`RawCommon`: the common (non-tensor) state, carried around undecoded:
+  its payloads plus the layout that says how the common dict is stored in them
+  (one wrapped or bare dict, or one payload per key). Decoding and encoding the
+  payloads is the job of the common-state codec (``mcore_state.common_state``),
+  which decides which classes may be unpickled; the layout rules live here, and
+  each adapter names the output byte item of each payload.
 """
 
 from __future__ import annotations
@@ -14,9 +17,26 @@ from __future__ import annotations
 import enum
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 from ..errors import IntegrityError, InternalError
+
+if TYPE_CHECKING:
+    from ..engine.reader import SourceReader
+
+
+class Section(enum.Enum):
+    """Role of a key in a store."""
+
+    MODEL = "model"
+    OPTIMIZER_STATE = "optimizer.state"
+    OPTIMIZER_OTHER = "optimizer other"
+    COMMON = "common"
+    RNG = "rng"
+    RERUN = "rerun"
+    EXTRA_STATE = "extra_state"
+    OTHER = "other"
 
 
 class CommonLayout(enum.Enum):
@@ -103,3 +123,32 @@ def wrap_common(common: Mapping[str, Any], layout: CommonLayout) -> dict[str, An
     if layout is CommonLayout.PER_KEY:
         return dict(common)
     return {WHOLE: [dict(common)] if layout is CommonLayout.WRAPPED else dict(common)}
+
+
+class FormatAdapter(Protocol):
+    """What a conversion needs to know about one checkpoint format and dialect.
+
+    Detection stays in :mod:`.detect`, which chooses the adapter.
+    """
+
+    fmt: ClassVar[str]
+    dialect: ClassVar[str]
+    common_layout: ClassVar[CommonLayout]
+
+    def classify(self, key: str, *, is_bytes: bool) -> Section:
+        """The section of a key of this format (``OTHER`` if unknown)."""
+
+    def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
+        """The undecoded common state of ``reader``'s store, if it has one."""
+
+    def common_item(self, key: str) -> tuple[str, tuple[str, ...] | None]:
+        """The output byte item that stores common-state payload ``key``: its key and planner path.
+
+        ``key`` is a payload key of ``common_layout`` (see :func:`payload_keys`).
+        """
+
+    def marker_files(self) -> dict[str, bytes]:
+        """Files the format requires next to ``.metadata`` in a published store."""
+
+    def validate_published(self, iter_dir: Path) -> None:
+        """Check a written store has exactly this format's markers."""

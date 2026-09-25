@@ -43,7 +43,6 @@ LEGACY_COMMON_FILE = "common.pt"
 FSDP_MODEL_PREFIX = "model.module."
 FSDP_COMMON_ITEMS = ("args", "iteration", "checkpoint_version")
 FSDP_OPTIONAL_COMMON_ITEMS = ("num_floating_point_operations_so_far",)
-TORCH_DIST_COMMON_PREFIX = "common_state/"
 TORCH_DIST_COMMON_ITEM = "common_state/shard_0_1"
 
 _ITERATION_DIR = re.compile(r"^iter_(?P<iteration>\d+)$")
