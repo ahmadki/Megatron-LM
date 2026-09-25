@@ -5,20 +5,22 @@
 from __future__ import annotations
 
 import io
-import warnings
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 import torch
-import torch.distributed.checkpoint as dcp
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter
+from torch.distributed.checkpoint import FileSystemReader
 
 from tools.checkpoint.format_converter.engine.metadata import MetadataView, StoredChunk
-from tools.checkpoint.format_converter.engine.part_writer import PieceSavePlanner
+from tools.checkpoint.format_converter.engine.part_writer import PieceSavePlanner, write_part
 from tools.checkpoint.format_converter.engine.pieces import BytePiece, CopyOp, Piece, copy_pieces
 from tools.checkpoint.format_converter.engine.regions import Region
-from tools.checkpoint.format_converter.errors import InternalError
+from tools.checkpoint.format_converter.errors import IntegrityError, InternalError
 
+from .._harness import REPO_ROOT, scrubbed_env
 from .._synthetic import dim0_grid, torch_save_bytes, write_store
 
 W = torch.arange(32, dtype=torch.float32).reshape(8, 4)
@@ -36,15 +38,8 @@ def _buffers(pieces, tensors):
     return [(p, tensors[p.key][p.chunk.slices()].clone()) for p in pieces]
 
 
-def _save(part_dir: Path, pieces, byte_pieces=()) -> None:
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="torch.distributed is disabled")
-        dcp.save(
-            {},
-            storage_writer=FileSystemWriter(part_dir, per_thread_copy_ahead=0),
-            planner=PieceSavePlanner(pieces, byte_pieces),
-            no_dist=True,
-        )
+def _save(part_dir: Path, pieces, byte_pieces=(), threads: int = 1) -> None:
+    write_part(part_dir, pieces, byte_pieces, threads=threads)
 
 
 def _stored_items(part_dir: Path) -> dict:
@@ -195,3 +190,74 @@ def test_copy_pieces_mirror_the_stored_grid(source):
         assert op.src == chunk and op.src_region == chunk.region
         assert op.dst_region == Region.full(chunk.sizes)
         assert piece.nbytes == chunk.nbytes and piece.planner_path is None
+
+
+def test_write_part_spreads_items_over_thread_files(source, tmp_path):
+    pieces = copy_pieces(source.tensors["w"]) + copy_pieces(source.tensors["b"])
+    _save(tmp_path / "part", _buffers(pieces, {"w": W, "b": B}), [BytePiece("x", b"1")], threads=2)
+    files = sorted(p.name for p in (tmp_path / "part").iterdir())
+    assert files == [".metadata", "__0_0.distcp", "__0_1.distcp"]
+    items = _stored_items(tmp_path / "part")
+    assert len(items) == len(pieces) + 1
+    for piece in pieces:
+        expected = {"w": W, "b": B}[piece.key][piece.chunk.slices()]
+        assert torch.equal(items[(piece.key, piece.chunk.offsets)], expected)
+
+
+def test_write_part_refuses_existing_directories_and_bad_threads(source, tmp_path):
+    pieces = _buffers(copy_pieces(source.tensors["b"]), {"b": B})
+    (tmp_path / "part").mkdir()
+    with pytest.raises(InternalError, match="already exists"):
+        _save(tmp_path / "part", pieces)
+    with pytest.raises(InternalError, match="writer threads must be positive"):
+        _save(tmp_path / "other", pieces, threads=0)
+    assert not (tmp_path / "other").exists()
+
+
+def test_write_failures_are_integrity_errors(source, tmp_path, monkeypatch):
+    pieces = _buffers(copy_pieces(source.tensors["b"]), {"b": B})
+
+    def full_disk(self, write_item):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(PieceSavePlanner, "resolve_data", full_disk)
+    with pytest.raises(IntegrityError, match="failed: OSError: .*No space left on device"):
+        _save(tmp_path / "part", pieces)
+
+    def interrupted(self, write_item):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(PieceSavePlanner, "resolve_data", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _save(tmp_path / "again", pieces)
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_write_part_never_initializes_cuda(tmp_path):
+    """In a fresh process that can see the GPUs (if any), writing a part leaves CUDA alone."""
+    script = textwrap.dedent(f"""
+        from pathlib import Path
+
+        import torch
+        from tools.checkpoint.format_converter.engine.metadata import MetadataView
+        from tools.checkpoint.format_converter.engine.part_writer import write_part
+        from tools.checkpoint.format_converter.engine.pieces import copy_pieces
+
+        view = MetadataView.load({str(tmp_path / "src")!r})
+        pieces = [(p, torch.ones(p.chunk.sizes, dtype=p.dtype)) for p in copy_pieces(view.tensors["w"])]
+        write_part(Path({str(tmp_path / "part")!r}), pieces, [], threads=1)
+        assert not torch.cuda.is_initialized(), "writing a part initialized CUDA"
+        print("ok", torch.cuda.is_available())
+        """)
+    write_store(tmp_path / "src", {"w": W}, grids={"w": dim0_grid((8, 4), 2)})
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=scrubbed_env(hide_gpus=False),
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("ok")

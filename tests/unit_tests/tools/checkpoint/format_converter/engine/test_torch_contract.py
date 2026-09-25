@@ -15,6 +15,8 @@ import enum
 import importlib
 import io
 import pickle
+import warnings
+import weakref
 from pathlib import Path
 
 import pytest
@@ -349,3 +351,82 @@ def test_global_save_plan_does_not_validate_coverage():
     planner.set_up_planner({}, is_coordinator=True)
     with pytest.raises(ValueError, match="Failed to validate global plan"):
         planner.create_global_plan([planner.create_local_plan()])
+
+
+class _FreshTensorPlanner(DefaultSavePlanner):
+    """Resolves every tensor item to a new tensor that nothing else references."""
+
+    def __init__(self):
+        super().__init__(flatten_state_dict=False)
+
+    def resolve_data(self, write_item):
+        return torch.zeros(64)
+
+
+def test_file_system_writer_retains_tensors_until_the_file_closes(tmp_path, monkeypatch):
+    """Protects the memory model of write_part: FileSystemWriter keeps every tensor
+    it wrote to a data file referenced until that file is closed (its ``tensor_dict``),
+    so a lazily resolving planner still holds a whole file's tensors at once. The
+    engine therefore writes one unit per save, from buffers it already counts."""
+    written = []
+    alive_at_write = []
+    real_save = torch.save
+
+    def recording_save(obj, *args, **kwargs):
+        if isinstance(obj, torch.Tensor):
+            alive_at_write.append(sum(ref() is not None for ref in written))
+            written.append(weakref.ref(obj))
+        return real_save(obj, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "save", recording_save)
+    state = {f"t{i}": torch.zeros(64) for i in range(4)}
+    writer = FileSystemWriter(tmp_path, thread_count=1, per_thread_copy_ahead=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dcp.save(state, storage_writer=writer, planner=_FreshTensorPlanner(), no_dist=True)
+    assert alive_at_write == [0, 1, 2, 3]
+    assert all(ref() is None for ref in written)
+
+
+def test_serial_loader_copies_only_views_of_larger_storages(tmp_path, monkeypatch):
+    """Protects part_writer's no-copy rule: the writer clones a tensor whose storage
+    is larger than the tensor, and serializes a tensor owning exactly its storage as is."""
+    backing = torch.arange(16, dtype=torch.float32)
+    standalone = torch.arange(4, dtype=torch.float32)
+    saved = {}
+    real_save = torch.save
+
+    def recording_save(obj, *args, **kwargs):
+        if isinstance(obj, torch.Tensor):
+            saved[obj[0].item()] = obj.data_ptr()
+        return real_save(obj, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "save", recording_save)
+    writer = FileSystemWriter(tmp_path, thread_count=1, per_thread_copy_ahead=0)
+    state = {"view": backing[8:12], "standalone": standalone}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dcp.save(state, storage_writer=writer, no_dist=True)
+    assert saved[8.0] != backing[8:12].data_ptr()
+    assert saved[0.0] == standalone.data_ptr()
+
+
+def test_copy_ahead_selects_the_cuda_stream_loader(tmp_path, monkeypatch):
+    """Protects write_part's ``per_thread_copy_ahead=0``: with one writer thread and
+    CUDA available, a positive copy-ahead makes the writer use its overlapping
+    loader, which drives CUDA streams; zero keeps the serial CPU loader."""
+
+    class ForbiddenLoader:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("overlapping loader selected")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(dcp_filesystem, "_OverlappingCpuLoader", ForbiddenLoader)
+    state = {"t": torch.zeros(4)}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(CheckpointException, match="overlapping loader selected"):
+            dcp.save(state, storage_writer=FileSystemWriter(tmp_path / "a"), no_dist=True)
+        writer = FileSystemWriter(tmp_path / "b", thread_count=1, per_thread_copy_ahead=0)
+        dcp.save(state, storage_writer=writer, no_dist=True)
+    assert (tmp_path / "b" / ".metadata").is_file()

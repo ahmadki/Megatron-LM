@@ -2,6 +2,10 @@
 
 """Writing pieces into a DCP part store.
 
+:func:`write_part` writes one unit's pieces and byte items as a complete DCP
+store (data files plus ``.metadata``) with one ``dcp.save`` call and no process
+group.
+
 :class:`PieceSavePlanner` is a ``SavePlanner`` for ``dcp.save({}, ...)`` that
 ignores the (empty) state dict and writes exactly the given pieces, each as one
 stored chunk, plus the given byte items. Unlike ``DefaultSavePlanner`` it
@@ -11,22 +15,66 @@ stores; the metadata merge checks that the parts cover every tensor exactly.
 Every piece buffer must be a standalone, contiguous CPU tensor whose storage is
 exactly its size: ``FileSystemWriter`` clones any tensor whose storage is larger
 than the tensor itself, and serializes the buffer it is given otherwise, so a
-standalone buffer is written without a copy.
+standalone buffer is written without a copy. ``FileSystemWriter`` keeps every
+tensor of a data file referenced until that file is closed, so the resident set
+of a write is the unit's own buffers, which the memory budget already counts.
+``per_thread_copy_ahead=0`` keeps the writer on its serial loader, which never
+touches CUDA (the overlapping loader it would otherwise pick when CUDA is
+available uses CUDA streams).
 """
 
 from __future__ import annotations
 
 import io
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 import torch
+from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteItem
 
 from ..errors import InternalError
 from . import torch_compat
 from .pieces import BytePiece, Piece
+
+
+def write_part(
+    part_dir: Path,
+    pieces: Sequence[tuple[Piece, torch.Tensor]],
+    byte_pieces: Sequence[BytePiece],
+    *,
+    threads: int,
+) -> None:
+    """Write pieces and byte items as a new DCP store in ``part_dir``.
+
+    Args:
+        part_dir: Directory to create (it must not exist).
+        pieces: Each piece with its standalone buffer.
+        byte_pieces: Byte items to write.
+        threads: Writer threads; the store gets that many data files at most.
+
+    Raises:
+        InternalError: ``part_dir`` exists, ``threads`` is not positive, or a
+            buffer does not match its piece.
+        IntegrityError: Writing failed (for example a full disk).
+    """
+    if threads < 1:
+        raise InternalError(f"writer threads must be positive, got {threads}")
+    planner = PieceSavePlanner(pieces, byte_pieces)
+    try:
+        part_dir.mkdir(parents=True)
+    except FileExistsError as err:
+        raise InternalError(f"part store {part_dir} already exists") from err
+    writer = FileSystemWriter(
+        part_dir,
+        single_file_per_rank=True,
+        sync_files=True,
+        thread_count=threads,
+        per_thread_copy_ahead=0,
+    )
+    torch_compat.save_without_process_group(writer, planner)
 
 
 class PieceSavePlanner(SavePlanner):

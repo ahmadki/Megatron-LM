@@ -20,14 +20,19 @@ def is_local_rank_zero() -> bool:
     return os.environ.get("LOCAL_RANK", "0") == "0"
 
 
-def scrubbed_env() -> dict[str, str]:
-    """Environment for child processes: no launcher variables and no visible GPU."""
+def scrubbed_env(*, hide_gpus: bool = True) -> dict[str, str]:
+    """Environment for child processes: no launcher variables and, by default, no visible GPU.
+
+    ``hide_gpus=False`` keeps the GPUs visible, for tests that check a process
+    does not initialize CUDA although it could.
+    """
     env = {
         name: value
         for name, value in os.environ.items()
         if name not in _SCRUBBED_NAMES and not name.startswith(_SCRUBBED_PREFIXES)
     }
-    env["CUDA_VISIBLE_DEVICES"] = ""
+    if hide_gpus:
+        env["CUDA_VISIBLE_DEVICES"] = ""
     pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(REPO_ROOT) + (os.pathsep + pythonpath if pythonpath else "")
     return env

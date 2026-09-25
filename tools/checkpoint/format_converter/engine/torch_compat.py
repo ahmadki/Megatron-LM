@@ -22,9 +22,9 @@ upgrade that moves an internal breaks exactly one file and the pins in
   ``dcp.load`` emits when it runs without a process group, and the
   ``CheckpointException`` (a ``BaseException``) it wraps every failure in.
 * The write side of a custom ``SavePlanner``: ``WriteItem`` construction for
-  partial tensor chunks (``SHARD`` items) and byte items, and the global plan
-  of ``create_default_global_save_plan``, which, unlike ``DefaultSavePlanner``,
-  does not require every tensor of a save to be complete.
+  partial tensor chunks (``SHARD`` items) and byte items, the global plan of
+  ``create_default_global_save_plan``, which, unlike ``DefaultSavePlanner``,
+  does not validate the chunk grid, and ``dcp.save`` without a process group.
 
 The public, stable fields ``Metadata.state_dict_metadata`` and
 ``Metadata.planner_data`` are read directly by ``metadata.py``.
@@ -53,11 +53,12 @@ from torch.distributed.checkpoint.planner import (
     LoadPlanner,
     ReadItem,
     SavePlan,
+    SavePlanner,
     TensorWriteData,
     WriteItem,
     WriteItemType,
 )
-from torch.distributed.checkpoint.storage import StorageReader
+from torch.distributed.checkpoint.storage import StorageReader, StorageWriter
 
 from ..errors import IntegrityError
 from .regions import Region
@@ -321,13 +322,30 @@ def load_without_process_group(
     try:
         dcp.load(state_dict, storage_reader=reader, planner=planner, no_dist=True)
     except CheckpointException as err:
-        failure = next(iter(err.failures.values()), None)
-        cause = failure[0] if isinstance(failure, tuple) else failure
-        if isinstance(cause, KeyboardInterrupt):
-            raise cause from err
-        raise IntegrityError(
-            f"reading {reader.checkpoint_id} failed: {type(cause).__name__}: {cause}"
-        ) from err
+        raise _failure(err, f"reading {reader.checkpoint_id} failed") from err
+
+
+def save_without_process_group(writer: StorageWriter, planner: SavePlanner) -> None:
+    """``dcp.save({})`` in this process only; ``planner`` supplies everything to write.
+
+    Raises:
+        IntegrityError: DCP failed to write the store (for example a full disk).
+        KeyboardInterrupt: The write was interrupted.
+    """
+    _ignore_no_process_group_warning()
+    try:
+        dcp.save({}, storage_writer=writer, planner=planner, no_dist=True)
+    except CheckpointException as err:
+        raise _failure(err, f"writing {writer.checkpoint_id} failed") from err
+
+
+def _failure(err: CheckpointException, what: str) -> BaseException:
+    """The ``KeyboardInterrupt`` DCP wrapped, else an ``IntegrityError`` naming the cause."""
+    failure = next(iter(err.failures.values()), None)
+    cause = failure[0] if isinstance(failure, tuple) else failure
+    if isinstance(cause, KeyboardInterrupt):
+        return cause
+    return IntegrityError(f"{what}: {type(cause).__name__}: {cause}")
 
 
 def _ignore_no_process_group_warning() -> None:
