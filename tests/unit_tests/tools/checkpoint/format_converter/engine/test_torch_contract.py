@@ -30,6 +30,7 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint import filesystem as dcp_filesystem
 from torch.distributed.checkpoint.metadata import Metadata, MetadataIndex
+from torch.distributed.checkpoint.planner import SavePlan
 
 from tools.checkpoint.format_converter.engine import torch_compat
 from tools.checkpoint.format_converter.engine.metadata import (
@@ -320,3 +321,31 @@ def test_decoded_bytes_match_an_independent_reader(store):
         raw = f.read(entry.length)
     assert _load(path, {"blob": None}).payloads["blob"] == raw
     assert torch.load(io.BytesIO(raw)) == [{"k": 1}]
+
+
+def test_global_save_plan_does_not_validate_coverage():
+    """Protects PieceSavePlanner: ``create_default_global_save_plan`` (via
+    torch_compat.global_save_plan) records exactly the chunks it is given, partial or
+    overlapping, while ``DefaultSavePlanner`` validates chunk bounds and overlaps (and,
+    before torch 2.12 or across ranks, coverage). The engine writes partial tensors
+    per part store and validates the merged grid itself."""
+    partial = [torch_compat.tensor_write_item("w", Region((2, 0), (2, 4)), (8, 4), torch.float32)]
+    overlapping = partial + [
+        torch_compat.tensor_write_item("w", Region((3, 0), (2, 4)), (8, 4), torch.float32)
+    ]
+    plans, metadata = torch_compat.global_save_plan([SavePlan(list(partial))])
+    entry = metadata.state_dict_metadata["w"]
+    assert tuple(entry.size) == (8, 4) and [tuple(c.offsets) for c in entry.chunks] == [(2, 0)]
+    assert torch_compat.write_item_target(plans[0].items[0]) == ("w", (2, 0))
+    assert torch_compat.write_item_target(torch_compat.bytes_write_item("b")) == ("b", None)
+    _, metadata = torch_compat.global_save_plan([SavePlan(list(overlapping))])
+    assert len(metadata.state_dict_metadata["w"].chunks) == 2
+
+    class FixedPlanner(DefaultSavePlanner):
+        def create_local_plan(self):
+            return SavePlan(list(overlapping))
+
+    planner = FixedPlanner(flatten_state_dict=False)
+    planner.set_up_planner({}, is_coordinator=True)
+    with pytest.raises(ValueError, match="Failed to validate global plan"):
+        planner.create_global_plan([planner.create_local_plan()])

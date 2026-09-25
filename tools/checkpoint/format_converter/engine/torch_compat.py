@@ -21,6 +21,10 @@ upgrade that moves an internal breaks exactly one file and the pins in
 * ``ReadItem`` index fields seen by load-planner hooks, the warning
   ``dcp.load`` emits when it runs without a process group, and the
   ``CheckpointException`` (a ``BaseException``) it wraps every failure in.
+* The write side of a custom ``SavePlanner``: ``WriteItem`` construction for
+  partial tensor chunks (``SHARD`` items) and byte items, and the global plan
+  of ``create_default_global_save_plan``, which, unlike ``DefaultSavePlanner``,
+  does not require every tensor of a save to be complete.
 
 The public, stable fields ``Metadata.state_dict_metadata`` and
 ``Metadata.planner_data`` are read directly by ``metadata.py``.
@@ -38,8 +42,21 @@ from typing import Any
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import CheckpointException
-from torch.distributed.checkpoint.metadata import ChunkStorageMetadata, Metadata
-from torch.distributed.checkpoint.planner import LoadPlanner, ReadItem
+from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
+from torch.distributed.checkpoint.metadata import (
+    ChunkStorageMetadata,
+    Metadata,
+    MetadataIndex,
+    TensorProperties,
+)
+from torch.distributed.checkpoint.planner import (
+    LoadPlanner,
+    ReadItem,
+    SavePlan,
+    TensorWriteData,
+    WriteItem,
+    WriteItemType,
+)
 from torch.distributed.checkpoint.storage import StorageReader
 
 from ..errors import IntegrityError
@@ -240,6 +257,49 @@ def read_item_source(read_item: ReadItem) -> tuple[str, tuple[int, ...]]:
     """The stored chunk a tensor ``ReadItem`` reads: its key and global offsets."""
     index = read_item.storage_index
     return index.fqn, tuple(int(o) for o in index.offset)
+
+
+def tensor_write_item(
+    key: str, chunk: Region, global_shape: Sequence[int], dtype: torch.dtype
+) -> WriteItem:
+    """A write item storing box ``chunk`` of tensor ``key`` as one stored chunk.
+
+    The item is of type ``SHARD``, so a save may hold any subset of a tensor's
+    chunks (several items of one key are allowed).
+    """
+    return WriteItem(
+        index=MetadataIndex(key, torch.Size(chunk.offsets)),
+        type=WriteItemType.SHARD,
+        tensor_data=TensorWriteData(
+            chunk=ChunkStorageMetadata(
+                offsets=torch.Size(chunk.offsets), sizes=torch.Size(chunk.sizes)
+            ),
+            properties=TensorProperties(dtype=dtype),
+            size=torch.Size(global_shape),
+        ),
+    )
+
+
+def bytes_write_item(key: str) -> WriteItem:
+    """A write item storing the byte item ``key`` (an opaque payload)."""
+    return WriteItem(index=MetadataIndex(key), type=WriteItemType.BYTE_IO)
+
+
+def write_item_target(item: WriteItem) -> tuple[str, tuple[int, ...] | None]:
+    """The key a write item stores and its chunk offsets (``None`` for byte items)."""
+    if item.type == WriteItemType.BYTE_IO:
+        return item.index.fqn, None
+    return item.index.fqn, tuple(int(o) for o in item.index.offset)
+
+
+def global_save_plan(plans: list[SavePlan]) -> tuple[list[SavePlan], Metadata]:
+    """The global plan and metadata of ``plans``, without coverage validation.
+
+    ``DefaultSavePlanner`` rejects a save whose tensors are not complete
+    (``_validate_global_plan``); a part store holds partial tensors, so the
+    engine validates coverage when it merges the parts instead.
+    """
+    return create_default_global_save_plan(plans, rewrite_index_hints=True)
 
 
 def load_without_process_group(
