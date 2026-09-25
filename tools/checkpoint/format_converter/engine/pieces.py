@@ -132,6 +132,31 @@ def copy_pieces(entry: TensorEntry) -> tuple[Piece, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class Unit:
+    """The pieces and byte items that one worker reads and writes as one part store.
+
+    Attributes:
+        uid: Unit id; parts are merged in uid order.
+        pieces: Output pieces (all their buffers are resident at once).
+        byte_pieces: Output byte items.
+        est_peak_bytes: Estimated peak memory of executing the unit (piece
+            buffers, read staging and the largest decoded stored item).
+        read_bytes: On-disk size of the stored items the unit reads.
+    """
+
+    uid: int
+    pieces: tuple[Piece, ...]
+    byte_pieces: tuple[BytePiece, ...] = ()
+    est_peak_bytes: int = 0
+    read_bytes: int = 0
+
+    @property
+    def source_keys(self) -> frozenset[str]:
+        """Keys of the source tensors the unit reads."""
+        return frozenset(op.src.key for piece in self.pieces for op in piece.ops)
+
+
+@dataclass(frozen=True, slots=True)
 class ExpectedTensor:
     """What the merged output must hold for one tensor.
 

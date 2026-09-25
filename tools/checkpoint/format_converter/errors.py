@@ -144,6 +144,12 @@ class IntegrityError(ConverterError):
     exit_code = ExitCode.INTEGRITY
 
 
+class FingerprintMismatch(ConverterError):
+    """Existing staging belongs to a different conversion, exit 7."""
+
+    exit_code = ExitCode.FINGERPRINT_MISMATCH
+
+
 class BudgetExceeded(ConverterError):
     """A single read unit does not fit the memory budget, exit 8."""
 

@@ -41,6 +41,7 @@ from torch.distributed.checkpoint.metadata import (
 from .. import errors
 from ..errors import IntegrityError, Refusal
 from . import torch_compat
+from .faults import inject_fault
 from .fs import append_line, write_atomic
 from .hashing import byte_view
 from .metadata import METADATA_FILE, MetadataView, read_metadata_file
@@ -171,6 +172,7 @@ class MetadataMerger:
                 target = final_dir / _final_name(part.uid, relative_path)
                 renamed += _place(part.path / relative_path, target, journal, moved)
                 files += 1
+                inject_fault(f"merge:link:{files}")
             _add_part(part, metadata, records, tensors, byte_items)
             _add_planner_data(part, metadata, planner_data)
         self._validate(tensors, byte_items)

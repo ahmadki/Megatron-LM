@@ -399,8 +399,25 @@ class MetadataView:
                 digest.update(f"{entry.name}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
         return digest.hexdigest()
 
-    def subset(self, keys: Iterable[str]) -> Metadata:
-        """A ``Metadata`` restricted to ``keys`` (tables only; other fields kept).
+    @classmethod
+    def of_metadata(cls, iter_dir: Path, metadata: Metadata) -> MetadataView:
+        """A view of an already loaded ``Metadata`` (for example a unit's subset).
+
+        The view has no file digest, so :meth:`fingerprint` must not be used.
+
+        Raises:
+            IntegrityError: A chunk grid does not tile its tensor.
+        """
+        return cls(Path(iter_dir), metadata, stubbed=frozenset(), metadata_sha256="")
+
+    def subset(self, keys: Iterable[str], *, tables_only: bool = False) -> Metadata:
+        """A ``Metadata`` restricted to ``keys``.
+
+        Args:
+            keys: Keys to keep (every chunk of each).
+            tables_only: Build a new ``Metadata`` holding only the three
+                per-key tables, safe to pickle into a unit file; otherwise every
+                other field and attachment of the store's metadata is kept.
 
         Raises:
             InternalError: A key is not in the store.
@@ -412,10 +429,14 @@ class MetadataView:
         planner_data = self.planner_data
         if isinstance(planner_data, Mapping):
             planner_data = {k: planner_data[k] for k in wanted if k in planner_data}
+        state_dict_metadata = {k: self._metadata.state_dict_metadata[k] for k in wanted}
+        storage_data = {r.index: r.info for k in wanted for r in self._records[k]}
+        if tables_only:
+            return torch_compat.tables_only(state_dict_metadata, storage_data, planner_data)
         return torch_compat.with_tables(
             self._metadata,
-            state_dict_metadata={k: self._metadata.state_dict_metadata[k] for k in wanted},
-            storage_data={r.index: r.info for k in wanted for r in self._records[k]},
+            state_dict_metadata=state_dict_metadata,
+            storage_data=storage_data,
             planner_data=planner_data,
         )
 

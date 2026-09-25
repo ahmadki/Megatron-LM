@@ -239,6 +239,17 @@ def metadata_from_fields(fields: Mapping[str, Any]) -> Metadata:
     return metadata
 
 
+def tables_only(
+    state_dict_metadata: dict[str, Any], storage_data: dict[Any, Any], planner_data: Any
+) -> Metadata:
+    """A ``Metadata`` holding only the three per-key tables (no storage identity)."""
+    return Metadata(
+        state_dict_metadata=state_dict_metadata,
+        planner_data=planner_data,
+        storage_data=storage_data,
+    )
+
+
 def with_tables(
     metadata: Metadata,
     *,
