@@ -15,6 +15,12 @@ upgrade that moves an internal breaks exactly one file and the pins in
 * ``Metadata.version`` (added after torch 2.8) and attributes that savers
   attach to ``Metadata`` instances (``mcore_data`` from old Megatron,
   ``all_local_plans`` from the nvidia-resiliency-ext async saver).
+* The checkpointable-tensor protocol (``__create_chunk_list__`` and
+  ``__get_tensor_shard__`` on a ``torch.Tensor._make_wrapper_subclass``), which
+  lets one load request cover several disjoint boxes of a tensor.
+* ``ReadItem`` index fields seen by load-planner hooks, the warning
+  ``dcp.load`` emits when it runs without a process group, and the
+  ``CheckpointException`` (a ``BaseException``) it wraps every failure in.
 
 The public, stable fields ``Metadata.state_dict_metadata`` and
 ``Metadata.planner_data`` are read directly by ``metadata.py``.
@@ -23,15 +29,27 @@ The public, stable fields ``Metadata.state_dict_metadata`` and
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
+import threading
+import warnings
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from torch.distributed.checkpoint.metadata import Metadata
+import torch
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint import CheckpointException
+from torch.distributed.checkpoint.metadata import ChunkStorageMetadata, Metadata
+from torch.distributed.checkpoint.planner import LoadPlanner, ReadItem
+from torch.distributed.checkpoint.storage import StorageReader
+
+from ..errors import IntegrityError
+from .regions import Region
 
 _SAVER_PLANS_ATTRIBUTE = "all_local_plans"
 _LEGACY_MCORE_ATTRIBUTE = "mcore_data"
 _METADATA_FIELDS = ("state_dict_metadata", "planner_data", "storage_data", "storage_meta")
+_NO_PROCESS_GROUP_WARNING = r"torch\.distributed is (disabled|unavailable)"
+_WARNING_FILTER_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,3 +188,97 @@ def with_tables(
     subset.storage_data = storage_data
     subset.planner_data = planner_data
     return subset
+
+
+class RegionTarget(torch.Tensor):
+    """Load destination covering disjoint boxes of one tensor, each with its own buffer.
+
+    ``dcp.load`` asks a checkpointable object for its local chunks, plans one
+    read per (local chunk, stored chunk) overlap, and fetches the buffer of a
+    local chunk through ``__get_tensor_shard__``. The object reports the full
+    global shape and supports no tensor operations.
+    """
+
+    @staticmethod
+    def __new__(
+        cls, shape: Sequence[int], dtype: torch.dtype, parts: Sequence[tuple[Region, torch.Tensor]]
+    ) -> RegionTarget:
+        del parts
+        return torch.Tensor._make_wrapper_subclass(  # pylint: disable=protected-access
+            cls, torch.Size(shape), dtype=dtype, device="cpu"
+        )
+
+    def __init__(
+        self, shape: Sequence[int], dtype: torch.dtype, parts: Sequence[tuple[Region, torch.Tensor]]
+    ) -> None:
+        del shape, dtype
+        self._regions = tuple(region for region, _ in parts)
+        self._buffers = {region.offsets: buffer for region, buffer in parts}
+
+    def __create_chunk_list__(self) -> list[ChunkStorageMetadata]:
+        """The boxes this target wants, as DCP chunk metadata."""
+        return [
+            ChunkStorageMetadata(offsets=torch.Size(r.offsets), sizes=torch.Size(r.sizes))
+            for r in self._regions
+        ]
+
+    def __get_tensor_shard__(self, index: Any) -> torch.Tensor:
+        """The buffer of the local chunk that starts at ``index.offset``."""
+        return self._buffers[tuple(int(o) for o in index.offset)]
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError(f"{cls.__name__} is a load target only; {func} is unsupported")
+
+
+def read_item_key(read_item: ReadItem) -> str:
+    """The state-dict key a ``ReadItem`` loads into."""
+    return read_item.dest_index.fqn
+
+
+def read_item_source(read_item: ReadItem) -> tuple[str, tuple[int, ...]]:
+    """The stored chunk a tensor ``ReadItem`` reads: its key and global offsets."""
+    index = read_item.storage_index
+    return index.fqn, tuple(int(o) for o in index.offset)
+
+
+def load_without_process_group(
+    state_dict: dict[str, Any], reader: StorageReader, planner: LoadPlanner
+) -> None:
+    """``dcp.load`` in this process only, whether or not a process group exists.
+
+    The first call adds one process-wide ``warnings`` filter that ignores the
+    "torch.distributed is disabled" warning ``dcp.load(no_dist=True)`` emits;
+    later calls leave the warning filters untouched.
+
+    Raises:
+        IntegrityError: DCP failed to read the store (for example a missing or
+            truncated data file); the message names the underlying error.
+        KeyboardInterrupt: The read was interrupted (DCP wraps the interrupt,
+            like any other failure, in a ``CheckpointException``).
+    """
+    _ignore_no_process_group_warning()
+    try:
+        dcp.load(state_dict, storage_reader=reader, planner=planner, no_dist=True)
+    except CheckpointException as err:
+        failure = next(iter(err.failures.values()), None)
+        cause = failure[0] if isinstance(failure, tuple) else failure
+        if isinstance(cause, KeyboardInterrupt):
+            raise cause from err
+        raise IntegrityError(
+            f"reading {reader.checkpoint_id} failed: {type(cause).__name__}: {cause}"
+        ) from err
+
+
+def _ignore_no_process_group_warning() -> None:
+    with _WARNING_FILTER_LOCK:  # warnings.filters is process-global; readers run in threads
+        if not any(_is_no_process_group_filter(f) for f in warnings.filters):
+            warnings.filterwarnings(
+                "ignore", message=_NO_PROCESS_GROUP_WARNING, category=UserWarning
+            )
+
+
+def _is_no_process_group_filter(entry: tuple[Any, ...]) -> bool:
+    action, message, category = entry[:3]
+    pattern = getattr(message, "pattern", None)
+    return action == "ignore" and pattern == _NO_PROCESS_GROUP_WARNING and category is UserWarning
