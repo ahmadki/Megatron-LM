@@ -14,8 +14,10 @@ import sys
 import textwrap
 
 import pytest
+import torch
 
 from ._harness import REPO_ROOT
+from ._synthetic import default_args, write_torch_dist_store
 
 _BLOCKER = textwrap.dedent("""
     import importlib
@@ -86,3 +88,27 @@ def test_blocker_really_blocks(scrubbed_env):
     result = _run("import megatron.core\n", scrubbed_env)
     assert result.returncode != 0
     assert "not allowed in format_converter" in result.stderr
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_inspect_runs_without_megatron(tmp_path, scrubbed_env):
+    store = write_torch_dist_store(
+        tmp_path / "store",
+        {"decoder.final_layernorm.weight": torch.ones(4)},
+        common={"args": default_args(), "iteration": 7, "checkpoint_version": 3.0},
+    )
+    digests = tmp_path / "digests.json"
+    result = _run(
+        f"""
+        from tools.checkpoint.format_converter import cli
+        code = cli.main(["inspect", {str(store)!r}, "--digests", {str(digests)!r}])
+        import torch
+        assert not torch.cuda.is_initialized()
+        assert not [m for m in sys.modules if m.split(".")[0] in BLOCKED]
+        sys.exit(code)
+        """,
+        scrubbed_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "format:     torch_dist (mcore)" in result.stdout
+    assert digests.is_file()

@@ -15,6 +15,7 @@ import argparse
 import io
 import json
 import pickle
+import types
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -142,10 +143,17 @@ def product_grid(shape: Sequence[int], cuts: Sequence[Sequence[int]]) -> tuple[R
     return tuple(Region(o, s) for o, s in regions)
 
 
-def torch_save_bytes(obj: Any) -> bytes:
-    """``torch.save(obj)`` into memory, as DCP stores byte items."""
+def torch_save_bytes(obj: Any, aliases: Mapping[Any, tuple[str, str]] | None = None) -> bytes:
+    """``torch.save(obj)`` into memory, as DCP stores byte items.
+
+    With ``aliases``, the listed classes are pickled under other global names
+    (see :class:`AliasPickler`), e.g. to reference Megatron enums.
+    """
     buffer = io.BytesIO()
-    torch.save(obj, buffer)
+    if aliases:
+        torch.save(obj, buffer, pickle_module=_alias_pickle_module(aliases), pickle_protocol=2)
+    else:
+        torch.save(obj, buffer)
     return buffer.getvalue()
 
 
@@ -168,6 +176,14 @@ class AliasPickler(pickle._Pickler):  # pylint: disable=protected-access
         module, qualname = alias
         self.write(pickle.GLOBAL + f"{module}\n{qualname}\n".encode())
         self.memoize(obj)
+
+
+def _alias_pickle_module(aliases: Mapping[Any, tuple[str, str]]) -> types.SimpleNamespace:
+    class _Pickler(AliasPickler):
+        def __init__(self, file, protocol: int = 2) -> None:
+            super().__init__(file, aliases, protocol=protocol)
+
+    return types.SimpleNamespace(__name__="alias_pickle", Pickler=_Pickler, dump=pickle.dump)
 
 
 def alias_dumps(obj: Any, aliases: Mapping[Any, tuple[str, str]]) -> bytes:
@@ -212,12 +228,13 @@ def write_torch_dist_store(
     *,
     grids: Mapping[str, Sequence[Region]] | None = None,
     common: Mapping[str, Any] | None = None,
+    common_aliases: Mapping[Any, tuple[str, str]] | None = None,
     extra_byte_items: Mapping[str, bytes] | None = None,
 ) -> Path:
     """A torch_dist-like store: bare keys, in-DCP common state and metadata.json."""
     if common is None:
         common = {"args": default_args(), "iteration": 7, "checkpoint_version": 3.0}
-    byte_items = {"common_state/shard_0_1": torch_save_bytes([dict(common)])}
+    byte_items = {"common_state/shard_0_1": torch_save_bytes([dict(common)], common_aliases)}
     byte_items.update(extra_byte_items or {})
     write_store(iter_dir, tensors, grids=grids, byte_items=byte_items)
     (iter_dir / "metadata.json").write_text(json.dumps(TORCH_DIST_CONFIG))
@@ -232,6 +249,7 @@ def write_fsdp_store(
     args: argparse.Namespace | None = None,
     iteration: int = 7,
     prefix: str = "model.module.",
+    common_aliases: Mapping[Any, tuple[str, str]] | None = None,
     extra_byte_items: Mapping[str, bytes] | None = None,
 ) -> Path:
     """An fsdp_dtensor-like store: ``prefix`` + fqn keys and top-level common byte items."""
@@ -240,7 +258,7 @@ def write_fsdp_store(
         "iteration": iteration,
         "checkpoint_version": 3.0,
     }
-    byte_items = {key: torch_save_bytes(value) for key, value in common.items()}
+    byte_items = {key: torch_save_bytes(value, common_aliases) for key, value in common.items()}
     byte_items.update(extra_byte_items or {})
     keyed = {prefix + fqn: tensor for fqn, tensor in tensors.items()}
     keyed_grids = {prefix + fqn: grid for fqn, grid in (grids or {}).items()}

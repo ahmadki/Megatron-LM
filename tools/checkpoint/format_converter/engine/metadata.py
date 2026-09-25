@@ -27,7 +27,7 @@ import pickle
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import _compat_pickle
@@ -193,26 +193,76 @@ def _is_dcp_class(module: str, name: str) -> bool:
 class SafeMetadataUnpickler(pickle.Unpickler):
     """Unpickler for DCP metadata and small common-state payloads.
 
+    Args:
+        file: Binary file to read the pickle from.
+        stub_unknown: Replace every global that is not allow-listed by a stub
+            instead of refusing it (for display-only decoding).
+        **kwargs: Passed to ``pickle.Unpickler``.
+
     Attributes:
         stubbed: Qualified names of the classes that were replaced by stubs.
     """
 
-    def __init__(self, file: Any, **kwargs: Any) -> None:
+    def __init__(self, file: Any, *, stub_unknown: bool = False, **kwargs: Any) -> None:
         super().__init__(file, **kwargs)
+        self.stub_unknown = stub_unknown
         self.stubbed: set[str] = set()
 
     def find_class(self, module: str, name: str) -> Any:
         """Resolve a global: allow-listed, stubbed, or refused."""
         module, name = _python3_name(module, name)
-        if module.split(".")[0] in STUBBED_PACKAGES:
-            self.stubbed.add(f"{module}.{name}")
-            return _stub_class(module, name)
         if _is_allowed_global(module, name):
             resolved = super().find_class(module, name)
             if _is_dcp_class(module, name) and not isinstance(resolved, type):
                 raise pickle.UnpicklingError(f"refusing to unpickle non-class {module}.{name}")
             return resolved
+        if self.stub_unknown or module.split(".")[0] in STUBBED_PACKAGES:
+            self.stubbed.add(f"{module}.{name}")
+            return _stub_class(module, name)
         raise pickle.UnpicklingError(f"refusing to unpickle global {module}.{name}")
+
+
+@dataclass(frozen=True)
+class DecodedPayload:
+    """A byte-item payload decoded for display.
+
+    Attributes:
+        value: The decoded object; unknown classes are :class:`Stub` objects.
+        stubbed: Qualified names of the classes that were stubbed.
+    """
+
+    value: Any
+    stubbed: frozenset[str]
+
+
+def decode_payload(payload: bytes, *, label: str) -> DecodedPayload:
+    """Decode a ``torch.save`` payload without importing or calling unknown globals.
+
+    Every global outside the allowlist becomes an inert :class:`Stub`, so the
+    result is safe to display but must not be written back.
+
+    Raises:
+        IntegrityError: The payload is not a readable ``torch.save`` blob.
+    """
+    stubbed: set[str] = set()
+
+    class _Unpickler(SafeMetadataUnpickler):
+        def __init__(self, file: Any, **kwargs: Any) -> None:
+            super().__init__(file, stub_unknown=True, **kwargs)
+            self.stubbed = stubbed
+
+    pickle_module = SimpleNamespace(
+        __name__="format_converter_stub_pickle",
+        Unpickler=_Unpickler,
+        load=lambda file, **kwargs: _Unpickler(file, **kwargs).load(),
+    )
+    try:
+        value = torch.load(
+            io.BytesIO(payload), map_location="cpu", weights_only=False, pickle_module=pickle_module
+        )
+    except Exception as err:  # torch.load of untrusted bytes can fail in any way
+        raise IntegrityError(f"cannot decode {label}: {type(err).__name__}: {err}") from err
+    return DecodedPayload(value, frozenset(stubbed))
 
 
 @dataclass(frozen=True, slots=True)

@@ -9,6 +9,7 @@ import io
 import os
 import pickle
 import re
+import types
 
 import pytest
 import torch
@@ -366,3 +367,39 @@ def test_missing_or_foreign_metadata_files(tmp_path):
     (tmp_path / ".metadata").write_bytes(pickle.dumps({"state_dict_metadata": {}}))
     with pytest.raises(IntegrityError, match="does not hold DCP Metadata"):
         MetadataView.load(tmp_path)
+
+
+def test_decode_payload_stubs_every_unknown_global(tmp_path):
+    marker = tmp_path / "trap-fired"
+    payload = torch_save_bytes(
+        {"trap": Trap(str(marker)), "plan": FakeSavePlan(), "x": torch.arange(3)},
+        {os.system: ("os", "system"), FakeSavePlan: (MEGATRON_TORCH_STRATEGY, "MCoreSavePlan")},
+    )
+    decoded = metadata_module.decode_payload(payload, label="test payload")
+    assert not marker.exists()
+    trap = decoded.value["trap"]
+    assert isinstance(trap, Stub) and trap.qualified_name == "os.system"
+    assert trap.args == (f"touch {marker}",)
+    assert decoded.value["plan"].state == {"payload": {"note": "saver side"}}
+    assert torch.equal(decoded.value["x"], torch.arange(3))
+    assert decoded.stubbed == {"os.system", f"{MEGATRON_TORCH_STRATEGY}.MCoreSavePlan"}
+    with pytest.raises(IntegrityError, match="cannot decode test payload"):
+        metadata_module.decode_payload(b"garbage", label="test payload")
+
+
+@pytest.mark.parametrize("gadget", GADGETS, indirect=True, ids=lambda g: ".".join(g))
+def test_decode_payload_stubs_code_execution_gadgets(gadget):
+    module, name, call, marker = gadget
+
+    class GadgetPickler(AliasPickler):
+        def __init__(self, file, protocol: int = 4) -> None:
+            super().__init__(file, {Placeholder: (module, name)}, protocol=protocol)
+
+    buffer = io.BytesIO()
+    pickle_module = types.SimpleNamespace(__name__="gadget_pickle", Pickler=GadgetPickler)
+    torch.save({"value": call}, buffer, pickle_module=pickle_module, pickle_protocol=4)
+    decoded = metadata_module.decode_payload(buffer.getvalue(), label="gadget")
+    value = decoded.value["value"]
+    assert isinstance(value, Stub) and value.qualified_name == f"{module}.{name}"
+    assert value.args == (SENTINEL,) and decoded.stubbed == {f"{module}.{name}"}
+    assert not marker.exists()

@@ -22,6 +22,9 @@ from .metadata import MetadataView
 from .regions import Region
 from .sizes import format_bytes
 
+DEFAULT_BATCH_BYTES = 256 * 2**20
+"""Default resident-size target of one read batch (batching amortizes ``dcp.load`` overhead)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ReadReq:
@@ -73,13 +76,20 @@ class SourceReader:
     Args:
         view: The store's metadata view.
         max_item_bytes: Largest stored chunk (decoded size) a read may touch.
+        batch_bytes: Resident-size target for callers that group small reads
+            into one batch; capped at ``max_item_bytes``.
     """
 
-    def __init__(self, view: MetadataView, *, max_item_bytes: int) -> None:
-        if max_item_bytes <= 0:
-            raise InternalError(f"max_item_bytes must be positive, got {max_item_bytes}")
+    def __init__(
+        self, view: MetadataView, *, max_item_bytes: int, batch_bytes: int = DEFAULT_BATCH_BYTES
+    ) -> None:
+        if max_item_bytes <= 0 or batch_bytes <= 0:
+            raise InternalError(
+                f"read budgets must be positive, got {max_item_bytes} and {batch_bytes}"
+            )
         self.view = view
         self.max_item_bytes = max_item_bytes
+        self.batch_bytes = min(batch_bytes, max_item_bytes)
 
     def read_into(self, reqs: Sequence[ReadReq]) -> ReadStats:
         """Fill every request's destination with one ``dcp.load``.
