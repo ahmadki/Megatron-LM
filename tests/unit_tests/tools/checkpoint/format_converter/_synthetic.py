@@ -11,7 +11,9 @@ their real global names by :class:`AliasPickler` without importing them.
 
 from __future__ import annotations
 
+import argparse
 import io
+import json
 import pickle
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -185,3 +187,72 @@ def rewrite_metadata(
     metadata = pickle.loads(path.read_bytes())
     replacement = mutate(metadata)
     path.write_bytes(alias_dumps(metadata if replacement is None else replacement, aliases or {}))
+
+
+TORCH_DIST_CONFIG = {"sharded_backend": "torch_dist", "sharded_backend_version": 1}
+
+
+def default_args(**overrides: Any) -> argparse.Namespace:
+    """A small training-args Namespace like the one Megatron stores."""
+    values = {
+        "num_layers": 2,
+        "hidden_size": 8,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "bf16": True,
+        "ckpt_format": "torch_dist",
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def write_torch_dist_store(
+    iter_dir: Path,
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    grids: Mapping[str, Sequence[Region]] | None = None,
+    common: Mapping[str, Any] | None = None,
+    extra_byte_items: Mapping[str, bytes] | None = None,
+) -> Path:
+    """A torch_dist-like store: bare keys, in-DCP common state and metadata.json."""
+    if common is None:
+        common = {"args": default_args(), "iteration": 7, "checkpoint_version": 3.0}
+    byte_items = {"common_state/shard_0_1": torch_save_bytes([dict(common)])}
+    byte_items.update(extra_byte_items or {})
+    write_store(iter_dir, tensors, grids=grids, byte_items=byte_items)
+    (iter_dir / "metadata.json").write_text(json.dumps(TORCH_DIST_CONFIG))
+    return iter_dir
+
+
+def write_fsdp_store(
+    iter_dir: Path,
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    grids: Mapping[str, Sequence[Region]] | None = None,
+    args: argparse.Namespace | None = None,
+    iteration: int = 7,
+    prefix: str = "model.module.",
+    extra_byte_items: Mapping[str, bytes] | None = None,
+) -> Path:
+    """An fsdp_dtensor-like store: ``prefix`` + fqn keys and top-level common byte items."""
+    common = {
+        "args": args if args is not None else default_args(ckpt_format="fsdp_dtensor"),
+        "iteration": iteration,
+        "checkpoint_version": 3.0,
+    }
+    byte_items = {key: torch_save_bytes(value) for key, value in common.items()}
+    byte_items.update(extra_byte_items or {})
+    keyed = {prefix + fqn: tensor for fqn, tensor in tensors.items()}
+    keyed_grids = {prefix + fqn: grid for fqn, grid in (grids or {}).items()}
+    planner_data = {key: ("model", key[len("model.") :]) for key in keyed}
+    planner_data.update({key: (key,) for key in byte_items})
+    return write_store(
+        iter_dir, keyed, grids=keyed_grids, byte_items=byte_items, planner_data=planner_data
+    )
+
+
+def write_tracker(root: Path, value: int | str) -> Path:
+    """Write ``latest_checkpointed_iteration.txt`` as Megatron does."""
+    tracker = root / "latest_checkpointed_iteration.txt"
+    tracker.write_text(f"{value}\n")
+    return tracker
