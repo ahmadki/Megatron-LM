@@ -148,6 +148,7 @@ Refusals print one line, `FC-xxx: <message> [keys...] hint: <what to do>`:
 | `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, or a legacy `mp_rank_*` checkpoint |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-A05` | `--from` disagrees with the detected format |
+| `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |
 | `FC-E02` | the staging directory is not on the destination's filesystem (part files are hard-linked into the output) |
 
 ## Format detection

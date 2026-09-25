@@ -9,6 +9,7 @@ even in environments (CI containers) where they are installed.
 
 from __future__ import annotations
 
+import enum
 import importlib
 import inspect
 import pkgutil
@@ -20,7 +21,24 @@ import pytest
 import torch
 
 from ._harness import REPO_ROOT
-from ._synthetic import default_args, write_torch_dist_store
+from ._synthetic import default_args, torch_save_bytes, write_torch_dist_store
+
+ENUMS = "megatron.core.transformer.enums"
+
+
+class FakeAttnBackend(enum.Enum):
+    """Pickled under Megatron's name ``AttnBackend``."""
+
+    auto = 5
+
+
+def megatron_common(**common):
+    """``torch.save([common])`` whose args reference Megatron's ``AttnBackend`` enum."""
+    args = default_args(attention_backend=FakeAttnBackend.auto)
+    return torch_save_bytes(
+        [{"args": args, **common}], aliases={FakeAttnBackend: (ENUMS, "AttnBackend")}
+    )
+
 
 _BLOCKER = textwrap.dedent("""
     import importlib
@@ -133,6 +151,35 @@ def test_blocker_really_blocks(scrubbed_env):
     result = _run("import megatron.core\n", scrubbed_env)
     assert result.returncode != 0
     assert "not allowed in format_converter" in result.stderr
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_plain_codec_refuses_megatron_classes_with_fc_e01(tmp_path, scrubbed_env):
+    """Runs where Megatron is blocked, so CI containers that have it exercise it too."""
+    payload = tmp_path / "common"
+    payload.write_bytes(megatron_common())
+    result = _run(
+        f"""
+        from pathlib import Path
+        from tools.checkpoint.format_converter.errors import RefusedError
+        from tools.checkpoint.format_converter.formats.base import WHOLE, CommonLayout, RawCommon
+        from tools.checkpoint.format_converter.mcore_state import common_state
+
+        assert common_state.auto_mode() is common_state.CodecMode.PLAIN
+        payload = Path({str(payload)!r}).read_bytes()
+        raw = RawCommon("test payload", CommonLayout.WRAPPED, {{WHOLE: payload}})
+        try:
+            common_state.decode(raw, common_state.CodecMode.PLAIN)
+        except RefusedError as err:
+            print(int(err.exit_code), err.format())
+        """,
+        scrubbed_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"3 FC-E01: test payload references classes only the Megatron codec can load "
+        f"({ENUMS}.AttnBackend) hint: run inside the Megatron container"
+    )
 
 
 @pytest.mark.usefixtures("local_rank_zero")
