@@ -17,7 +17,7 @@ from tools.checkpoint.format_converter.engine.metadata import MetadataView
 from tools.checkpoint.format_converter.engine.regions import Region
 from tools.checkpoint.format_converter.errors import BudgetExceeded, ExitCode, UsageError
 from tools.checkpoint.format_converter.options import CompareMode, VerifyOptions
-from tools.checkpoint.format_converter.verify.compare import _select_value_keys, overlap_units
+from tools.checkpoint.format_converter.verify.compare import overlap_units
 from tools.checkpoint.format_converter.verify.report import FindingKind
 
 from .._synthetic import dim0_grid, product_grid, torch_save_bytes, write_store
@@ -222,9 +222,8 @@ def test_sample_mode_is_seeded(tmp_path):
     samples = set()
     for seed in range(8):
         opts = VerifyOptions(mode=CompareMode.parse("sample:2"), seed=seed, common="skip")
-        chosen = _select_value_keys(keys, opts)
-        assert chosen == _select_value_keys(keys, opts) == sorted(set(chosen))
-        assert set(chosen) <= set(keys)
+        chosen = opts.value_keys(keys)
+        assert chosen == opts.value_keys(keys) == sorted(set(chosen)) and set(chosen) <= set(keys)
         report = verify_checkpoint(a, b, opts)
         assert report.values_compared == 2
         assert report.ok == ("rows" not in chosen), (seed, chosen)
@@ -300,7 +299,7 @@ def test_cli_exit_codes_and_output(tmp_path, capsys):
     assert "verify:     MISMATCH" in out and "  value      rows: 1 of 40" in out
     assert report.is_file()
     assert cli.main(["verify", str(c)]) == ExitCode.USAGE
-    assert "needs a second store B" in capsys.readouterr().err
+    assert "needs a second store B or --oracle GLOB hint: pass B" in capsys.readouterr().err
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["verify", str(c), str(d), "--mode", "sample:0"])
     assert excinfo.value.code == 2

@@ -21,6 +21,7 @@ from .formats.detect import Detection, detect_format, open_store
 from .formats.sections import Census, Section, classify_key, take_census
 from .options import InspectOptions, VerifyOptions
 from .verify.compare import compare_stores
+from .verify.oracle import verify_against_oracle
 from .verify.report import VerifyReport
 
 _LOGGER = logging.getLogger(__name__)
@@ -173,24 +174,34 @@ def inspect_checkpoint(src: Path, opts: InspectOptions) -> InspectReport:
 
 
 def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyReport:
-    """Compare store ``a`` with store ``b`` bitwise, key by key.
+    """Verify store ``a`` bitwise against store ``b`` or against digest files.
 
     Args:
         a: The store to verify (a store directory or a checkpoint root).
-        b: The store to compare it with.
+        b: The store to compare with; ``None`` when ``opts.oracle`` is set.
         opts: What to compare.
 
     Raises:
-        UsageError: ``b`` is missing.
-        ConverterError: A store cannot be resolved or is corrupt, or a compare
-            unit does not fit the memory budget.
+        UsageError: Neither or both of ``b`` and ``opts.oracle`` are given.
+        ConverterError: A store cannot be resolved or is corrupt, an oracle file
+            is malformed, or a read unit does not fit the memory budget.
     """
-    if b is None:
-        raise UsageError("verify needs a second store B to compare with")
+    if b is None and opts.oracle is None:
+        raise UsageError(
+            "verify needs a second store B or --oracle GLOB",
+            hint="pass B to compare two stores, or --oracle 'digests*.json' to check digests",
+        )
+    if b is not None and opts.oracle is not None:
+        raise UsageError(
+            "verify takes either a second store B or --oracle GLOB, not both",
+            hint="drop B to check A against the digests, or drop --oracle",
+        )
     _log_budget(opts.max_item_bytes, opts.workers)
     store_a = open_store(a, iteration=opts.iteration)
-    store_b = open_store(b, iteration=opts.iteration)
-    report = compare_stores(store_a, store_b, opts)
+    if b is None:
+        report = verify_against_oracle(store_a, opts)
+    else:
+        report = compare_stores(store_a, open_store(b, iteration=opts.iteration), opts)
     _log_reads(f"verify ({len(report.findings)} findings)", report.read_stats)
     return report
 

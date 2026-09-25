@@ -24,6 +24,7 @@ class FindingKind(enum.Enum):
     LAYOUT = "layout"
     VALUE = "value"
     BYTES = "bytes"
+    ORACLE_INCONSISTENT = "oracle_inconsistent"
 
 
 _KIND_ORDER = {kind: index for index, kind in enumerate(FindingKind)}

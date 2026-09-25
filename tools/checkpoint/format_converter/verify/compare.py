@@ -17,7 +17,6 @@ before anything is read.
 from __future__ import annotations
 
 import bisect
-import random
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -91,7 +90,7 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
         findings.extend(problems)
         if not any(p.kind in (FindingKind.SHAPE, FindingKind.DTYPE) for p in problems):
             comparable.append(key)
-    value_keys = _select_value_keys(comparable, opts)
+    value_keys = opts.value_keys(comparable)
     units = [u for key in value_keys for u in overlap_units(a_tensors[key], b_tensors[key])]
     for unit in units:
         _check_unit_budget(unit, opts.max_item_bytes)
@@ -203,15 +202,6 @@ def _metadata_findings(a: TensorEntry, b: TensorEntry, *, layout: bool) -> list[
             )
         ]
     return []
-
-
-def _select_value_keys(comparable: list[str], opts: VerifyOptions) -> list[str]:
-    if opts.mode.kind == "meta":
-        return []
-    if opts.mode.kind == "full":
-        return comparable
-    count = min(opts.mode.sample_size, len(comparable))
-    return sorted(random.Random(opts.seed).sample(comparable, count))
 
 
 def _check_unit_budget(unit: CompareUnit, max_item_bytes: int) -> None:

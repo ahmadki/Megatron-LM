@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import random
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .errors import UsageError
 from .formats.names import FORMATS
@@ -134,6 +137,8 @@ class VerifyOptions:
         common: ``bytes`` compares byte items (common state) byte for byte;
             ``skip`` ignores them.
         ignore_keys: Keys matching any of these (``re.search``) are ignored.
+        oracle: Glob of digest files to verify against instead of a second store.
+        oracle_key_map: Python file mapping oracle keys to store keys.
         max_item_bytes: Per-item read budget (one side of one compare unit).
         workers: Threads used for reading and comparing.
     """
@@ -144,6 +149,8 @@ class VerifyOptions:
     layout: bool = False
     common: str = "bytes"
     ignore_keys: tuple[re.Pattern[str], ...] = ()
+    oracle: str | None = None
+    oracle_key_map: Path | None = None
     max_item_bytes: int = field(default_factory=default_max_item_bytes)
     workers: int = DEFAULT_WORKERS
 
@@ -151,7 +158,20 @@ class VerifyOptions:
         _check_common(self.iteration, self.max_item_bytes, self.workers)
         if self.common not in COMMON_MODES:
             raise UsageError(f"--common must be one of {', '.join(COMMON_MODES)}")
+        if self.oracle_key_map is not None and self.oracle is None:
+            raise UsageError("--oracle-key-map needs --oracle")
+        if self.layout and self.oracle is not None:
+            raise UsageError("--layout compares two stores; it cannot be used with --oracle")
 
     def ignores(self, key: str) -> bool:
         """Whether ``key`` is excluded by ``ignore_keys``."""
         return any(pattern.search(key) for pattern in self.ignore_keys)
+
+    def value_keys(self, comparable: Sequence[str]) -> list[str]:
+        """The keys whose values ``mode`` compares, from ``comparable`` (sorted)."""
+        if self.mode.kind == "meta":
+            return []
+        if self.mode.kind == "full":
+            return sorted(comparable)
+        count = min(self.mode.sample_size, len(comparable))
+        return sorted(random.Random(self.seed).sample(sorted(comparable), count))

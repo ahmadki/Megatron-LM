@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -33,11 +34,13 @@ from typing import Any
 
 import torch
 
-from ..errors import BudgetExceeded
+from ..errors import BudgetExceeded, IntegrityError
 from .metadata import TensorEntry
 from .reader import ReadReq, ReadStats, SourceReader
 from .regions import Region, bounding_box, dim0_only
 from .sizes import format_bytes
+
+_SHA256_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +147,39 @@ def write_digest_file(path: Path, digests: Mapping[str, TensorDigest]) -> None:
     tmp = path.with_name(f".{path.name}.tmp")
     tmp.write_text(json.dumps(payload, indent=2) + "\n")
     os.replace(tmp, path)
+
+
+def read_digest_file(path: Path) -> dict[str, TensorDigest]:
+    """Read and validate a digest file.
+
+    Raises:
+        IntegrityError: The file is unreadable or does not follow the schema.
+    """
+    try:
+        records = json.loads(path.read_text())
+    except (OSError, ValueError) as err:
+        raise IntegrityError(f"cannot read digest file {path}: {err}") from err
+    if not isinstance(records, dict):
+        raise IntegrityError(f"digest file {path} must hold a JSON object of key records")
+    return {key: _digest_from_record(path, key, record) for key, record in records.items()}
+
+
+def _digest_from_record(path: Path, key: str, record: Any) -> TensorDigest:
+    shape = record.get("shape") if isinstance(record, dict) else None
+    dtype = record.get("dtype") if isinstance(record, dict) else None
+    sha256 = record.get("sha256") if isinstance(record, dict) else None
+    if (
+        not isinstance(shape, list)
+        or not all(isinstance(d, int) and not isinstance(d, bool) and d >= 0 for d in shape)
+        or not isinstance(dtype, str)
+        or not isinstance(sha256, str)
+        or _SHA256_HEX.match(sha256) is None
+    ):
+        raise IntegrityError(
+            f"digest file {path}: record of {key!r} must be "
+            '{"shape": [int, ...], "dtype": "torch.<type>", "sha256": "<64 hex digits>"}'
+        )
+    return TensorDigest(tuple(shape), dtype, sha256.lower())
 
 
 def _row_slabs(entry: TensorEntry, max_item_bytes: int, batch_bytes: int) -> tuple[Region, ...]:

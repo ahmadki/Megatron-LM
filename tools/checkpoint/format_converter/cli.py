@@ -178,9 +178,10 @@ def _run_inspect(args: argparse.Namespace) -> int:
 def _add_verify(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "verify",
-        help="compare two stores bitwise",
-        description="Compare store A with store B key by key: key sets, shapes, dtypes and "
-        "values bit for bit, reading each stored chunk once. Exits 5 on any difference.",
+        help="compare two stores bitwise, or check one against SHA-256 digests",
+        description="Compare store A with store B key by key (key sets, shapes, dtypes and "
+        "values bit for bit, reading each stored chunk once), or check A against SHA-256 "
+        "digest files with --oracle. Exits 5 on any difference.",
         epilog=_EPILOG,
     )
     parser.add_argument("a", type=Path, metavar="A", help="store (or checkpoint root) to verify")
@@ -210,6 +211,17 @@ def _add_verify(subparsers: Any) -> None:
         help="ignore keys matching RE (repeatable)",
     )
     parser.add_argument(
+        "--oracle",
+        metavar="GLOB",
+        help="verify A against these digest files (sorted; position = file index) instead of B",
+    )
+    parser.add_argument(
+        "--oracle-key-map",
+        type=Path,
+        metavar="PY",
+        help="Python file defining to_store_key(oracle_key, file_index) -> str | None",
+    )
+    parser.add_argument(
         "--report", type=Path, metavar="PATH.jsonl", help="write every finding as JSON lines"
     )
     _add_store_arguments(parser)
@@ -227,6 +239,8 @@ def _run_verify(args: argparse.Namespace) -> int:
         layout=args.layout,
         common=args.common,
         ignore_keys=tuple(args.ignore_key),
+        oracle=args.oracle,
+        oracle_key_map=args.oracle_key_map,
         **_read_options(args),
     )
     report = verify_checkpoint(args.a, args.b, opts)
