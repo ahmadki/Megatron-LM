@@ -11,19 +11,26 @@ A worker claims units in the staged dispatch order and, for each one:
 4. digests the pieces selected for the post-merge check and commits the unit
    (``DONE`` record, rename, journal line).
 
-It imports only the engine (standard library, torch and DCP).
+Worker processes run ``python -m tools.checkpoint.format_converter.engine.worker
+STAGING WORKER_ID --driver-pid PID`` (see :mod:`.workers`) and stop before their
+next unit once the driver is no longer their parent; the module imports only
+the engine (standard library, torch and DCP) and never uses CUDA or
+``torch.distributed``.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 import torch
 
+from ..errors import ConverterError, ExitCode, IntegrityError
 from .faults import inject_fault
 from .hashing import byte_view
 from .memory import process_peak_rss_bytes
@@ -35,15 +42,29 @@ from .reader import ReadReq, SourceReader
 from .staging import Staging, StagingPlan
 
 
-def run_worker(staging: Staging, worker_id: int) -> int:
+def run_worker(staging: Staging, worker_id: int, *, driver_pid: int | None = None) -> int:
     """Claim and execute units in dispatch order until none is left.
+
+    Args:
+        staging: The staged conversion.
+        worker_id: Id recorded in claims and the journal.
+        driver_pid: The driving process, which must stay this process's parent
+            (``None``: the units run in the driver itself).
 
     Returns:
         The number of units this worker executed.
+
+    Raises:
+        IntegrityError: The driver exited (checked before each unit).
     """
     plan = staging.plan()
     executed = 0
     for uid in plan.dispatch_order:
+        if driver_pid is not None and os.getppid() != driver_pid:
+            raise IntegrityError(
+                f"the driver (pid {driver_pid}) is gone; stopping before unit {uid}",
+                hint="rerun the conversion to resume it",
+            )
         if staging.is_complete(uid) or not staging.claim(uid, worker_id):
             continue
         execute_unit(staging, plan, uid, worker_id)
@@ -77,6 +98,7 @@ def execute_unit(staging: Staging, plan: StagingPlan, uid: int, worker_id: int) 
         "items_touched": stats.items_touched,
         "torch_load_calls": stats.torch_load_calls,
         "vmhwm_bytes": process_peak_rss_bytes(),
+        "cuda_initialized": torch.cuda.is_initialized(),
     }
     staging.complete(uid, digests, record)
 
@@ -110,3 +132,26 @@ def _digests(
 
 def _directory_bytes(path: Path) -> int:
     return sum(entry.stat().st_size for entry in path.iterdir() if entry.is_file())
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point of a worker process; returns its exit status."""
+    parser = argparse.ArgumentParser(description="format_converter unit worker")
+    parser.add_argument("staging", type=Path, help="staging directory of the conversion")
+    parser.add_argument("worker_id", type=int, help="id recorded in claims and the journal")
+    parser.add_argument(
+        "--driver-pid", type=int, help="stop before the next unit once this process is gone"
+    )
+    args = parser.parse_args(argv)
+    try:
+        run_worker(Staging(args.staging), args.worker_id, driver_pid=args.driver_pid)
+    except ConverterError as err:
+        sys.stderr.write(f"worker {args.worker_id}: error: {err.format()}\n")
+        return int(err.exit_code)
+    except KeyboardInterrupt:
+        return int(ExitCode.INTERRUPTED)
+    return int(ExitCode.OK)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

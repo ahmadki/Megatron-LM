@@ -40,7 +40,7 @@ from .staging import (
     ensure_same_file_system,
     target_exists_error,
 )
-from .worker import run_worker
+from .workers import run_units
 
 DEFAULT_CHECKED_PIECES = 16
 """Pieces re-read and compared with their digests after the merge."""
@@ -113,6 +113,7 @@ class RunOptions:
     """How to run a program.
 
     Attributes:
+        workers: Worker processes executing units; 0 runs them in this process.
         resume: ``auto`` continues existing staging of the same conversion;
             ``never`` refuses to run when staging exists.
         restart: Discard existing staging (of any conversion) first.
@@ -124,6 +125,7 @@ class RunOptions:
             Only that subdirectory is ever written or deleted.
     """
 
+    workers: int = 0
     resume: str = "auto"
     restart: bool = False
     keep_staging: bool = False
@@ -202,7 +204,7 @@ def run_program(
                 raise target_exists_error(target)
             if not resumed:
                 staging.stage(program.staging_plan(), program.staged_units())
-            units_run = run_worker(staging, worker_id=0)
+            units_run = run_units(staging, workers=options.workers)
             merge = MetadataMerger(program.expected, program.expected_bytes).merge(
                 staging.part_stores(),
                 staging.final_dir,
