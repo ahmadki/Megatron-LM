@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from tools.checkpoint.format_converter.engine.metadata import MetadataView
-from tools.checkpoint.format_converter.engine.pieces import BytePiece, Unit, copy_pieces
+from tools.checkpoint.format_converter.engine.pieces import BytePiece, Piece, Unit, copy_pieces
 from tools.checkpoint.format_converter.engine.reader import SourceReader
 from tools.checkpoint.format_converter.engine.runner import (
     RunOptions,
@@ -24,6 +24,7 @@ from tools.checkpoint.format_converter.engine.runner import (
     choose_checked,
     run_program,
 )
+from tools.checkpoint.format_converter.engine.scheduler import dispatch_order, pack_units
 from tools.checkpoint.format_converter.engine.staging import PublishTarget
 
 from ._synthetic import dim0_grid, torch_save_bytes, write_store
@@ -69,6 +70,29 @@ def build_program(source: Path, target: PublishTarget, *, pieces_per_unit: int =
         writer_threads=2,
         max_item_bytes=2**30,
         fingerprint=fingerprint,
+    )
+
+
+def packed_program(
+    view: MetadataView,
+    target: PublishTarget,
+    pieces: list[Piece],
+    byte_pieces: tuple[BytePiece, ...] = (),
+    *,
+    unit_bytes: int,
+    hard_cap: int = 2**30,
+) -> WriteProgram:
+    """A program of the given pieces packed by the scheduler."""
+    units = pack_units(pieces, byte_pieces, unit_bytes=unit_bytes, hard_cap=hard_cap)
+    fingerprint = hashlib.sha256(f"{view.fingerprint()}|{target.iter_dir}|{unit_bytes}".encode())
+    return WriteProgram(
+        source=view,
+        units=units,
+        dispatch_order=dispatch_order(units),
+        checked=choose_checked(units, seed=fingerprint.hexdigest()),
+        writer_threads=1,
+        max_item_bytes=hard_cap,
+        fingerprint=fingerprint.hexdigest(),
     )
 
 

@@ -26,6 +26,7 @@ import torch
 
 from .faults import inject_fault
 from .hashing import byte_view
+from .memory import process_peak_rss_bytes
 from .merge import ItemDigest
 from .metadata import MetadataView
 from .part_writer import write_part
@@ -75,6 +76,7 @@ def execute_unit(staging: Staging, plan: StagingPlan, uid: int, worker_id: int) 
         "bytes_written": _directory_bytes(part_dir),
         "items_touched": stats.items_touched,
         "torch_load_calls": stats.torch_load_calls,
+        "vmhwm_bytes": process_peak_rss_bytes(),
     }
     staging.complete(uid, digests, record)
 

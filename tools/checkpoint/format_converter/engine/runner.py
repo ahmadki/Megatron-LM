@@ -10,8 +10,9 @@ format-specific parts (marker files, sidecars) are added by a ``finalize``
 callback before the merged store is checked and published.
 
 Before anything is created, the target, the source store and the staging
-directory must be disjoint (none inside another), and an existing target is
-replaced (``overwrite``) only if it is a single store directory.
+directory must be disjoint (none inside another), an existing target is
+replaced (``overwrite``) only if it is a single store directory, and the
+target's file system must have room for the output (exit 8 otherwise).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import UsageError
+from .memory import check_free_disk, estimate_output_bytes
 from .merge import MergeSummary, MetadataMerger, post_check
 from .metadata import MetadataView
 from .pieces import ExpectedTensor, Unit, expected_tensors
@@ -178,6 +180,8 @@ def run_program(
             or post-check fails.
         FingerprintMismatch: Staging of another conversion exists (exit 7).
         RefusedError: Staging is not on the target's file system (FC-E02).
+        BudgetExceeded: The target's file system has less than 1.02 x the
+            estimated output free (exit 8).
     """
     staging = Staging(target.default_staging_dir(options.staging_dir))
     check_disjoint(program.source.iter_dir, target, staging.root)
@@ -185,6 +189,7 @@ def run_program(
         if not options.overwrite:
             raise target_exists_error(target)
         check_replaceable(target.iter_dir)
+    check_free_disk(_existing_ancestor(target.iter_dir), estimate_output_bytes(program.units))
     target.iter_dir.parent.mkdir(parents=True, exist_ok=True)
     with staging.locked():
         ensure_same_file_system(staging.root, target.iter_dir.parent)
@@ -246,6 +251,12 @@ def check_disjoint(source_dir: Path, target: PublishTarget, staging_dir: Path) -
 
 def _overlap(a: Path, b: Path) -> bool:
     return a in b.parents or b in a.parents
+
+
+def _existing_ancestor(path: Path) -> Path:
+    while not path.exists():
+        path = path.parent
+    return path
 
 
 def save_id(fingerprint: str) -> str:

@@ -10,24 +10,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .engine.memory import available_memory_bytes
 from .errors import UsageError
 from .formats.names import FORMATS
 
 DEFAULT_WORKERS = 4
 MAX_ITEM_FRACTION_OF_AVAILABLE = 0.25
 _FALLBACK_MAX_ITEM_BYTES = 4 * 2**30
-
-
-def available_memory_bytes() -> int | None:
-    """``MemAvailable`` from ``/proc/meminfo`` (Linux), else ``None``."""
-    try:
-        with open("/proc/meminfo", encoding="ascii") as meminfo:
-            for line in meminfo:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
 
 
 def default_max_item_bytes() -> int:

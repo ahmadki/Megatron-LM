@@ -108,7 +108,7 @@ def plan_region_load(view: MetadataView, reqs: Sequence[ReadReq]) -> RegionLoadP
                 continue
             touched.append(chunk)
             box = bounding_box(overlap for _, overlap in needs)
-            if len(needs) == 1 and needs[0][1] == box:
+            if staging_bytes(chunk, [overlap for _, overlap in needs]) == 0:
                 req = needs[0][0]
                 parts.append((box, req.dst[box.relative_to(req.region).slices()]))
                 continue
@@ -123,6 +123,18 @@ def plan_region_load(view: MetadataView, reqs: Sequence[ReadReq]) -> RegionLoadP
                 )
         targets[key] = torch_compat.RegionTarget(entry.shape, entry.dtype, parts)
     return RegionLoadPlan(targets, tuple(copies), tuple(touched))
+
+
+def staging_bytes(chunk: StoredChunk, overlaps: Sequence[Region]) -> int:
+    """Size of the staging buffer a batch needs for one stored chunk.
+
+    ``overlaps`` are the parts of the chunk the batch's requests need. A single
+    request is read straight into its destination; several share one staging
+    buffer covering their bounding box, which is copied out after the load.
+    """
+    if len(overlaps) <= 1:
+        return 0
+    return bounding_box(overlaps).numel() * chunk.dtype.itemsize
 
 
 def execute_region_load(
