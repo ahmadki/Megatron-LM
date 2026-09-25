@@ -47,5 +47,6 @@ def test_key_selection():
     assert InspectOptions(chunks=True).lists_keys
 
 
-def test_cli_format_choices_match_the_detector():
+def test_cli_choices_match_the_options():
     assert cli.FORMAT_CHOICES == FORMATS
+    assert cli.COMMON_CHOICES == options.COMMON_MODES

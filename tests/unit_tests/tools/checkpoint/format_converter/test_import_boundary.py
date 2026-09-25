@@ -9,6 +9,9 @@ even in environments (CI containers) where they are installed.
 
 from __future__ import annotations
 
+import importlib
+import inspect
+import pkgutil
 import subprocess
 import sys
 import textwrap
@@ -83,6 +86,48 @@ def test_every_module_imports_without_megatron(scrubbed_env):
     assert int(result.stdout.strip()) >= 4
 
 
+def test_api_exports_are_functions_after_the_subpackages_load():
+    """Importing ``verify/`` sets the package attribute ``verify``; no export may clash."""
+    importlib.import_module("tools.checkpoint.format_converter.verify.compare")
+    fc = importlib.import_module("tools.checkpoint.format_converter")
+    from tools.checkpoint.format_converter import (  # pylint: disable=import-outside-toplevel
+        inspect_checkpoint,
+        verify_checkpoint,
+    )
+
+    for name in fc.__all__:
+        if name != "__version__":
+            assert inspect.isfunction(getattr(fc, name)), name
+    assert inspect.isfunction(inspect_checkpoint) and inspect.isfunction(verify_checkpoint)
+    assert set(fc.__all__).isdisjoint(info.name for info in pkgutil.iter_modules(fc.__path__))
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_usage_errors_do_not_import_torch(scrubbed_env):
+    result = _run(
+        """
+        from tools.checkpoint.format_converter import cli
+        for argv in (
+            ["verify", "A", "--mode", "bogus"],
+            ["verify", "A", "--seed", "x"],
+            ["inspect", "A", "--max-item-bytes", "lots"],
+            ["inspect", "A", "--from", "zarr"],
+        ):
+            try:
+                cli.main(argv)
+            except SystemExit as exit_:
+                assert exit_.code == 2, (argv, exit_.code)
+            else:
+                raise AssertionError(f"{argv} was accepted")
+        assert "torch" not in sys.modules, "a usage error imported torch"
+        print("ok")
+        """,
+        scrubbed_env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
 @pytest.mark.usefixtures("local_rank_zero")
 def test_blocker_really_blocks(scrubbed_env):
     result = _run("import megatron.core\n", scrubbed_env)
@@ -91,7 +136,7 @@ def test_blocker_really_blocks(scrubbed_env):
 
 
 @pytest.mark.usefixtures("local_rank_zero")
-def test_inspect_runs_without_megatron(tmp_path, scrubbed_env):
+def test_commands_run_without_megatron(tmp_path, scrubbed_env):
     store = write_torch_dist_store(
         tmp_path / "store",
         {"decoder.final_layernorm.weight": torch.ones(4)},
@@ -101,14 +146,16 @@ def test_inspect_runs_without_megatron(tmp_path, scrubbed_env):
     result = _run(
         f"""
         from tools.checkpoint.format_converter import cli
-        code = cli.main(["inspect", {str(store)!r}, "--digests", {str(digests)!r}])
+        inspected = cli.main(["inspect", {str(store)!r}, "--digests", {str(digests)!r}])
+        verified = cli.main(["verify", {str(store)!r}, {str(store)!r}])
         import torch
         assert not torch.cuda.is_initialized()
         assert not [m for m in sys.modules if m.split(".")[0] in BLOCKED]
-        sys.exit(code)
+        sys.exit(inspected or verified)
         """,
         scrubbed_env,
     )
     assert result.returncode == 0, result.stderr
     assert "format:     torch_dist (mcore)" in result.stdout
+    assert "verify:     OK" in result.stdout
     assert digests.is_file()

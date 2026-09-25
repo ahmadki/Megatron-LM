@@ -102,6 +102,11 @@ def test_split_dim0_tiles_the_region(max_rows):
         assert sum(s.numel() for s in slabs) == region.numel()
 
 
+def test_text_form():
+    assert str(Region((1, 0), (2, 3))) == "[1:3, 0:3]"
+    assert str(Region((), ())) == "[]"
+
+
 def test_is_full_and_zero_dim():
     assert Region.full(SHAPE).is_full(SHAPE)
     assert not Region((0, 0), (4, 2)).is_full(SHAPE)

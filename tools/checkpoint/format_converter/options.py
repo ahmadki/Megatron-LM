@@ -79,3 +79,79 @@ class InspectOptions:
     def selects(self, key: str) -> bool:
         """Whether ``key`` is selected by ``keys`` (all keys when unset)."""
         return self.keys is None or self.keys.search(key) is not None
+
+
+COMMON_MODES = ("skip", "bytes")
+_MODE_PATTERN = re.compile(r"^(?:(?P<kind>meta|full)|sample:(?P<size>[1-9]\d*))$")
+
+
+@dataclass(frozen=True, slots=True)
+class CompareMode:
+    """How much of each tensor ``verify`` compares.
+
+    Attributes:
+        kind: ``meta`` (keys, shapes, dtypes), ``full`` (all values) or
+            ``sample`` (values of ``sample_size`` keys chosen with a seeded RNG).
+        sample_size: Number of sampled keys (``sample`` only).
+    """
+
+    kind: str
+    sample_size: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("meta", "full", "sample"):
+            raise UsageError(f"--mode must be meta, full or sample:N, got {self.kind!r}")
+        if (self.kind == "sample") != (self.sample_size > 0):
+            raise UsageError("--mode sample needs a positive sample size (sample:N)")
+
+    @classmethod
+    def parse(cls, text: str) -> CompareMode:
+        """Parse ``meta``, ``full`` or ``sample:N``.
+
+        Raises:
+            ValueError: ``text`` is none of those.
+        """
+        match = _MODE_PATTERN.match(text)
+        if match is None:
+            raise ValueError(f"invalid mode {text!r}; use meta, full or sample:N")
+        if match.group("kind"):
+            return cls(match.group("kind"))
+        return cls("sample", int(match.group("size")))
+
+    def __str__(self) -> str:
+        return f"sample:{self.sample_size}" if self.kind == "sample" else self.kind
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyOptions:
+    """Options of ``verify``.
+
+    Attributes:
+        iteration: Iteration to open under checkpoint roots (both sides).
+        mode: What to compare (see :class:`CompareMode`).
+        seed: Seed of the key sample for ``sample:N``.
+        layout: Also require identical chunk grids.
+        common: ``bytes`` compares byte items (common state) byte for byte;
+            ``skip`` ignores them.
+        ignore_keys: Keys matching any of these (``re.search``) are ignored.
+        max_item_bytes: Per-item read budget (one side of one compare unit).
+        workers: Threads used for reading and comparing.
+    """
+
+    iteration: int | None = None
+    mode: CompareMode = CompareMode("full")
+    seed: int = 0
+    layout: bool = False
+    common: str = "bytes"
+    ignore_keys: tuple[re.Pattern[str], ...] = ()
+    max_item_bytes: int = field(default_factory=default_max_item_bytes)
+    workers: int = DEFAULT_WORKERS
+
+    def __post_init__(self) -> None:
+        _check_common(self.iteration, self.max_item_bytes, self.workers)
+        if self.common not in COMMON_MODES:
+            raise UsageError(f"--common must be one of {', '.join(COMMON_MODES)}")
+
+    def ignores(self, key: str) -> bool:
+        """Whether ``key`` is excluded by ``ignore_keys``."""
+        return any(pattern.search(key) for pattern in self.ignore_keys)

@@ -105,6 +105,9 @@ class Region:
         """Index expression selecting this region from a tensor laid out in its coordinates."""
         return tuple(slice(o, e) for o, e in zip(self.offsets, self.ends))
 
+    def __str__(self) -> str:
+        return "[" + ", ".join(f"{o}:{e}" for o, e in zip(self.offsets, self.ends)) + "]"
+
     def _check_rank(self, other: Region) -> None:
         if other.ndim != self.ndim:
             raise ValueError(f"regions of rank {self.ndim} and {other.ndim} are not comparable")

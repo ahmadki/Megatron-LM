@@ -22,9 +22,12 @@ from .errors import ConverterError, ExitCode
 
 if TYPE_CHECKING:
     from .api import InspectReport
+    from .verify.report import VerifyReport
 
 PROG = "python -m tools.checkpoint.format_converter"
 FORMAT_CHOICES = ("torch_dist", "fsdp_dtensor")
+COMMON_CHOICES = ("skip", "bytes")
+MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
 _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
@@ -46,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     _add_inspect(subparsers)
+    _add_verify(subparsers)
     return parser
 
 
@@ -81,6 +85,15 @@ def _size(text: str) -> int:
 
     try:
         return parse_size(text)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err)) from err
+
+
+def _mode(text: str) -> Any:
+    from .options import CompareMode  # pylint: disable=import-outside-toplevel
+
+    try:
+        return CompareMode.parse(text)
     except ValueError as err:
         raise argparse.ArgumentTypeError(str(err)) from err
 
@@ -160,6 +173,91 @@ def _run_inspect(args: argparse.Namespace) -> int:
     else:
         sys.stdout.write(render_inspect(report, digests_path=args.digests))
     return int(ExitCode.OK)
+
+
+def _add_verify(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "verify",
+        help="compare two stores bitwise",
+        description="Compare store A with store B key by key: key sets, shapes, dtypes and "
+        "values bit for bit, reading each stored chunk once. Exits 5 on any difference.",
+        epilog=_EPILOG,
+    )
+    parser.add_argument("a", type=Path, metavar="A", help="store (or checkpoint root) to verify")
+    parser.add_argument("b", type=Path, metavar="B", nargs="?", help="store to compare with")
+    parser.add_argument(
+        "--mode",
+        type=_mode,
+        default="full",
+        metavar="MODE",
+        help="meta (keys, shapes, dtypes), full (all values; default) or sample:N "
+        "(values of N keys chosen with --seed)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="seed of sample:N (default: 0)")
+    parser.add_argument("--layout", action="store_true", help="also require identical chunk grids")
+    parser.add_argument(
+        "--common",
+        choices=COMMON_CHOICES,
+        default="bytes",
+        help="bytes: byte items (common state) must be byte-identical (default); skip: ignore them",
+    )
+    parser.add_argument(
+        "--ignore-key",
+        type=_regex,
+        action="append",
+        default=[],
+        metavar="RE",
+        help="ignore keys matching RE (repeatable)",
+    )
+    parser.add_argument(
+        "--report", type=Path, metavar="PATH.jsonl", help="write every finding as JSON lines"
+    )
+    _add_store_arguments(parser)
+    parser.set_defaults(handler=_run_verify)
+
+
+def _run_verify(args: argparse.Namespace) -> int:
+    # pylint: disable=import-outside-toplevel
+    from .api import verify_checkpoint
+    from .options import VerifyOptions
+
+    opts = VerifyOptions(
+        mode=args.mode,
+        seed=args.seed,
+        layout=args.layout,
+        common=args.common,
+        ignore_keys=tuple(args.ignore_key),
+        **_read_options(args),
+    )
+    report = verify_checkpoint(args.a, args.b, opts)
+    if args.report is not None:
+        report.write_jsonl(args.report)
+    sys.stdout.write(render_verify(report))
+    return int(ExitCode.OK if report.ok else ExitCode.VERIFY_MISMATCH)
+
+
+def render_verify(report: VerifyReport) -> str:
+    """Human-readable text of a ``verify`` report."""
+    # pylint: disable=import-outside-toplevel
+    from .engine.sizes import format_bytes
+
+    stats = report.read_stats
+    lines = [
+        f"verify:     {'OK' if report.ok else 'MISMATCH'}",
+        f"a:          {report.a}",
+        f"reference:  {report.reference}",
+        f"compared:   {report.keys_compared} tensors, values of {report.values_compared} "
+        f"(mode {report.mode}), {report.byte_items_compared} byte items",
+        f"read:       {format_bytes(stats.bytes_read)} in {stats.items_touched} stored items "
+        f"(amplification {stats.amplification:.2f})",
+        f"findings:   {len(report.findings)}",
+    ]
+    for finding in report.findings[:MAX_PRINTED_FINDINGS]:
+        lines.append(f"  {finding.kind.value:<10} {finding.key}: {finding.detail}")
+    hidden = len(report.findings) - MAX_PRINTED_FINDINGS
+    if hidden > 0:
+        lines.append(f"  ... {hidden} more (use --report PATH.jsonl for all)")
+    return "\n".join(lines) + "\n"
 
 
 def render_inspect(report: InspectReport, *, digests_path: Path | None = None) -> str:

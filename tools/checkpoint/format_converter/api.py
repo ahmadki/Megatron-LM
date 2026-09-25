@@ -15,10 +15,13 @@ from .engine.metadata import MetadataView
 from .engine.reader import ReadStats, SourceReader
 from .engine.regions import Region
 from .engine.sizes import format_bytes
+from .errors import UsageError
 from .formats.common_summary import CommonSummary, summarize_common_state
 from .formats.detect import Detection, detect_format, open_store
 from .formats.sections import Census, Section, classify_key, take_census
-from .options import InspectOptions
+from .options import InspectOptions, VerifyOptions
+from .verify.compare import compare_stores
+from .verify.report import VerifyReport
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,9 +172,27 @@ def inspect_checkpoint(src: Path, opts: InspectOptions) -> InspectReport:
     )
 
 
-def verify_checkpoint(a: Path, b: Path | None, opts: object) -> object:
-    """Compare two checkpoint stores (not implemented yet)."""
-    raise NotImplementedError(f"verify is not implemented yet (a={a}, b={b}, opts={opts})")
+def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyReport:
+    """Compare store ``a`` with store ``b`` bitwise, key by key.
+
+    Args:
+        a: The store to verify (a store directory or a checkpoint root).
+        b: The store to compare it with.
+        opts: What to compare.
+
+    Raises:
+        UsageError: ``b`` is missing.
+        ConverterError: A store cannot be resolved or is corrupt, or a compare
+            unit does not fit the memory budget.
+    """
+    if b is None:
+        raise UsageError("verify needs a second store B to compare with")
+    _log_budget(opts.max_item_bytes, opts.workers)
+    store_a = open_store(a, iteration=opts.iteration)
+    store_b = open_store(b, iteration=opts.iteration)
+    report = compare_stores(store_a, store_b, opts)
+    _log_reads(f"verify ({len(report.findings)} findings)", report.read_stats)
+    return report
 
 
 def _log_budget(max_item_bytes: int, workers: int) -> None:
