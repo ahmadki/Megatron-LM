@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 from ..errors import IntegrityError, InternalError
 
 if TYPE_CHECKING:
+    import torch
+
+    from ..engine.metadata import MetadataView, TensorEntry
     from ..engine.reader import SourceReader
+    from ..engine.regions import Region
 
 
 class Section(enum.Enum):
@@ -32,6 +36,7 @@ class Section(enum.Enum):
     MODEL = "model"
     OPTIMIZER_STATE = "optimizer.state"
     OPTIMIZER_OTHER = "optimizer other"
+    SCHEDULER = "scheduler"
     COMMON = "common"
     RNG = "rng"
     RERUN = "rerun"
@@ -138,6 +143,23 @@ class FormatAdapter(Protocol):
     def classify(self, key: str, *, is_bytes: bool) -> Section:
         """The section of a key of this format (``OTHER`` if unknown)."""
 
+    def sections(self, view: MetadataView) -> dict[str, Section]:
+        """The section of every key of a store, refusing keys the format does not know."""
+
+    def stored_key(self, relative: str) -> str:
+        """The store key of a model-relative key (see ``core/keys.py``)."""
+
+    def relative_key(self, key: str) -> str:
+        """The model-relative key of a store's model key."""
+
+    def planner_path(self, key: str) -> tuple[str, ...] | None:
+        """``Metadata.planner_data`` entry of an output model key (``None``: not recorded)."""
+
+    def output_grid(
+        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+    ) -> tuple[Region, ...]:
+        """The chunk grid a converted model tensor is written with."""
+
     def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
         """The undecoded common state of ``reader``'s store, if it has one."""
 
@@ -152,3 +174,18 @@ class FormatAdapter(Protocol):
 
     def validate_published(self, iter_dir: Path) -> None:
         """Check a written store has exactly this format's markers."""
+
+
+def model_tensors(
+    view: MetadataView, sections: Mapping[str, Section], adapter: FormatAdapter
+) -> dict[str, TensorEntry]:
+    """A store's model tensors by model-relative key (sorted).
+
+    Raises:
+        RefusedError: The adapter refuses a model key's envelope.
+    """
+    return {
+        adapter.relative_key(key): view.tensors[key]
+        for key in sorted(view.tensors)
+        if sections[key] is Section.MODEL
+    }

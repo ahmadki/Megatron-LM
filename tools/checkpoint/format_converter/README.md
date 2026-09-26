@@ -45,7 +45,7 @@ statistics) and `--version`.
 
 Summarizes a store from its metadata: format, dialect and the evidence for
 them, key counts and tensor bytes per section (model, optimizer.state,
-optimizer other, common, rng, extra_state, other), dtype and chunks-per-tensor
+optimizer other, scheduler, common, rng, rerun, extra_state, other), dtype and chunks-per-tensor
 histograms, the largest stored chunk, DCP metadata facts, and the common state
 with selected training arguments. The common state is read from the byte item
 `common_state/shard_0_1` or a legacy `common.pt` file (which wins) for

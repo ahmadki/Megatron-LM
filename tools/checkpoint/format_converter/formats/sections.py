@@ -2,24 +2,21 @@
 
 """Key sections and a per-store census.
 
-torch_dist keys are classified by the exact rules of the torch_dist adapter
-(the ones conversion uses); fsdp_dtensor keys by descriptive prefix rules.
+Keys are classified by the exact rules of each format's adapter (the ones
+conversion uses).
 """
 
 from __future__ import annotations
 
-import re
 from collections import Counter
 from dataclasses import dataclass
 
 from ..engine.metadata import MetadataView, StoredChunk
-from . import torch_dist
+from . import fsdp_mfsdp_v1, torch_dist
 from .base import Section
-from .detect import FSDP_COMMON_ITEMS, FSDP_DTENSOR, FSDP_OPTIONAL_COMMON_ITEMS, TORCH_DIST
+from .detect import FSDP_DTENSOR, TORCH_DIST
 
 __all__ = ["Census", "Section", "SectionTotals", "classify_key", "take_census"]
-
-_EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
 
 
 def classify_key(fmt: str, key: str, *, is_bytes: bool) -> Section:
@@ -27,22 +24,8 @@ def classify_key(fmt: str, key: str, *, is_bytes: bool) -> Section:
     if fmt == TORCH_DIST:
         return torch_dist.classify_key(key, is_bytes=is_bytes)
     if fmt == FSDP_DTENSOR:
-        return _classify_fsdp(key)
+        return fsdp_mfsdp_v1.classify_key(key, is_bytes=is_bytes)
     raise ValueError(f"unknown format {fmt!r}")
-
-
-def _classify_fsdp(key: str) -> Section:
-    if key.startswith("rng_state"):
-        return Section.RNG
-    if _EXTRA_STATE.search(key):
-        return Section.EXTRA_STATE
-    if key.startswith("optimizer.state."):
-        return Section.OPTIMIZER_STATE
-    if key.startswith("optimizer."):
-        return Section.OPTIMIZER_OTHER
-    if key in FSDP_COMMON_ITEMS or key in FSDP_OPTIONAL_COMMON_ITEMS:
-        return Section.COMMON
-    return Section.MODEL if key.startswith("model.") else Section.OTHER
 
 
 @dataclass(frozen=True, slots=True)

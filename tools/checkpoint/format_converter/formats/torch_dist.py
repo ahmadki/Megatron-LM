@@ -33,13 +33,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
+import torch
+
 from .. import errors
+from ..core.names import DIALECTS, TORCH_DIST
 from ..engine.metadata import MetadataView
 from ..engine.reader import SourceReader
+from ..engine.regions import Region
 from ..errors import IntegrityError, InternalError, Refusal, UsageError
 from .base import WHOLE, CommonLayout, RawCommon, Section
 from .detect import LEGACY_COMMON_FILE, TORCH_DIST_COMMON_ITEM, TORCH_DIST_CONFIG_FILE
-from ..core.names import DIALECTS, TORCH_DIST
 
 TORCH_DIST_CONFIG = {"sharded_backend": TORCH_DIST, "sharded_backend_version": 1}
 """Contents of ``metadata.json`` (Megatron's ``CheckpointingConfig``)."""
@@ -96,6 +99,33 @@ class TorchDistAdapter:
     def classify(self, key: str, *, is_bytes: bool) -> Section:
         """The section of ``key`` (see :func:`classify_key`)."""
         return classify_key(key, is_bytes=is_bytes)
+
+    def sections(self, view: MetadataView) -> dict[str, Section]:
+        """The section of every key (see :func:`weights_only_sections`)."""
+        return weights_only_sections(view)
+
+    def stored_key(self, relative: str) -> str:
+        """torch_dist model keys are bare: the model-relative key itself."""
+        return relative
+
+    def relative_key(self, key: str) -> str:
+        """torch_dist model keys are bare: the key itself."""
+        return key
+
+    def planner_path(self, key: str) -> None:
+        """torch_dist stores record no planner paths."""
+        del key
+
+    def output_grid(
+        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+    ) -> tuple[Region, ...]:
+        """One chunk per converted tensor; Megatron's loader reads any chunk grid.
+
+        Pieces larger than half the unit budget are split along dimension 0 by
+        the scheduler; ``max_chunk_bytes`` only applies to fsdp_dtensor.
+        """
+        del dtype, max_chunk_bytes
+        return (Region.full(shape),)
 
     def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
         """The common state: ``common.pt`` if the store has one (as Megatron reads it), else

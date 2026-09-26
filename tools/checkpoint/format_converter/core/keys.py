@@ -138,6 +138,10 @@ MLA_PARAM = re.compile(
 TE_OP_FUSER_MLP = re.compile(r"\.mlp\.[0-9]+\.")
 """An MLP built with Transformer Engine's operation fuser (``mlp.<i>.basic_ops...``)."""
 
+EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
+"""A Transformer Engine ``_extra_state`` key (``_extra_state<i>`` when grouped; torch_dist
+stores it as a tensor or a ``/shard_*`` byte item)."""
+
 FC1_WEIGHT = re.compile(r"(?:^|\.)linear_fc1\.weight$")
 """The weight of an MLP's first projection (a candidate gated linear unit)."""
 

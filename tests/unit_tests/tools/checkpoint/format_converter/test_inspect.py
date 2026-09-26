@@ -132,7 +132,7 @@ def test_fsdp_report(fsdp_store):
     assert {s: t.keys for s, t in report.census.sections.items()} == {
         Section.MODEL: 3,
         Section.COMMON: 4,
-        Section.OTHER: 1,
+        Section.SCHEDULER: 1,
     }
     assert report.has_planner_data
     common = report.common
