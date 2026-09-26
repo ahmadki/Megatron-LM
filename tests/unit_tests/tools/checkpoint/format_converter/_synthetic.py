@@ -251,8 +251,12 @@ def write_fsdp_store(
     prefix: str = "model.module.",
     common_aliases: Mapping[Any, tuple[str, str]] | None = None,
     extra_byte_items: Mapping[str, bytes] | None = None,
+    extra_tensors: Mapping[str, torch.Tensor] | None = None,
 ) -> Path:
-    """An fsdp_dtensor-like store: ``prefix`` + fqn keys and top-level common byte items."""
+    """An fsdp_dtensor-like store: ``prefix`` + fqn keys and top-level common byte items.
+
+    ``extra_tensors`` are stored under their own keys (optimizer or RNG state).
+    """
     common = {
         "args": args if args is not None else default_args(ckpt_format="fsdp_dtensor"),
         "iteration": iteration,
@@ -261,6 +265,7 @@ def write_fsdp_store(
     byte_items = {key: torch_save_bytes(value, common_aliases) for key, value in common.items()}
     byte_items.update(extra_byte_items or {})
     keyed = {prefix + fqn: tensor for fqn, tensor in tensors.items()}
+    keyed.update(extra_tensors or {})
     keyed_grids = {prefix + fqn: grid for fqn, grid in (grids or {}).items()}
     planner_data = {key: ("model", key[len("model.") :]) for key in keyed}
     planner_data.update({key: (key,) for key in byte_items})

@@ -15,6 +15,7 @@ from typing import Any
 from .core.names import FORMATS, TORCH_DIST
 from .engine.memory import available_memory_bytes
 from .errors import UsageError
+from .verify.contract import CONTRACTS
 
 DEFAULT_WORKERS = 4
 MAX_ITEM_FRACTION_OF_AVAILABLE = 0.25
@@ -76,6 +77,7 @@ class InspectOptions:
 
 
 COMMON_MODES = ("skip", "bytes", "semantic")
+MAP_MODES = ("identity", "convert")
 _MODE_PATTERN = re.compile(r"^(?:(?P<kind>meta|full)|sample:(?P<size>[1-9]\d*))$")
 
 
@@ -133,6 +135,10 @@ class VerifyOptions:
         oracle_key_map: Python file mapping oracle keys to store keys.
         max_item_bytes: Per-item read budget (one side of one compare unit).
         workers: Threads used for reading and comparing.
+        expected_diff: Id of the expected-difference contract A is compared
+            under (it sets the common-state comparison), if any.
+        map: ``identity`` compares key by key; ``convert`` replays the
+            conversion plan of A and compares the result with B.
     """
 
     iteration: int | None = None
@@ -145,9 +151,12 @@ class VerifyOptions:
     oracle_key_map: Path | None = None
     max_item_bytes: int = field(default_factory=default_max_item_bytes)
     workers: int = DEFAULT_WORKERS
+    expected_diff: str | None = None
+    map: str = "identity"
 
     def __post_init__(self) -> None:
         _check_common(self.iteration, self.max_item_bytes, self.workers)
+        self._check_comparison()
         if self.common not in COMMON_MODES:
             raise UsageError(f"--common must be one of {', '.join(COMMON_MODES)}")
         if self.oracle_key_map is not None and self.oracle is None:
@@ -157,6 +166,19 @@ class VerifyOptions:
         if self.common == "semantic" and self.oracle is not None:
             raise UsageError(
                 "--common semantic compares two stores; it cannot be used with --oracle"
+            )
+
+    def _check_comparison(self) -> None:
+        if self.expected_diff is not None and self.expected_diff not in CONTRACTS:
+            raise UsageError(f"--expected-diff must be one of {', '.join(CONTRACTS)}")
+        if self.map not in MAP_MODES:
+            raise UsageError(f"--map must be one of {', '.join(MAP_MODES)}")
+        if self.oracle is not None and (self.expected_diff is not None or self.map != "identity"):
+            raise UsageError("--expected-diff and --map convert compare two stores, not an oracle")
+        if self.map == "convert" and (self.expected_diff is not None or self.layout):
+            raise UsageError(
+                "--map convert compares B with A's replayed conversion; it takes no "
+                "--expected-diff or --layout"
             )
 
     def ignores(self, key: str) -> bool:

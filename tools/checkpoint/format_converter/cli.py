@@ -30,6 +30,8 @@ PROG = "python -m tools.checkpoint.format_converter"
 FORMAT_CHOICES = ("torch_dist", "fsdp_dtensor")
 OPTIMIZER_CHOICES = ("drop", "convert")
 COMMON_CHOICES = ("skip", "bytes", "semantic")
+MAP_CHOICES = ("identity", "convert")
+EXPECTED_DIFF_CHOICES = ("A", "B", "C", "D", "E")
 RESUME_CHOICES = ("auto", "never")
 MAX_PRINTED_FINDINGS = 20
 
@@ -222,6 +224,20 @@ def _add_verify(subparsers: Any) -> None:
         help="ignore keys matching RE (repeatable)",
     )
     parser.add_argument(
+        "--expected-diff",
+        choices=EXPECTED_DIFF_CHOICES,
+        help="compare A (a converted store) with B under an expected-difference contract: "
+        "differences it allows are reported as expected, anything else is a finding; it sets "
+        "the common-state comparison, overriding --common (see the README)",
+    )
+    parser.add_argument(
+        "--map",
+        choices=MAP_CHOICES,
+        default="identity",
+        help="identity: compare key by key (default); convert: compare B with the replayed "
+        "conversion of A (not independent: detects engine and I/O faults only)",
+    )
+    parser.add_argument(
         "--oracle",
         metavar="GLOB",
         help="verify A against these digest files (sorted; position = file index) instead of B",
@@ -252,6 +268,8 @@ def _run_verify(args: argparse.Namespace) -> int:
         ignore_keys=tuple(args.ignore_key),
         oracle=args.oracle,
         oracle_key_map=args.oracle_key_map,
+        expected_diff=args.expected_diff,
+        map=args.map,
         **_read_options(args),
     )
     report = verify_checkpoint(args.a, args.b, opts)
@@ -533,6 +551,12 @@ def render_verify(report: VerifyReport) -> str:
     hidden = len(report.findings) - MAX_PRINTED_FINDINGS
     if hidden > 0:
         lines.append(f"  ... {hidden} more (use --report PATH.jsonl for all)")
+    if report.contract is not None:
+        lines.append(
+            f"expected:   {len(report.expected)} differences allowed by contract {report.contract}"
+        )
+    if not report.independent:
+        lines.append("note:       not an independent check (detects engine and I/O faults only)")
     return "\n".join(lines) + "\n"
 
 

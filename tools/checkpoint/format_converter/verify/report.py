@@ -69,6 +69,11 @@ class VerifyReport:
         byte_items_compared: Byte items whose payloads were compared.
         read_stats: What reading both sides cost.
         common_fields_compared: Common-state fields compared semantically.
+        expected: Differences the expected-difference contract allows.
+        contract: The contract id, if one was applied.
+        independent: False when the reference was derived from ``a`` by the
+            converter's own plan (a plan replay), which can only reveal engine
+            and I/O faults.
     """
 
     a: Path
@@ -80,6 +85,9 @@ class VerifyReport:
     byte_items_compared: int
     read_stats: ReadStats
     common_fields_compared: int = 0
+    expected: tuple[Finding, ...] = ()
+    contract: str | None = None
+    independent: bool = True
 
     @property
     def ok(self) -> bool:
@@ -99,6 +107,9 @@ class VerifyReport:
             "values_compared": self.values_compared,
             "byte_items_compared": self.byte_items_compared,
             "common_fields_compared": self.common_fields_compared,
+            "contract": self.contract,
+            "expected_differences": len(self.expected),
+            "independent": self.independent,
             "bytes_read": self.read_stats.bytes_read,
             "items_read": self.read_stats.items_touched,
             "read_amplification": self.read_stats.amplification,
@@ -107,6 +118,7 @@ class VerifyReport:
     def write_jsonl(self, path: Path) -> None:
         """Write one JSON line per finding, then the summary, atomically."""
         lines = [json.dumps(f.to_json()) for f in self.findings]
+        lines += [json.dumps({**f.to_json(), "expected": True}) for f in self.expected]
         lines.append(json.dumps(self.summary()))
         tmp = path.with_name(f".{path.name}.tmp")
         tmp.write_text("\n".join(lines) + "\n")

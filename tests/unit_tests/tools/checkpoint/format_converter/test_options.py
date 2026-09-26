@@ -52,6 +52,7 @@ def test_cli_choices_match_the_options():
     assert cli.FORMAT_CHOICES == FORMATS
     assert cli.COMMON_CHOICES == options.COMMON_MODES
     assert cli.OPTIMIZER_CHOICES == options.OPTIMIZER_CHOICES
+    assert cli.MAP_CHOICES == options.MAP_MODES
     assert cli.RESUME_CHOICES == options.RESUME_CHOICES == RESUME_MODES
 
 

@@ -33,6 +33,9 @@ from .report import Finding, FindingKind
 
 _MAX_VALUE_TEXT = 80
 
+ONLY_IN_A, ONLY_IN_B = "only in A", "only in B"
+"""Details of a finding for a field only one side holds."""
+
 
 def compare_common(
     a: Detection,
@@ -71,9 +74,9 @@ def semantic_findings(
             continue
         compared += 1
         if name not in b_fields:
-            findings.append(Finding(FindingKind.COMMON, name, "only in A"))
+            findings.append(Finding(FindingKind.COMMON, name, ONLY_IN_A))
         elif name not in a_fields:
-            findings.append(Finding(FindingKind.COMMON, name, "only in B"))
+            findings.append(Finding(FindingKind.COMMON, name, ONLY_IN_B))
         elif canonical(a_fields[name]) != canonical(b_fields[name]):
             findings.append(
                 Finding(

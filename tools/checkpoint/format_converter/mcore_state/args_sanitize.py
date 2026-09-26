@@ -19,7 +19,7 @@ arguments must therefore describe the store:
   that state.
 
 Only attributes the arguments already have are changed, and every change is
-reported as ``{field: (old, new)}``.
+reported as ``{field: (old, new)}``. The field values are in ``core/format_args.py``.
 """
 
 from __future__ import annotations
@@ -31,28 +31,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..core.args_view import ArgsView
+from ..core.format_args import (
+    FSDP_DTENSOR_FIELDS,
+    PATTERN_FIELDS,
+    SINGLE_STAGE_FIELDS,
+    TORCH_DIST_FIELDS,
+    WEIGHTS_ONLY_FIELDS,
+)
 from ..core.hybrid_pattern import PIPE
-
-WEIGHTS_ONLY_FIELDS: Mapping[str, Any] = {"no_save_optim": True, "no_save_rng": True}
-"""Arguments of a store holding model weights only (no optimizer or RNG state)."""
-
-FSDP_DTENSOR_FIELDS: Mapping[str, Any] = {"ckpt_format": "fsdp_dtensor", "use_megatron_fsdp": True}
-TORCH_DIST_FIELDS: Mapping[str, Any] = {"ckpt_format": "torch_dist", "use_megatron_fsdp": False}
-
-SINGLE_STAGE_FIELDS: Mapping[str, Any] = {
-    "pipeline_model_parallel_size": 1,
-    "transformer_pipeline_model_parallel_size": 1,
-    "virtual_pipeline_model_parallel_size": None,
-    "num_layers_per_virtual_pipeline_stage": None,
-    "num_virtual_stages_per_pipeline_rank": None,
-    "pipeline_model_parallel_layout": None,
-    "decoder_first_pipeline_num_layers": None,
-    "decoder_last_pipeline_num_layers": None,
-}
-"""The pipeline layout of a single-stage job (what an fsdp_dtensor store describes)."""
-
-PATTERN_FIELDS = ("hybrid_layer_pattern", "hybrid_override_pattern")
-"""Hybrid layer patterns, whose ``|`` separators mark pipeline stages."""
 
 
 @dataclass(frozen=True)

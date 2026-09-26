@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .core.manifest import MANIFEST_FILE
+from .core.manifest import MANIFEST_FILE, Manifest
 from .engine.fs import write_atomic
 from .engine.hashing import TensorDigest, compute_digests
 from .engine.metadata import METADATA_FILE, MetadataView
@@ -21,9 +21,9 @@ from .engine.reader import ReadStats, SourceReader
 from .engine.regions import Region
 from .engine.runner import RunOptions, run_program
 from .engine.sizes import format_bytes
-from .errors import UsageError
+from .errors import IntegrityError, UsageError
 from .formats.common_summary import CommonSummary, summarize_common_state
-from .formats.detect import Detection, detect_format, open_store, publish_target
+from .formats.detect import Detection, Store, detect_format, open_store, publish_target
 from .formats.sections import Census, Section, classify_key, take_census
 from .options import ConvertOptions, InspectOptions, PlanOptions, VerifyOptions
 from .planning import ConversionPlan, build_plan
@@ -31,6 +31,7 @@ from .report import ConvertReport, peak_rss
 from .sidecars import INTEGRITY_MANIFEST, copy_sidecars, write_integrity_manifest
 from .verify.compare import compare_stores
 from .verify.oracle import verify_against_oracle
+from .verify.replay import replay_conversion
 from .verify.report import VerifyReport
 
 _LOGGER = logging.getLogger(__name__)
@@ -190,10 +191,14 @@ def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyRep
         b: The store to compare with; ``None`` when ``opts.oracle`` is set.
         opts: What to compare.
 
+    With ``opts.map == "convert"``, ``b`` is compared with the replayed
+    conversion of ``a`` (see ``verify/replay.py``; not an independent check).
+
     Raises:
         UsageError: Neither or both of ``b`` and ``opts.oracle`` are given.
         ConverterError: A store cannot be resolved or is corrupt, an oracle file
-            is malformed, or a read unit does not fit the memory budget.
+            is malformed, a read unit does not fit the memory budget, or the
+            conversion to replay is refused.
     """
     if b is None and opts.oracle is None:
         raise UsageError(
@@ -209,10 +214,54 @@ def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyRep
     store_a = open_store(a, iteration=opts.iteration)
     if b is None:
         report = verify_against_oracle(store_a, opts)
+    elif opts.map == "convert":
+        report = _replay(store_a, open_store(b, iteration=opts.iteration), opts)
     else:
         report = compare_stores(store_a, open_store(b, iteration=opts.iteration), opts)
     _log_reads(f"verify ({len(report.findings)} findings)", report.read_stats)
     return report
+
+
+def _replay(source: Store, converted: Store, opts: VerifyOptions) -> VerifyReport:
+    """``converted`` against the dry-run plan of converting ``source`` as it was converted."""
+    plan = build_plan(source.iter_dir, _replay_options(converted), dry_run=True)
+    pieces = [piece for unit in plan.units for piece in unit.pieces]
+    byte_keys = frozenset(item.key for unit in plan.units for item in unit.byte_pieces)
+    return replay_conversion(source, converted, pieces, byte_keys, opts)
+
+
+_REPLAYED_OPTIONS = {
+    "drop_common_keys": frozenset,
+    "unit_bytes": int,
+    "optimizer": str,
+    "allow_roots": tuple,
+    "max_output_chunk_bytes": int,
+    "allow_missing_fp8_extra_state": bool,
+    "ignore_manifest": bool,
+}
+"""Options a conversion manifest records that shape the replayed plan, and their types."""
+
+
+def _replay_options(converted: Store) -> PlanOptions:
+    """The planning options ``converted`` was written with (from its manifest, if it has one).
+
+    Raises:
+        IntegrityError: The manifest is unreadable or malformed.
+    """
+    fmt = detect_format(converted).fmt
+    path = converted.iter_dir / MANIFEST_FILE
+    if not path.is_file():
+        return PlanOptions(to_format=fmt, workers=0)
+    try:
+        manifest = Manifest.from_json(json.loads(path.read_text()), label=str(path))
+    except (OSError, ValueError) as err:
+        raise IntegrityError(f"cannot read {path}: {err}") from err
+    recorded = {
+        name: kind(manifest.options[name])
+        for name, kind in _REPLAYED_OPTIONS.items()
+        if name in manifest.options
+    }
+    return PlanOptions(to_format=fmt, workers=0, **recorded)
 
 
 def plan_conversion(src: Path, opts: PlanOptions) -> ConversionPlan:

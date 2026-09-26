@@ -3,7 +3,11 @@
 """Chunk-aligned, bitwise comparison of two stores key by key (identity key map).
 
 With ``--common semantic`` the common states are decoded and compared field by
-field (see :mod:`.common`) instead of byte for byte.
+field (see :mod:`.common`) instead of byte for byte. With ``--expected-diff``
+the differences an expected-difference contract allows (see :mod:`.contract`)
+are reported as expected rather than as findings: keys only the reference
+holds, float values compared after the contract's cast, chunk grids and
+sanitized argument fields.
 
 For every key present on both sides the shapes and dtypes are compared, then
 (depending on the mode) the values. Values are compared per *compare unit*: a
@@ -20,7 +24,7 @@ before anything is read.
 from __future__ import annotations
 
 import bisect
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypeVar
@@ -35,7 +39,8 @@ from ..errors import BudgetExceeded
 from ..formats.common_summary import common_state_keys
 from ..formats.detect import Store, detect_format
 from ..options import VerifyOptions
-from .common import compare_common
+from .common import ONLY_IN_B, compare_common
+from .contract import COARSENING, CONTRACTS, DOWNCAST, EXACT, UPCAST, Contract
 from .report import Finding, FindingKind, VerifyReport, sort_findings
 
 T = TypeVar("T")
@@ -50,19 +55,23 @@ class CompareUnit:
         region: Bounding box of the unit's chunks.
         a_chunks: A's stored chunks in the unit.
         b_chunks: B's stored chunks in the unit (same elements as ``a_chunks``).
-        dtype: Element type (equal on both sides).
+        a_dtype: A's element type.
+        b_dtype: B's element type (A's unless a contract allows a cast).
+        cast: How values of different dtypes are compared (``exact`` otherwise).
     """
 
     key: str
     region: Region
     a_chunks: tuple[Region, ...]
     b_chunks: tuple[Region, ...]
-    dtype: torch.dtype
+    a_dtype: torch.dtype
+    b_dtype: torch.dtype
+    cast: str = EXACT
 
     @property
     def nbytes(self) -> int:
-        """Buffer size of one side."""
-        return self.region.numel() * self.dtype.itemsize
+        """Buffer size of the wider side."""
+        return self.region.numel() * max(self.a_dtype.itemsize, self.b_dtype.itemsize)
 
     @property
     def fills_region(self) -> bool:
@@ -71,7 +80,17 @@ class CompareUnit:
 
 
 @dataclass(frozen=True, slots=True)
-class _UnitDifference:
+class UnitDifference:
+    """How the two sides of one compare unit differ.
+
+    Attributes:
+        key: Tensor key.
+        differing: Number of elements whose bytes differ.
+        first: Global index of the first differing element.
+        a_value: That element on side A (value and bytes).
+        b_value: That element on side B.
+    """
+
     key: str
     differing: int
     first: tuple[int, ...]
@@ -86,29 +105,36 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
         BudgetExceeded: Before any read, if a compare unit or a byte item does
             not fit ``opts.max_item_bytes``.
     """
+    contract = CONTRACTS[opts.expected_diff] if opts.expected_diff is not None else None
+    common_mode = opts.common if contract is None else contract.common
     a_tensors = {k: e for k, e in a.view.tensors.items() if not opts.ignores(k)}
     b_tensors = {k: e for k, e in b.view.tensors.items() if not opts.ignores(k)}
     findings = _key_set_findings(a_tensors.keys(), b_tensors.keys())
     comparable = []
     for key in sorted(a_tensors.keys() & b_tensors.keys()):
-        problems = _metadata_findings(a_tensors[key], b_tensors[key], layout=opts.layout)
+        problems = _metadata_findings(a_tensors[key], b_tensors[key], opts.layout, contract)
         findings.extend(problems)
         if not any(p.kind in (FindingKind.SHAPE, FindingKind.DTYPE) for p in problems):
             comparable.append(key)
     value_keys = opts.value_keys(comparable)
-    units = [u for key in value_keys for u in overlap_units(a_tensors[key], b_tensors[key])]
+    cast = EXACT if contract is None else contract.casts
+    units = [
+        unit
+        for key in value_keys
+        for unit in overlap_units(a_tensors[key], b_tensors[key], cast=cast)
+    ]
     for unit in units:
         _check_unit_budget(unit, opts.max_item_bytes)
-    detections = (detect_format(a), detect_format(b)) if opts.common == "semantic" else None
+    detections = (detect_format(a), detect_format(b)) if common_mode == "semantic" else None
     byte_sizes: dict[str, int] = {}
-    if opts.common != "skip":
+    if common_mode != "skip":
         common_keys = frozenset().union(*map(common_state_keys, detections or ()))
         key_findings, byte_sizes = _plan_byte_items(a, b, opts, common_keys)
         findings.extend(key_findings)
     reader_a = SourceReader(a.view, max_item_bytes=opts.max_item_bytes)
     reader_b = SourceReader(b.view, max_item_bytes=opts.max_item_bytes)
     differences, stats = _compare_units(reader_a, reader_b, units, opts.workers)
-    findings.extend(_value_findings(differences, a_tensors))
+    findings.extend(value_findings(differences, a_tensors))
     findings.extend(_compare_byte_items(reader_a, reader_b, byte_sizes))
     common_fields = 0
     if detections is not None:
@@ -116,6 +142,7 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
             *detections, reader_a, reader_b, opts.ignores
         )
         findings.extend(common_findings)
+    findings, expected = _apply_contract(findings, contract)
     return VerifyReport(
         a=a.iter_dir,
         reference=str(b.iter_dir),
@@ -126,17 +153,37 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
         byte_items_compared=len(byte_sizes),
         read_stats=stats,
         common_fields_compared=common_fields,
+        expected=sort_findings(expected),
+        contract=None if contract is None else contract.name,
     )
 
 
-def overlap_units(a: TensorEntry, b: TensorEntry) -> list[CompareUnit]:
+def _apply_contract(
+    findings: list[Finding], contract: Contract | None
+) -> tuple[list[Finding], list[Finding]]:
+    """Split findings into the ones ``contract`` does not allow and the ones it expects."""
+    if contract is None:
+        return findings, []
+    unexpected, expected = [], []
+    for finding in findings:
+        allowed = (
+            finding.kind is FindingKind.ONLY_IN_B and contract.allows_missing(finding.key)
+        ) or (
+            finding.kind is FindingKind.COMMON
+            and contract.allows_common(finding.key, only_in_reference=finding.detail == ONLY_IN_B)
+        )
+        (expected if allowed else unexpected).append(finding)
+    return unexpected, expected
+
+
+def overlap_units(a: TensorEntry, b: TensorEntry, *, cast: str = EXACT) -> list[CompareUnit]:
     """Split a tensor into compare units: components of the A/B chunk-overlap graph."""
     if a.numel == 0:
         return []
     a_regions = [c.region for c in a.chunks]
     b_regions = [c.region for c in b.chunks]
     if set(a_regions) == set(b_regions):
-        return [CompareUnit(a.key, r, (r,), (r,), a.dtype) for r in a_regions]
+        return [CompareUnit(a.key, r, (r,), (r,), a.dtype, b.dtype, cast) for r in a_regions]
     parent = list(range(len(a_regions) + len(b_regions)))
 
     def find(node: int) -> int:
@@ -153,7 +200,15 @@ def overlap_units(a: TensorEntry, b: TensorEntry) -> list[CompareUnit]:
     for j, region in enumerate(b_regions):
         groups.setdefault(find(len(a_regions) + j), ([], []))[1].append(region)
     units = [
-        CompareUnit(a.key, bounding_box(a_part + b_part), tuple(a_part), tuple(b_part), a.dtype)
+        CompareUnit(
+            a.key,
+            bounding_box(a_part + b_part),
+            tuple(a_part),
+            tuple(b_part),
+            a.dtype,
+            b.dtype,
+            cast,
+        )
         for a_part, b_part in groups.values()
     ]
     return sorted(units, key=lambda u: u.region.offsets)
@@ -197,13 +252,17 @@ def _key_set_findings(a_keys: Iterable[str], b_keys: Iterable[str]) -> list[Find
     return findings
 
 
-def _metadata_findings(a: TensorEntry, b: TensorEntry, *, layout: bool) -> list[Finding]:
+def _metadata_findings(
+    a: TensorEntry, b: TensorEntry, layout: bool, contract: Contract | None
+) -> list[Finding]:
     if a.shape != b.shape:
         return [Finding(FindingKind.SHAPE, a.key, f"A {a.shape} vs B {b.shape}")]
-    if a.dtype != b.dtype:
+    if a.dtype != b.dtype and not (contract and castable(a.dtype, b.dtype, contract.casts)):
         return [Finding(FindingKind.DTYPE, a.key, f"A {a.dtype} vs B {b.dtype}")]
     a_grid = {c.region for c in a.chunks}
     b_grid = {c.region for c in b.chunks}
+    if not layout and contract is not None and contract.grid == COARSENING:
+        return _coarsening_findings(a.key, sorted(a_grid, key=lambda r: r.offsets), list(b_grid))
     if layout and a_grid != b_grid:
         only_a = min(a_grid - b_grid, key=lambda r: r.offsets, default=None)
         only_b = min(b_grid - a_grid, key=lambda r: r.offsets, default=None)
@@ -218,6 +277,35 @@ def _metadata_findings(a: TensorEntry, b: TensorEntry, *, layout: bool) -> list[
     return []
 
 
+def castable(a: torch.dtype, b: torch.dtype, cast: str) -> bool:
+    """Whether floats of dtypes ``a`` and ``b`` can be compared under ``cast``.
+
+    Both must be floating point of different sizes (the narrower one converts
+    exactly into the wider one).
+    """
+    return (
+        cast in (UPCAST, DOWNCAST)
+        and a.is_floating_point
+        and b.is_floating_point
+        and a.itemsize != b.itemsize
+    )
+
+
+def _coarsening_findings(key: str, a_grid: list[Region], b_grid: list[Region]) -> list[Finding]:
+    """A finding unless every chunk of A is exactly tiled by chunks of B."""
+    for i, j in _overlapping_pairs(a_grid, b_grid):
+        if not a_grid[i].contains(b_grid[j]):
+            return [
+                Finding(
+                    FindingKind.LAYOUT,
+                    key,
+                    f"A's chunk {a_grid[i]} cuts B's chunk {b_grid[j]} (A's grid must merge "
+                    "whole chunks of B)",
+                )
+            ]
+    return []
+
+
 def _check_unit_budget(unit: CompareUnit, max_item_bytes: int) -> None:
     if unit.nbytes > max_item_bytes:
         raise BudgetExceeded(
@@ -229,9 +317,9 @@ def _check_unit_budget(unit: CompareUnit, max_item_bytes: int) -> None:
 
 def _compare_units(
     reader_a: SourceReader, reader_b: SourceReader, units: list[CompareUnit], workers: int
-) -> tuple[list[_UnitDifference], ReadStats]:
+) -> tuple[list[UnitDifference], ReadStats]:
     jobs = group_by_budget(units, lambda u: u.nbytes, reader_a.batch_bytes)
-    differences: list[_UnitDifference] = []
+    differences: list[UnitDifference] = []
     stats = ReadStats()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for job_differences, job_stats in pool.map(
@@ -244,45 +332,50 @@ def _compare_units(
 
 def _compare_job(
     reader_a: SourceReader, reader_b: SourceReader, units: list[CompareUnit]
-) -> tuple[list[_UnitDifference], ReadStats]:
-    a_buffers, a_reqs = _unit_buffers(units, lambda u: u.a_chunks)
-    b_buffers, b_reqs = _unit_buffers(units, lambda u: u.b_chunks)
+) -> tuple[list[UnitDifference], ReadStats]:
+    a_buffers, a_reqs = _unit_buffers(units, lambda u: (u.a_chunks, u.a_dtype))
+    b_buffers, b_reqs = _unit_buffers(units, lambda u: (u.b_chunks, u.b_dtype))
     stats = reader_a.read_into(a_reqs) + reader_b.read_into(b_reqs)
     differences = []
     for unit, a_buffer, b_buffer in zip(units, a_buffers, b_buffers):
-        difference = _bitwise_difference(unit, a_buffer, b_buffer)
+        difference = bitwise_difference(unit, a_buffer, b_buffer)
         if difference is not None:
             differences.append(difference)
     return differences, stats
 
 
 def _unit_buffers(
-    units: list[CompareUnit], chunks_of: Callable[[CompareUnit], tuple[Region, ...]]
+    units: list[CompareUnit],
+    side_of: Callable[[CompareUnit], tuple[tuple[Region, ...], torch.dtype]],
 ) -> tuple[list[torch.Tensor], list[ReadReq]]:
     buffers, reqs = [], []
     for unit in units:
+        chunks, dtype = side_of(unit)
         allocate = torch.empty if unit.fills_region else torch.zeros
-        buffer = allocate(unit.region.sizes, dtype=unit.dtype)
+        buffer = allocate(unit.region.sizes, dtype=dtype)
         buffers.append(buffer)
-        for chunk in chunks_of(unit):
+        for chunk in chunks:
             view = buffer[chunk.relative_to(unit.region).slices()]
             reqs.append(ReadReq(unit.key, chunk, view))
     return buffers, reqs
 
 
-def _bitwise_difference(
+def bitwise_difference(
     unit: CompareUnit, a: torch.Tensor, b: torch.Tensor
-) -> _UnitDifference | None:
+) -> UnitDifference | None:
+    """How buffers ``a`` and ``b`` of ``unit`` differ bit for bit (after its cast), if they do."""
+    if a.dtype != b.dtype:
+        a, b = _cast_pair(a, b, unit.cast)
     a_bytes = a.reshape(-1).view(torch.uint8)
     b_bytes = b.reshape(-1).view(torch.uint8)
     if torch.equal(a_bytes, b_bytes):
         return None
-    itemsize = unit.dtype.itemsize
+    itemsize = a.dtype.itemsize
     differs = (a_bytes != b_bytes).reshape(-1, itemsize).any(dim=1)
     first = int(differs.nonzero()[0])
     local = torch.unravel_index(torch.tensor(first), unit.region.sizes) if unit.region.ndim else ()
     coords = tuple(o + int(i) for o, i in zip(unit.region.offsets, local))
-    return _UnitDifference(
+    return UnitDifference(
         key=unit.key,
         differing=int(differs.sum()),
         first=coords,
@@ -291,16 +384,25 @@ def _bitwise_difference(
     )
 
 
+def _cast_pair(a: torch.Tensor, b: torch.Tensor, cast: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Both buffers in one dtype: the narrower upcast exactly, or the wider rounded (RNE)."""
+    narrow_a = a.dtype.itemsize < b.dtype.itemsize
+    if cast == UPCAST:
+        return (a.to(b.dtype), b) if narrow_a else (a, b.to(a.dtype))
+    return (a, b.to(a.dtype)) if narrow_a else (a.to(b.dtype), b)
+
+
 def _describe_element(buffer: torch.Tensor, index: int) -> str:
     element = buffer.reshape(-1)[index : index + 1]
     raw = bytes(element.view(torch.uint8).tolist()).hex()
     return f"{element.item()!r} (bytes {raw})"
 
 
-def _value_findings(
-    differences: list[_UnitDifference], tensors: dict[str, TensorEntry]
+def value_findings(
+    differences: list[UnitDifference], tensors: Mapping[str, TensorEntry]
 ) -> list[Finding]:
-    by_key: dict[str, list[_UnitDifference]] = {}
+    """One value finding per tensor with differences (``tensors`` gives the element counts)."""
+    by_key: dict[str, list[UnitDifference]] = {}
     for difference in differences:
         by_key.setdefault(difference.key, []).append(difference)
     findings = []

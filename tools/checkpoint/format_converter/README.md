@@ -93,10 +93,54 @@ grids unless `--layout` is given.
 | `--layout` | also require identical chunk grids (not with `--oracle`) |
 | `--common {skip,bytes,semantic}` | `bytes` (default): byte items must be byte-identical; `semantic`: decode both common states (stubbing unknown classes) and compare them, `args` field by field, wherever each side stores them (in-DCP item, `common.pt`, or `fsdp_dtensor` top-level items); other byte items byte for byte; `skip`: ignore byte items |
 | `--ignore-key RE` | ignore keys matching `RE`, repeatable |
+| `--expected-diff {A,B,C,D,E}` | compare `A` (a converted store) with `B` under an [expected-difference contract](#expected-difference-contracts); it sets the common-state comparison, overriding `--common` |
+| `--map {identity,convert}` | `identity` (default) compares key by key; `convert` compares `B` with the replayed conversion of `A` (see below) |
 | `--oracle GLOB` | verify `A` against these digest files instead of `B` |
 | `--oracle-key-map PY` | Python file defining `to_store_key(oracle_key, file_index)` |
 | `--report PATH.jsonl` | write every finding as JSON lines |
 | `--iteration N`, `--max-item-bytes SIZE`, `--workers N` | as for `inspect` |
+
+### Expected-difference contracts
+
+A converted store differs from its references in known ways: a conversion
+drops optimizer and RNG state, may write another chunk grid, keeps bfloat16
+where Megatron-FSDP holds fp32 main weights, and sanitizes some arguments.
+`verify A B --expected-diff X` reports the differences contract `X` allows as
+expected (they are counted, and listed in `--report` with `"expected": true`)
+and every other difference as a finding (exit 5):
+
+| Id | `A` vs `B` | Allowed differences |
+|---|---|---|
+| `A` | a `torch_dist` -> `fsdp_dtensor` conversion vs a real `fsdp_dtensor` save | optimizer, scheduler, RNG, rerun and extra state only in `B`; `A`'s narrower floats equal `B`'s after the exact upcast; any chunk grid; the common state is not compared |
+| `B` | an `fsdp_dtensor` -> `torch_dist` conversion vs a real `torch_dist` save | that state only in `B`; `A`'s wider floats round (RNE) to `B`'s; any chunk grid; the common state is not compared |
+| `C` | two model-only saves of one step of a conversion chain in one format (real vs converted, or real vs real) | floats equal after the exact upcast; any chunk grid; the sanitized argument fields |
+| `D` | `torch_dist` -> `fsdp_dtensor` -> `torch_dist` vs the model-only source | only `args.no_save_optim` and `args.no_save_rng`, and rerun state only in `B`; `A`'s chunk grid must merge whole chunks of `B`'s (tensor-parallel splits merged); dtypes exact |
+| `E` | `fsdp_dtensor` -> `torch_dist` -> `fsdp_dtensor` vs the source | that state only in `B`; any chunk grid; the sanitized argument fields |
+
+Keys, shapes, values and every other argument or common-state field must
+agree. The contract sets the common-state comparison, whatever `--common`
+says: `C`, `D` and `E` compare the common state field by field
+(`--common semantic`), and `A` and `B` skip it. A converted store's common
+state is re-encoded, and a re-encoded common state is never byte-identical to
+the one Megatron wrote, even when every field is equal, so a plain `verify`
+(`--common bytes`) of a round trip always reports `common_state/shard_0_1`.
+State a contract lets `A` lack may also be a common-state key only `B` holds.
+Rerun state (the `rerun_state_machine_state/*` items and the
+`rerun_state_machine` common-state key) is in every model-only save of a job
+that runs with Megatron's default `--rerun-mode validate_results`, and a
+conversion drops it. The sanitized argument fields are `no_save_optim`,
+`no_save_rng`, `ckpt_format`, `use_megatron_fsdp`, the pipeline and
+virtual-pipeline fields and the hybrid layer pattern.
+
+### Plan replay (`--map convert`)
+
+`verify SRC OUT --map convert` rebuilds the plan that converted `SRC` into
+`OUT` (with the options `OUT`'s conversion manifest records), fills every
+planned chunk from `SRC` and compares it bit for bit with `OUT`, and compares
+the key sets, shapes and dtypes with the plan's. The reference is the
+converter's own plan, so this is **not an independent check** (the report says
+so): it detects faults of the engine, the workers, the merge or the storage,
+never a wrong rule. Byte items are compared by key only.
 
 ### Digest files and key maps
 
