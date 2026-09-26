@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import errors
-from ..core.names import DIALECTS, FORMATS, FSDP_DTENSOR, TORCH_DIST
+from ..core.names import DIALECTS, FORMATS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, TORCH_DIST
 from ..engine.metadata import METADATA_FILE, MetadataView
 from ..engine.staging import PublishTarget
 from ..errors import IntegrityError, Refusal, UsageError
@@ -41,7 +41,6 @@ TRACKER_FILE = "latest_checkpointed_iteration.txt"
 TORCH_DIST_CONFIG_FILE = "metadata.json"
 LEGACY_COMMON_FILE = "common.pt"
 
-FSDP_MODEL_PREFIX = "model.module."
 FSDP_COMMON_ITEMS = ("args", "iteration", "checkpoint_version")
 FSDP_OPTIONAL_COMMON_ITEMS = ("num_floating_point_operations_so_far",)
 TORCH_DIST_COMMON_ITEM = "common_state/shard_0_1"

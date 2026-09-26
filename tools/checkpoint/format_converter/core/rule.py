@@ -19,10 +19,13 @@ import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from ..errors import InternalError
 from .logical import LogicalId, LogicalOutput, LogicalSlice
+
+if TYPE_CHECKING:
+    from .context import ArchContext
 
 
 class Stage(enum.IntEnum):
@@ -161,11 +164,11 @@ class LeafRule(ABC):
     name: ClassVar[str]
     stage: ClassVar[Stage]
 
-    def enabled(self, ctx: Any) -> bool:
-        """Whether the rule applies to the conversion described by the context ``ctx``."""
+    def enabled(self, ctx: ArchContext) -> bool:
+        """Whether the rule applies to the conversion described by ``ctx``."""
         del ctx
         return True
 
     @abstractmethod
-    def claim(self, pool: LogicalPool, ctx: Any) -> Iterable[FamilyInstance]:
+    def claim(self, pool: LogicalPool, ctx: ArchContext) -> Iterable[FamilyInstance]:
         """Take the slices this rule handles from ``pool`` and build their outputs."""

@@ -24,13 +24,17 @@ import enum
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from ..errors import InternalError, Refusal
 from .rule import LeafRule
 
+if TYPE_CHECKING:
+    from .context import ArchContext
+    from .refusals import Facts
+
 RuleT = TypeVar("RuleT", bound=type[LeafRule])
-Detector = Callable[[Any], Iterable[Refusal]]
+Detector = Callable[["Facts"], Iterable[Refusal]]
 """A refusal detector: yields the refusals the conversion's facts call for."""
 
 
@@ -138,8 +142,8 @@ class RuleRegistry:
         """Every registered sentinel, by name."""
         return tuple(self._sentinels[name] for name in sorted(self._sentinels))
 
-    def rules_for(self, ctx: Any) -> list[LeafRule]:
-        """The rules enabled for the context ``ctx``, in (stage, name) order."""
+    def rules_for(self, ctx: ArchContext) -> list[LeafRule]:
+        """The rules enabled for ``ctx``, in (stage, name) order."""
         ordered = sorted(self._rules.values(), key=lambda rule: (rule.stage, rule.name))
         return [rule for rule in ordered if rule.enabled(ctx)]
 
