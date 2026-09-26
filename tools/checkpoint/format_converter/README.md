@@ -15,9 +15,10 @@ and Megatron-FSDP v1 `fsdp_dtensor` stores. It reads stores chunk by chunk
 with bounded host memory, never uses a GPU or a process group, and runs on a
 host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 
-This first version inspects and verifies stores. Conversion between the two
-formats lands in later changes (see [Roadmap](#roadmap)); this file is the
-living design document of the package.
+This version inspects and verifies stores and rewrites `torch_dist` stores
+with model weights only. Conversion between the two formats lands in later
+changes (see [Roadmap](#roadmap)); this file is the living design document of
+the package.
 
 ## Commands
 
@@ -27,6 +28,8 @@ Run from the repository root (or with it on `PYTHONPATH`):
 python -m tools.checkpoint.format_converter inspect SRC
 python -m tools.checkpoint.format_converter verify A B
 python -m tools.checkpoint.format_converter verify A --oracle 'digests_rank*.json' --oracle-key-map map.py
+python -m tools.checkpoint.format_converter plan SRC --to torch_dist
+python -m tools.checkpoint.format_converter convert SRC DST --to torch_dist
 ```
 
 `SRC`, `A` and `B` are either a store directory (the one holding `.metadata`
@@ -124,6 +127,69 @@ it is reported as `oracle_inconsistent`. The store is then checked for keys
 missing from either side, shapes and dtypes (every mode), and SHA-256 values
 (`full` and `sample:N`).
 
+### `plan` and `convert`
+
+`convert SRC DST --to torch_dist` rewrites a `torch_dist` store as a
+`torch_dist` store holding the model weights only:
+
+* model tensors and TE `_extra_state` (tensors and byte items) are copied
+  chunk for chunk, so the output has the source's chunk grid and dtypes;
+* optimizer state (`optimizer.*`, `chained_<i>.optimizer.*`), RNG state and
+  rerun state are dropped and reported;
+* the common state keeps `args`, `iteration`, `checkpoint_version`,
+  `num_floating_point_operations_so_far` and `content_metadata`, drops
+  `optimizer`, `opt_param_scheduler` and `rerun_state_machine`, sets the
+  existing `args.no_save_optim` and `args.no_save_rng` to `True` (so Megatron
+  loads it without looking for optimizer or RNG state), and is written as the
+  in-DCP item `common_state/shard_0_1` (a legacy `common.pt` is migrated);
+* `run_config.yaml` and `tokenizer/` are copied, `train_dataloader_dprank*.pt`
+  is dropped, other files are listed but not copied.
+
+Load the result with `--no-load-optim --no-load-rng` (a training job that
+resumes from it starts a fresh optimizer).
+
+`DST` is a checkpoint root, which gets `iter_%07d` (or `release`) and then
+`latest_checkpointed_iteration.txt`, written last; or, if its name is
+`iter_<N>` or `release` (or with `--dst-is-iter-dir`), the store directory
+itself. Only that iteration directory is ever created or, with `--overwrite`,
+replaced; other iterations in the root are never touched. An interrupted run
+resumes when the same command is run again.
+
+`plan SRC --to torch_dist` prints the same decisions (sections kept and dropped,
+the common state, sidecars, units, the memory and disk estimates) from the
+metadata alone and exits the way `convert` would (3 refused, 8 over budget),
+without writing anything.
+
+The common state is decoded with Megatron's own safe globals when Megatron can
+be imported (the training container). Elsewhere a plain decoder accepts only
+`argparse.Namespace`, containers, numbers, strings and torch dtypes; a common
+state that references Megatron classes then exits 3 with `FC-E01`.
+
+| Flag (`plan` and `convert`) | Meaning |
+|---|---|
+| `--to torch_dist` | target format (required) |
+| `--from {torch_dist,fsdp_dtensor}` | format to assume when the store has no format markers |
+| `--iteration N` | iteration to open under a checkpoint root |
+| `--drop-common-key KEY` | drop this unknown common-state key instead of refusing (repeatable) |
+| `--workers N` | worker processes; `0` runs the units in the driver (default `min(4, cores/8)`) |
+| `--unit-bytes SIZE` | target peak memory of one unit (default `4GiB`) |
+| `--max-unit-bytes-hard SIZE` | largest memory one unit may need, else exit 8 (default 0.6 x `MemAvailable` / workers) |
+| `--writer-threads N` | data files written per unit (default 4) |
+| `--max-host-bytes SIZE` | host-memory budget of the whole conversion, else exit 8 (default 0.8 x `MemAvailable`) |
+| `--json` | print the report as JSON |
+
+| Flag (`convert` only) | Meaning |
+|---|---|
+| `--staging-dir DIR` | staging directory, on the destination's file system (default: beside the target) |
+| `--resume {auto,never}` | `auto` continues staging of the same conversion (default); `never` exits 6 if staging exists |
+| `--restart` | discard existing staging first |
+| `--keep-staging` | keep the staging directory (and its part stores) afterwards |
+| `--overwrite` | replace an existing target iteration directory (only that directory) |
+| `--dst-is-iter-dir` | treat `DST` as the store directory (no tracker) |
+| `--no-tracker` | do not write `latest_checkpointed_iteration.txt` |
+| `--no-copy-sidecars` | do not copy `run_config.yaml` and `tokenizer/` |
+| `--report PATH.json` | also write the report as JSON |
+
 ## Exit codes and refusal codes
 
 | Exit | Meaning |
@@ -134,9 +200,9 @@ missing from either side, shapes and dtypes (every mode), and SHA-256 values
 | 3 | refused (`FC-R`, `FC-P`, `FC-E` codes) |
 | 4 | ambiguous, needs a flag (`FC-A` codes) |
 | 5 | verification mismatch |
-| 6 | integrity or I/O error (corrupt or truncated store, bad tracker or digest file) |
-| 7 | staging fingerprint mismatch (conversion; not used yet) |
-| 8 | memory budget exceeded |
+| 6 | integrity or I/O error (corrupt or truncated store, bad tracker or digest file, existing target, locked or foreign staging, failed worker) |
+| 7 | staging fingerprint mismatch: the staging directory holds another conversion (`--restart` discards it) |
+| 8 | memory or disk budget exceeded |
 | 130 | interrupted |
 
 Refusals print one line, `FC-xxx: <message> [keys...] hint: <what to do>`:

@@ -20,7 +20,7 @@ def test_help_exits_zero_and_lists_exit_codes(capsys):
     assert excinfo.value.code == 0
     out = " ".join(capsys.readouterr().out.split())  # argparse wraps at the terminal width
     assert "usage: python -m tools.checkpoint.format_converter" in out
-    assert "8 memory budget exceeded" in out
+    assert "8 memory or disk budget exceeded" in out
 
 
 def test_missing_command_is_usage_error(capsys):

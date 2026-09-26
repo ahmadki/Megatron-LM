@@ -21,7 +21,7 @@ def fixture_readme() -> str:
     return README.read_text()
 
 
-@pytest.mark.parametrize("command", [None, "inspect", "verify"])
+@pytest.mark.parametrize("command", [None, "inspect", "verify", "plan", "convert"])
 def test_every_flag_is_documented(readme, command, capsys):
     argv = ["--help"] if command is None else [command, "--help"]
     with pytest.raises(SystemExit):

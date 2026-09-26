@@ -3,7 +3,8 @@
 """Command line interface: ``python -m tools.checkpoint.format_converter <command>``.
 
 Heavy modules (torch) are imported by the command handlers, so ``--help`` and
-usage errors stay fast.
+usage errors stay fast. ``plan`` and ``convert`` hide the GPUs from their own
+process before torch is imported, so nothing they load can initialize CUDA.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -26,7 +28,9 @@ if TYPE_CHECKING:
 
 PROG = "python -m tools.checkpoint.format_converter"
 FORMAT_CHOICES = ("torch_dist", "fsdp_dtensor")
+TARGET_CHOICES = ("torch_dist",)
 COMMON_CHOICES = ("skip", "bytes")
+RESUME_CHOICES = ("auto", "never")
 MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
@@ -34,14 +38,16 @@ _LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 _EPILOG = (
     "exit codes: 0 ok, 1 internal error, 2 usage error, 3 refused (FC-R/FC-P/FC-E), "
     "4 ambiguous (FC-A), 5 verification mismatch, 6 integrity or I/O error, "
-    "7 staging fingerprint mismatch, 8 memory budget exceeded, 130 interrupted"
+    "7 staging fingerprint mismatch, 8 memory or disk budget exceeded, 130 interrupted"
 )
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser with every subcommand registered."""
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Inspect and verify Megatron DCP checkpoint stores.", epilog=_EPILOG
+        prog=PROG,
+        description="Inspect, verify and convert Megatron DCP checkpoint stores.",
+        epilog=_EPILOG,
     )
     parser.add_argument(
         "--log-level", choices=_LOG_LEVELS, default="WARNING", help="logging verbosity"
@@ -50,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
     _add_inspect(subparsers)
     _add_verify(subparsers)
+    _add_plan(subparsers)
+    _add_convert(subparsers)
     return parser
 
 
@@ -248,6 +256,214 @@ def _run_verify(args: argparse.Namespace) -> int:
         report.write_jsonl(args.report)
     sys.stdout.write(render_verify(report))
     return int(ExitCode.OK if report.ok else ExitCode.VERIFY_MISMATCH)
+
+
+def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("src", type=Path, metavar="SRC", help="store directory or checkpoint root")
+    parser.add_argument(
+        "--to",
+        dest="to_format",
+        choices=TARGET_CHOICES,
+        required=True,
+        help="target format (this version: torch_dist, a weights-only rewrite)",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_format",
+        choices=FORMAT_CHOICES,
+        help="format to assume when the store has no format markers",
+    )
+    parser.add_argument(
+        "--iteration", type=int, metavar="N", help="iteration to open under a checkpoint root"
+    )
+    parser.add_argument(
+        "--drop-common-key",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="drop this unknown common-state key instead of refusing (repeatable)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        metavar="N",
+        help="worker processes; 0 runs the units in this process (default: min(4, cores/8))",
+    )
+    parser.add_argument(
+        "--unit-bytes",
+        type=_size,
+        metavar="SIZE",
+        help="target peak memory of one unit of work (default: 4GiB)",
+    )
+    parser.add_argument(
+        "--max-unit-bytes-hard",
+        type=_size,
+        metavar="SIZE",
+        help="largest memory any single unit may need; larger ones exit 8 "
+        "(default: 0.6 x available memory / workers)",
+    )
+    parser.add_argument(
+        "--writer-threads",
+        type=int,
+        metavar="N",
+        help="writer threads (data files) per unit (default: 4)",
+    )
+    parser.add_argument(
+        "--max-host-bytes",
+        type=_size,
+        metavar="SIZE",
+        help="host-memory budget of the whole conversion; exit 8 if the estimate exceeds it "
+        "(default: 0.8 x available memory)",
+    )
+    parser.add_argument("--json", action="store_true", help="print the report as JSON")
+
+
+def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "to_format": args.to_format,
+        "from_format": args.from_format,
+        "iteration": args.iteration,
+        "drop_common_keys": frozenset(args.drop_common_key),
+    }
+    for name in (
+        "workers",
+        "unit_bytes",
+        "max_unit_bytes_hard",
+        "writer_threads",
+        "max_host_bytes",
+    ):
+        if getattr(args, name) is not None:
+            options[name] = getattr(args, name)
+    return options
+
+
+def _add_plan(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "plan",
+        help="dry-run a conversion: what is kept or dropped, units, memory and disk",
+        description="Plan a conversion from the source's metadata and common state: "
+        "refusals, sections kept and dropped, the common state, units, and the memory and "
+        "disk estimates. Exits 3 when convert would be refused and 8 when the conversion "
+        "exceeds the memory budgets, without writing anything; the free disk space is "
+        "checked by convert. On a host without Megatron, a common state that references "
+        "Megatron classes is decoded with stubs (the stub codec): the plan is complete, but "
+        "convert must run in the Megatron container.",
+        epilog=_EPILOG,
+    )
+    _add_conversion_arguments(parser)
+    parser.set_defaults(handler=_run_plan)
+
+
+def _run_plan(args: argparse.Namespace) -> int:
+    _hide_gpus()
+    # pylint: disable=import-outside-toplevel
+    from .api import plan_conversion
+    from .options import PlanOptions
+    from .report import render_plan
+
+    plan = plan_conversion(args.src, PlanOptions(**_plan_options(args)))
+    summary = plan.to_json()
+    sys.stdout.write(json.dumps(summary, indent=2) + "\n" if args.json else render_plan(summary))
+    return int(ExitCode.OK)
+
+
+def _add_convert(subparsers: Any) -> None:
+    parser = subparsers.add_parser(
+        "convert",
+        help="convert a store (this version: weights-only torch_dist rewrite)",
+        description="Convert SRC into a new store under DST with bounded host memory and no "
+        "GPU. This version rewrites a torch_dist store as torch_dist with model weights only: "
+        "optimizer, RNG and rerun state are dropped, extra state and the chunk grid are kept, "
+        "and the common state is written into the store (a legacy common.pt is migrated). "
+        "DST is a checkpoint root (it gets iter_NNNNNNN and the tracker, written last and "
+        "only moved forward) or, if named iter_NNNNNNN or release, the iteration directory "
+        "itself. An interrupted run resumes when rerun with the same arguments.",
+        epilog=_EPILOG,
+    )
+    _add_conversion_arguments(parser)
+    parser.add_argument(
+        "dst", type=Path, metavar="DST", help="checkpoint root or iteration directory"
+    )
+    parser.add_argument(
+        "--staging-dir",
+        type=Path,
+        metavar="DIR",
+        help="directory in which the staging directory .fc-staging-NAME is created (only that "
+        "subdirectory is ever deleted); must be on DST's file system (default: the target's "
+        "parent)",
+    )
+    parser.add_argument(
+        "--resume",
+        choices=RESUME_CHOICES,
+        default="auto",
+        help="auto: continue staging of the same conversion (default); never: refuse if it exists",
+    )
+    parser.add_argument(
+        "--restart", action="store_true", help="discard existing staging and start over"
+    )
+    parser.add_argument(
+        "--keep-staging", action="store_true", help="keep the staging directory afterwards"
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing target iteration directory (only that directory, and only "
+        "if it is a single store)",
+    )
+    parser.add_argument(
+        "--dst-is-iter-dir",
+        action="store_true",
+        help="treat DST as the iteration directory itself (no tracker)",
+    )
+    parser.add_argument(
+        "--no-tracker",
+        dest="tracker",
+        action="store_false",
+        help="do not write latest_checkpointed_iteration.txt in DST",
+    )
+    parser.add_argument(
+        "--no-copy-sidecars",
+        dest="copy_sidecars",
+        action="store_false",
+        help="do not copy run_config.yaml and tokenizer assets",
+    )
+    parser.add_argument(
+        "--report", type=Path, metavar="PATH.json", help="also write the report as JSON"
+    )
+    parser.set_defaults(handler=_run_convert)
+
+
+def _run_convert(args: argparse.Namespace) -> int:
+    _hide_gpus()
+    # pylint: disable=import-outside-toplevel
+    from .api import convert_checkpoint
+    from .options import ConvertOptions
+    from .report import write_report
+
+    opts = ConvertOptions(
+        **_plan_options(args),
+        staging_dir=args.staging_dir,
+        resume=args.resume,
+        restart=args.restart,
+        keep_staging=args.keep_staging,
+        overwrite=args.overwrite,
+        dst_is_iter_dir=args.dst_is_iter_dir,
+        tracker=args.tracker,
+        copy_sidecars=args.copy_sidecars,
+    )
+    report = convert_checkpoint(args.src, args.dst, opts)
+    if args.report is not None:
+        write_report(args.report, report.to_json())
+    sys.stdout.write(
+        json.dumps(report.to_json(), indent=2) + "\n" if args.json else report.render()
+    )
+    return int(ExitCode.OK)
+
+
+def _hide_gpus() -> None:
+    """Hide the GPUs from this process, if torch is not imported yet (a fresh CLI process)."""
+    if "torch" not in sys.modules:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 
 def render_verify(report: VerifyReport) -> str:

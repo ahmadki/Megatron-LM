@@ -41,6 +41,9 @@ STORED_ITEM_OVERHEAD_BYTES = 4096
 DISK_HEADROOM = 1.02
 """Free space required on the destination, as a multiple of the estimated output size."""
 
+MERGE_BYTES_PER_CHUNK = 2048
+"""Driver memory per output chunk while merging (parsed metadata entries; ~1.5 KiB measured)."""
+
 
 @dataclass(frozen=True, slots=True)
 class MemoryEstimate:
@@ -76,6 +79,7 @@ class MemoryEstimate:
             "worker_baseline": self.worker_baseline,
             "workers": self.workers,
             "driver": self.driver,
+            "worker_peak": self.worker_peak,
             "total": self.total,
         }
 
@@ -86,12 +90,17 @@ def estimate_memory(units: Iterable[Unit], *, workers: int, driver: int) -> Memo
     return MemoryEstimate(unit_peak, WORKER_BASELINE_BYTES, workers, driver)
 
 
+def driver_bytes(output_chunks: int) -> int:
+    """``M_driver``: the driver's resident set now plus what merging ``output_chunks`` adds."""
+    return (process_rss_bytes() or 0) + output_chunks * MERGE_BYTES_PER_CHUNK
+
+
 def estimate_output_bytes(units: Iterable[Unit]) -> int:
     """Estimated on-disk size of the merged store (data files and metadata)."""
     total = 0
     for unit in units:
         total += sum(p.nbytes + STORED_ITEM_OVERHEAD_BYTES for p in unit.pieces)
-        total += sum(len(item.payload) for item in unit.byte_pieces)
+        total += sum(item.nbytes for item in unit.byte_pieces)
     return total
 
 

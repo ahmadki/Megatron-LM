@@ -67,7 +67,7 @@ class _OpenUnit:
 
     def estimate(self, extra: _Cluster | None = None) -> int:
         """Peak memory of the unit (with ``extra`` added, if given)."""
-        held = self.held + sum(2 * len(item.payload) for item in self.byte_pieces)
+        held = self.held + sum(2 * item.nbytes for item in self.byte_pieces)
         decode = self.decode
         if extra is not None:
             held += extra.piece_bytes + extra.staging

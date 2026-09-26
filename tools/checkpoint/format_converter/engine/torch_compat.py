@@ -69,6 +69,7 @@ _SAVER_PLANS_ATTRIBUTE = "all_local_plans"
 _LEGACY_MCORE_ATTRIBUTE = "mcore_data"
 _METADATA_FIELDS = ("state_dict_metadata", "planner_data", "storage_data", "storage_meta")
 _NO_PROCESS_GROUP_WARNING = r"torch\.distributed is (disabled|unavailable)"
+_TYPED_STORAGE_WARNING = r"TypedStorage is deprecated"
 _WARNING_FILTER_LOCK = threading.Lock()
 
 
@@ -395,7 +396,10 @@ def save_without_process_group(writer: StorageWriter, planner: SavePlanner) -> N
     """
     _ignore_no_process_group_warning()
     try:
-        dcp.save({}, storage_writer=writer, planner=planner, no_dist=True)
+        with warnings.catch_warnings():
+            # torch 2.8's writer calls the deprecated Tensor.storage() on every tensor it writes.
+            warnings.filterwarnings("ignore", message=_TYPED_STORAGE_WARNING, category=UserWarning)
+            dcp.save({}, storage_writer=writer, planner=planner, no_dist=True)
     except CheckpointException as err:
         raise _failure(err, f"writing {writer.checkpoint_id} failed") from err
 

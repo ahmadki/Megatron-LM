@@ -6,8 +6,9 @@ A :class:`Piece` is one output DCP chunk: a box of an output tensor, backed at
 run time by one standalone CPU buffer of exactly its size. Its :class:`CopyOp`
 list says where every element comes from (a box of a stored source chunk) and
 tiles the piece exactly. A :class:`BytePiece` is an output byte item whose
-payload is already encoded. Pieces are pure descriptions (no tensor data), so
-they can be planned from metadata alone and pickled to worker processes.
+payload is already encoded (or, in a dry-run plan, only sized). Pieces are pure
+descriptions (no tensor data), so they can be planned from metadata alone and
+pickled to worker processes.
 """
 
 from __future__ import annotations
@@ -102,16 +103,39 @@ class Piece:
 class BytePiece:
     """One output byte item with its encoded payload.
 
+    A dry-run plan may record only the payload's (estimated) size, without
+    reading or encoding it (:meth:`sized`); such a piece can be packed and
+    budgeted but never written.
+
     Attributes:
         key: Output item key.
-        payload: The bytes to store, written verbatim.
+        payload: The bytes to store, written verbatim; ``None`` if only sized.
         planner_path: ``Metadata.planner_data`` entry of the key, if the target
             format records one.
+        size: The payload size of a piece without a payload.
+
+    Raises:
+        InternalError: Neither or both of ``payload`` and ``size`` are given.
     """
 
     key: str
-    payload: bytes
+    payload: bytes | None
     planner_path: tuple[str, ...] | None = None
+    size: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.payload is None) == (self.size is None):
+            raise InternalError(f"byte item {self.key} needs exactly one of a payload and a size")
+
+    @classmethod
+    def sized(cls, key: str, size: int, planner_path: tuple[str, ...] | None = None) -> BytePiece:
+        """A byte item of a dry-run plan: its size is known, its payload is not read."""
+        return cls(key, None, planner_path, size)
+
+    @property
+    def nbytes(self) -> int:
+        """Size of the payload."""
+        return len(self.payload) if self.payload is not None else int(self.size or 0)
 
 
 def copy_pieces(entry: TensorEntry) -> tuple[Piece, ...]:

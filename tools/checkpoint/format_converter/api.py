@@ -5,21 +5,27 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .engine.fs import write_atomic
 from .engine.hashing import TensorDigest, compute_digests
 from .engine.metadata import MetadataView
 from .engine.reader import ReadStats, SourceReader
 from .engine.regions import Region
+from .engine.runner import RunOptions, run_program
 from .engine.sizes import format_bytes
 from .errors import UsageError
 from .formats.common_summary import CommonSummary, summarize_common_state
-from .formats.detect import Detection, detect_format, open_store
+from .formats.detect import Detection, detect_format, open_store, publish_target
 from .formats.sections import Census, Section, classify_key, take_census
-from .options import InspectOptions, VerifyOptions
+from .options import ConvertOptions, InspectOptions, PlanOptions, VerifyOptions
+from .planning import ConversionPlan, plan_weights_only
+from .report import ConvertReport, peak_rss
+from .sidecars import copy_sidecars, write_integrity_manifest
 from .verify.compare import compare_stores
 from .verify.oracle import verify_against_oracle
 from .verify.report import VerifyReport
@@ -204,6 +210,82 @@ def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyRep
         report = compare_stores(store_a, open_store(b, iteration=opts.iteration), opts)
     _log_reads(f"verify ({len(report.findings)} findings)", report.read_stats)
     return report
+
+
+def plan_conversion(src: Path, opts: PlanOptions) -> ConversionPlan:
+    """Dry-run a conversion of ``src`` from its metadata and common state (nothing is written).
+
+    Byte items are sized from the metadata rather than read. On a host
+    without Megatron, a common state that references Megatron classes is
+    decoded with stubs (codec ``stub``): the plan is complete, but ``convert``
+    needs the Megatron container. The plan cannot be executed.
+
+    Args:
+        src: A store directory or a checkpoint root.
+        opts: Target format and budgets.
+
+    Raises:
+        ConverterError: The source is refused, unreadable, or does not fit the
+            memory budgets.
+    """
+    return _plan(src, opts, dry_run=True)
+
+
+def _plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan:
+    plan = plan_weights_only(Path(src), opts, dry_run=dry_run)
+    _LOGGER.info(
+        "planned %d units, about %s of host memory",
+        len(plan.units),
+        format_bytes(plan.memory.total),
+    )
+    return plan
+
+
+def convert_checkpoint(src: Path, dst: Path, opts: ConvertOptions) -> ConvertReport:
+    """Convert ``src`` into a new store under ``dst`` (a checkpoint root or an iteration directory).
+
+    Args:
+        src: A store directory or a checkpoint root.
+        dst: Checkpoint root (gets ``iter_%07d`` and the tracker) or, if its
+            name is ``iter_<N>``/``release`` or ``opts.dst_is_iter_dir``, the
+            iteration directory itself.
+        opts: Planning, staging and publishing options.
+
+    Raises:
+        ConverterError: The source is refused or unreadable, a budget is
+            exceeded, the target overlaps the source or the staging directory,
+            the target exists (without ``overwrite``), staging belongs to
+            another conversion, or writing or checking the output fails.
+    """
+    started = time.time()
+    plan = _plan(src, opts, dry_run=False)
+    target = publish_target(
+        Path(dst), plan.iteration, iter_dir_mode=opts.dst_is_iter_dir, tracker=opts.tracker
+    )
+
+    def finalize(final_dir: Path) -> None:
+        for name, payload in plan.adapter.marker_files().items():
+            write_atomic(final_dir / name, payload)
+        if opts.copy_sidecars:
+            copy_sidecars(plan.sidecars, plan.store.iter_dir, final_dir)
+        plan.adapter.validate_published(final_dir)
+        if plan.sidecars.regenerated:
+            write_integrity_manifest(final_dir)  # last: it hashes every other file
+
+    run = run_program(
+        plan.program(target),
+        target,
+        RunOptions(
+            workers=opts.workers,
+            resume=opts.resume,
+            restart=opts.restart,
+            keep_staging=opts.keep_staging,
+            overwrite=opts.overwrite,
+            staging_dir=opts.staging_dir,
+        ),
+        finalize=finalize,
+    )
+    return ConvertReport(plan.to_json(), run, time.time() - started, peak_rss())
 
 
 def _log_budget(max_item_bytes: int, workers: int) -> None:

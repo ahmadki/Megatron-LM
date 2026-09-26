@@ -4,14 +4,17 @@
 
 Each check runs in a fresh interpreter whose ``sys.meta_path`` refuses those
 packages, so an accidental top-level import anywhere in the package fails here
-even in environments (CI containers) where they are installed.
+even in environments (CI containers) where they are installed. An AST scan
+also keeps each subpackage to the layers below it.
 """
 
 from __future__ import annotations
 
+import ast
 import enum
 import importlib
 import inspect
+import json
 import pkgutil
 import subprocess
 import sys
@@ -76,7 +79,9 @@ def test_package_import_does_not_import_torch(scrubbed_env):
         import tools.checkpoint.format_converter as fc
         assert "torch" not in sys.modules, "package __init__ imported torch"
         assert fc.__version__ == "0.1.0"
-        assert {"inspect_checkpoint", "verify_checkpoint"} <= set(dir(fc))
+        assert {
+            "convert_checkpoint", "inspect_checkpoint", "plan_conversion", "verify_checkpoint"
+        } <= set(dir(fc))
         print("ok")
         """,
         scrubbed_env,
@@ -117,6 +122,7 @@ def test_api_exports_are_functions_after_the_subpackages_load():
         if name != "__version__":
             assert inspect.isfunction(getattr(fc, name)), name
     assert inspect.isfunction(inspect_checkpoint) and inspect.isfunction(verify_checkpoint)
+    assert {"plan_conversion", "convert_checkpoint"} <= set(fc.__all__)
     assert set(fc.__all__).isdisjoint(info.name for info in pkgutil.iter_modules(fc.__path__))
 
 
@@ -190,19 +196,106 @@ def test_commands_run_without_megatron(tmp_path, scrubbed_env):
         common={"args": default_args(), "iteration": 7, "checkpoint_version": 3.0},
     )
     digests = tmp_path / "digests.json"
+    dst = tmp_path / "dst" / "iter_0000007"
     result = _run(
         f"""
         from tools.checkpoint.format_converter import cli
         inspected = cli.main(["inspect", {str(store)!r}, "--digests", {str(digests)!r}])
         verified = cli.main(["verify", {str(store)!r}, {str(store)!r}])
+        planned = cli.main(["plan", {str(store)!r}, "--to", "torch_dist"])
+        converted = cli.main(["convert", {str(store)!r}, {str(dst)!r}, "--to", "torch_dist",
+                              "--workers", "0"])
         import torch
         assert not torch.cuda.is_initialized()
         assert not [m for m in sys.modules if m.split(".")[0] in BLOCKED]
-        sys.exit(inspected or verified)
+        sys.exit(inspected or verified or planned or converted)
         """,
         scrubbed_env,
     )
     assert result.returncode == 0, result.stderr
     assert "format:     torch_dist (mcore)" in result.stdout
     assert "verify:     OK" in result.stdout
+    assert "(plain codec)" in result.stdout
+    assert f"published:  {dst}" in result.stdout
     assert digests.is_file()
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_plan_without_megatron_stubs_megatron_classes_and_convert_refuses(tmp_path, scrubbed_env):
+    """``plan`` stays complete on a host without Megatron; ``convert`` needs the container."""
+    store = write_torch_dist_store(
+        tmp_path / "store",
+        {"decoder.final_layernorm.weight": torch.ones(4)},
+        common={
+            "args": default_args(attention_backend=FakeAttnBackend.auto, no_save_optim=False),
+            "iteration": 7,
+            "checkpoint_version": 3.0,
+            "optimizer": {"param_groups": []},
+        },
+        common_aliases={FakeAttnBackend: (ENUMS, "AttnBackend")},
+    )
+    dst = tmp_path / "dst"
+    result = _run(
+        f"""
+        from tools.checkpoint.format_converter import cli
+        planned = cli.main(["plan", {str(store)!r}, "--to", "torch_dist", "--json"])
+        converted = cli.main(["convert", {str(store)!r}, {str(dst)!r}, "--to", "torch_dist",
+                              "--workers", "0"])
+        print("exit", planned, converted)
+        """,
+        scrubbed_env,
+    )
+    assert result.returncode == 0, result.stderr
+    report, _, codes = result.stdout.rpartition("exit ")
+    assert codes.split() == ["0", "3"]
+    common = json.loads(report)["common"]
+    assert common["codec"] == "stub"
+    assert common["dropped"] == ["optimizer"]
+    assert common["args_changes"] == {"no_save_optim": [False, True]}
+    assert (
+        f"FC-E01: common_state/shard_0_1 references classes only the Megatron codec can load "
+        f"({ENUMS}.AttnBackend)" in result.stderr
+    )
+    assert not dst.exists()
+
+
+PACKAGE = REPO_ROOT / "tools" / "checkpoint" / "format_converter"
+LAYERS = {
+    "engine": {"errors"},
+    "core": {"errors", "engine"},
+    "formats": {"errors", "engine", "core"},
+    "rules": {"errors", "engine", "core"},
+    "verify": {"errors", "engine", "core", "formats", "options"},
+    "mcore_state": {"errors", "engine", "core", "formats"},
+}
+"""What each subpackage may import from the rest of the package (besides itself)."""
+
+
+def _package_imports(path) -> set[str]:
+    """The top-level package modules (``engine``, ``errors``, ...) that ``path`` imports."""
+    parts = path.relative_to(REPO_ROOT).with_suffix("").parts
+    package = parts[:-1]
+    root = PACKAGE.relative_to(REPO_ROOT).parts
+    found = set()
+    for node in ast.walk(ast.parse(path.read_text(), str(path))):
+        if isinstance(node, ast.ImportFrom):
+            base = package[: len(package) - node.level + 1] if node.level else ()
+            module = (*base, *(node.module or "").split(".")) if node.module else base
+            names = [module] if node.module else [(*module, a.name) for a in node.names]
+        elif isinstance(node, ast.Import):
+            names = [tuple(a.name.split(".")) for a in node.names]
+        else:
+            continue
+        found.update(n[len(root)] for n in names if n[: len(root)] == root and len(n) > len(root))
+    return found
+
+
+def test_each_layer_imports_only_the_layers_below_it():
+    violations = []
+    for layer, allowed in LAYERS.items():
+        for path in sorted((PACKAGE / layer).glob("**/*.py")):
+            extra = _package_imports(path) - allowed - {layer}
+            if extra:
+                violations.append(f"{path.relative_to(PACKAGE)} imports {sorted(extra)}")
+    assert violations == []
+    assert _package_imports(PACKAGE / "planning.py") >= {"engine", "formats", "mcore_state"}

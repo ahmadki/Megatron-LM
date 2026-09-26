@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..errors import UsageError
+from ..errors import InternalError, UsageError
 from .memory import check_free_disk, estimate_output_bytes
 from .merge import MergeSummary, MetadataMerger, post_check
 from .metadata import MetadataView
@@ -70,6 +70,13 @@ class WriteProgram:
     max_item_bytes: int
     fingerprint: str
     info: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        unread = [p.key for u in self.units for p in u.byte_pieces if p.payload is None]
+        if unread:
+            raise InternalError(
+                f"byte items {unread[:4]} have no payload (a dry-run plan cannot be executed)"
+            )
 
     @functools.cached_property
     def expected(self) -> dict[str, ExpectedTensor]:

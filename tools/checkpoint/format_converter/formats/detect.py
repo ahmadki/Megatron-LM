@@ -33,6 +33,7 @@ from pathlib import Path
 
 from .. import errors
 from ..engine.metadata import METADATA_FILE, MetadataView
+from ..engine.staging import PublishTarget
 from ..errors import IntegrityError, Refusal, UsageError
 from .names import DIALECTS, FORMATS, FSDP_DTENSOR, TORCH_DIST
 
@@ -203,6 +204,30 @@ def detect_format(store: Store, *, from_format: str | None = None) -> Detection:
         iteration=store.iteration,
         evidence=tuple(evidence),
     )
+
+
+def publish_target(
+    dst: Path, iteration: Iteration, *, iter_dir_mode: bool, tracker: bool = True
+) -> PublishTarget:
+    """Where a converted store goes: the inverse of :func:`resolve_iteration_dir`.
+
+    ``dst`` is an iteration directory (a bare store, no tracker) if ``iter_dir_mode``
+    is set or its name is ``iter_<N>`` or ``release``; otherwise it is a checkpoint
+    root that gets ``iter_%07d`` (or ``release``) and, if ``tracker``, the tracker.
+
+    Raises:
+        UsageError: ``dst`` is a root and the iteration is unknown.
+    """
+    dst = Path(dst).absolute()
+    if iter_dir_mode or _ITERATION_DIR.match(dst.name) or dst.name == "release":
+        return PublishTarget(dst)
+    if iteration is None:
+        raise UsageError(
+            f"the source's iteration is unknown, so no iteration directory can be named in {dst}",
+            hint="pass DST as the iteration directory itself (or --dst-is-iter-dir)",
+        )
+    name = "release" if iteration == "release" else f"iter_{iteration:07d}"
+    return PublishTarget(dst / name, dst / TRACKER_FILE if tracker else None, str(iteration))
 
 
 def _detect_from_config(config: Path) -> tuple[str, tuple[str, ...]]:

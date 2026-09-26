@@ -14,7 +14,12 @@ from typing import Any
 
 __version__ = "0.1.0"
 
-_LAZY_EXPORTS: dict[str, str] = {"inspect_checkpoint": ".api", "verify_checkpoint": ".api"}
+_LAZY_EXPORTS: dict[str, str] = {
+    "convert_checkpoint": ".api",
+    "inspect_checkpoint": ".api",
+    "plan_conversion": ".api",
+    "verify_checkpoint": ".api",
+}
 
 __all__ = ["__version__", *sorted(_LAZY_EXPORTS)]
 

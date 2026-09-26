@@ -33,6 +33,7 @@ def test_estimate_totals():
         "worker_baseline": 10,
         "workers": 3,
         "driver": 50,
+        "worker_peak": 110,
         "total": 380,
     }
     units = [Unit(0, (), est_peak_bytes=7), Unit(1, (), est_peak_bytes=30)]
