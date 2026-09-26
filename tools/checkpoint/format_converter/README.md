@@ -240,6 +240,7 @@ arguments and the model keys before any tensor is read.
 | `FC-R03` | a spec or implementation whose keys the rules do not know: `transformer_impl` other than `transformer_engine`, a `--spec` outside the verified list, heterogeneous layer specs, Transformer Engine operation-fuser MLPs |
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
+| `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
 | `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, or model keys under an unknown top-level module |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |

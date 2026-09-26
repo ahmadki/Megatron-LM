@@ -51,6 +51,9 @@ FC_R06 = "FC-R06"
 FC_R07 = "FC-R07"
 """A torch_dist target would lose FP8 delayed-scaling state that its loader requires."""
 
+FC_R11 = "FC-R11"
+"""The layer indices a store holds contradict the hybrid layer pattern."""
+
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""
 

@@ -2,13 +2,17 @@
 
 """The logical key space: format-independent identities of model tensors.
 
-Conversion never maps one format's keys to the other's directly. The source
-adapter *decomposes* every source tensor into :class:`LogicalSlice` objects,
-each naming a region of a stored key by a :class:`LogicalId`; rules turn slices
-into :class:`LogicalOutput` objects (what each output tensor holds, as
-:class:`LogicalCopy` boxes of source slices); and the target adapter
-*composes* output keys and chunk grids from the output ids. Rules therefore see
-only logical ids and serve both directions.
+Conversion never maps one format's keys to the other's directly. Every source
+tensor is *decomposed* into :class:`LogicalSlice` objects, each naming a region
+of a stored key by a :class:`LogicalId`: the source format's adapter strips its
+key envelope and ``core/structure.py`` maps the model-relative key to an id
+(key grammar and the blocks' layer numbering). Rules turn slices into
+:class:`LogicalOutput` objects (what each output tensor holds, as
+:class:`LogicalCopy` boxes of source slices). Every output id is then
+*composed* back: ``core/structure.py`` gives its model-relative key in the
+target format, and the target format's adapter adds the envelope and supplies
+the planner path and the chunk grid. Rules therefore see only logical ids and
+serve both directions.
 
 A :class:`LogicalId` names one model tensor as the live model does: the block
 it belongs to, its *dense* layer index in that block (the ``nn.ModuleList``

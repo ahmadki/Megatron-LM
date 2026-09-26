@@ -28,6 +28,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
+from .blocks import BlockLayout, classify_blocks
 from .names import DIALECTS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, FSDP_OPTIMIZER_STATE, TORCH_DIST
 
 TD_TO_FSDP = "td_to_fsdp"
@@ -72,6 +73,7 @@ class ArchContext:
         ep: Expert-parallel size the source was saved with.
         pp: Pipeline-parallel size the source was saved with.
         vpp: Virtual-pipeline size the source was saved with (``None`` if unused).
+        blocks: The model's layered blocks and how each format numbers their layers.
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -88,6 +90,7 @@ class ArchContext:
     ep: int
     pp: int
     vpp: int | None
+    blocks: tuple[BlockLayout, ...]
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     derivations: tuple[Derivation, ...]
@@ -117,7 +120,7 @@ def build_arch_context(
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction.
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
-            and ``fp16``).
+            and ``fp16``; FC-R11 for layer indices the blocks do not explain).
     """
     direction = DIRECTIONS.get((source, target))
     if direction is None:
@@ -132,6 +135,11 @@ def build_arch_context(
     pp = _parallel_size(args, "pipeline_model_parallel_size", 1, log, field="pp")
     vpp = args.get("virtual_pipeline_model_parallel_size", None)
     log.append(Derivation("vpp", vpp, f"args.virtual_pipeline_model_parallel_size={vpp}"))
+    blocks = classify_blocks(args, model, source)
+    log.extend(
+        Derivation(f"blocks.{block.prefix}", _block_summary(block), block.evidence)
+        for block in blocks
+    )
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
@@ -147,10 +155,17 @@ def build_arch_context(
         ep=ep,
         pp=pp,
         vpp=vpp,
+        blocks=blocks,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         derivations=tuple(log),
     )
+
+
+def _block_summary(block: BlockLayout) -> dict[str, Any]:
+    summary = block.to_json()
+    del summary["prefix"], summary["evidence"]
+    return summary
 
 
 def _params_dtype(

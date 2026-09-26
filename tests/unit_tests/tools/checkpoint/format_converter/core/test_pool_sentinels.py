@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -19,6 +22,8 @@ from tools.checkpoint.format_converter.core.registry import RuleRegistry, Sentin
 from tools.checkpoint.format_converter.core.rule import FamilyInstance, LeafRule, LogicalPool, Stage
 from tools.checkpoint.format_converter.engine.regions import Region
 from tools.checkpoint.format_converter.errors import InternalError
+
+from .._harness import REPO_ROOT
 
 
 def _slice(layer: int, leaf: str = "weight") -> LogicalSlice:
@@ -136,3 +141,25 @@ def test_sentinels_are_named_owned_and_per_format():
         registry.sentinel(stacked)
     with pytest.raises(InternalError, match="no owner"):
         registry.sentinel(Sentinel("orphan", "torch_dist", re.compile("x"), (), "none"))
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_importing_the_rules_alone_registers_the_sentinels(scrubbed_env):
+    """Fail-closed must not depend on another module having imported the refusal fence."""
+    script = (
+        "import json\n"
+        "from tools.checkpoint.format_converter import rules\n"
+        "from tools.checkpoint.format_converter.core.registry import REGISTRY\n"
+        "print(json.dumps(sorted({sentinel.fmt for sentinel in REGISTRY.sentinels})))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=scrubbed_env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["fsdp_dtensor", "torch_dist"]

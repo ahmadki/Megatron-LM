@@ -1,13 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The registry every conversion rule, sentinel, refusal detector and allowlist is declared in.
+"""The registry every rule, sentinel, refusal detector, block classifier and allowlist is in.
 
 Rule modules register their :class:`~.rule.LeafRule` subclasses with the
 ``@REGISTRY.rule`` decorator when they are imported; planning asks the
 registry for the enabled rules in stage order. Refusal detectors (functions of
 the conversion's facts that yield refusals, see ``core/refusals.py``) register
-with ``@REGISTRY.detector``, and :class:`Allowlist` entries name the layer
-symbols, specs and attention variants that rules have been verified for.
+with ``@REGISTRY.detector``, block classifiers (functions of the arguments that
+yield block layouts, see ``core/blocks.py``) with ``@REGISTRY.classifier``, and
+:class:`Allowlist` entries name the layer symbols, specs and attention variants
+that rules have been verified for.
 
 A :class:`Sentinel` names source keys that the generic identity rule must
 never convert, because they need a specific rule (for example a fused
@@ -30,12 +32,17 @@ from ..errors import InternalError, Refusal
 from .rule import LeafRule
 
 if TYPE_CHECKING:
+    from .args_view import ArgsView
+    from .blocks import BlockLayout
     from .context import ArchContext
     from .refusals import Facts
 
 RuleT = TypeVar("RuleT", bound=type[LeafRule])
 Detector = Callable[["Facts"], Iterable[Refusal]]
 """A refusal detector: yields the refusals the conversion's facts call for."""
+
+Classifier = Callable[["ArgsView"], Iterable["BlockLayout"]]
+"""A block classifier: yields the layouts of the blocks of its kind the arguments describe."""
 
 
 class Allowlist(enum.Enum):
@@ -75,12 +82,13 @@ class Sentinel:
 
 
 class RuleRegistry:
-    """Rules, sentinels and refusal detectors by name, and allowlists."""
+    """Rules, sentinels, refusal detectors and block classifiers by name, and allowlists."""
 
     def __init__(self) -> None:
         self._rules: dict[str, LeafRule] = {}
         self._sentinels: dict[str, Sentinel] = {}
         self._detectors: dict[str, Detector] = {}
+        self._classifiers: dict[str, Classifier] = {}
         self._allowed: dict[Allowlist, frozenset[str]] = {kind: frozenset() for kind in Allowlist}
 
     def rule(self, cls: RuleT) -> RuleT:
@@ -119,6 +127,18 @@ class RuleRegistry:
         self._detectors[name] = function
         return function
 
+    def classifier(self, function: Classifier) -> Classifier:
+        """Function decorator: register a block classifier under its name.
+
+        Raises:
+            InternalError: Another classifier has the same name.
+        """
+        name = function.__name__
+        if name in self._classifiers:
+            raise InternalError(f"block classifier {name} is registered twice")
+        self._classifiers[name] = function
+        return function
+
     def allow(self, kind: Allowlist, *values: str) -> None:
         """Add verified values to an allowlist."""
         self._allowed[kind] = self._allowed[kind] | frozenset(values)
@@ -126,6 +146,11 @@ class RuleRegistry:
     def allowed(self, kind: Allowlist) -> frozenset[str]:
         """The verified values of an allowlist."""
         return self._allowed[kind]
+
+    @property
+    def classifiers(self) -> dict[str, Classifier]:
+        """Every registered block classifier by name, in registration order."""
+        return dict(self._classifiers)
 
     @property
     def detectors(self) -> dict[str, Detector]:
