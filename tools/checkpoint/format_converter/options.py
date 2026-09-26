@@ -14,7 +14,7 @@ from typing import Any
 
 from .engine.memory import available_memory_bytes
 from .errors import UsageError
-from .formats.names import FORMATS, TORCH_DIST
+from .core.names import FORMATS, TORCH_DIST
 
 DEFAULT_WORKERS = 4
 MAX_ITEM_FRACTION_OF_AVAILABLE = 0.25

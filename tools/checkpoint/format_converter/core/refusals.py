@@ -1,0 +1,541 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""The refusal fence: permanent refusals and pending families, detected before any tensor is read.
+
+Cross-format conversion only runs on models whose every part a rule has been
+verified for. Everything else is refused from the checkpoint's training
+arguments and its model keys (names and shapes from the metadata), before any
+tensor data is read:
+
+* ``FC-R`` codes are permanent: the input is not a supported configuration.
+* ``FC-P`` codes are *pending families*: a supported configuration whose rules
+  are not implemented yet. Each code is lifted by the change that adds its
+  rules (:data:`PENDING_FAMILIES`), so no intermediate version of the tool can
+  silently mis-convert a family it does not know.
+
+Every detector runs and every refusal is reported together, so ``plan`` shows
+the whole list at once. Detectors are pure functions of :class:`Facts`
+registered with ``@REGISTRY.detector``.
+
+The layer symbols and specs verified so far are registered here too, and the
+sentinels owned by pending families: a pending family's keys that slip past
+the detectors are still refused by the identity rule (see ``core/registry.py``).
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
+
+from .. import errors
+from ..engine.metadata import TensorEntry
+from ..errors import Refusal
+from .args_view import ArgsView
+from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
+from .keys import (
+    EXPERT_PARAM,
+    FACTORY_PART,
+    FC1_WEIGHT,
+    FUSED_MIXER,
+    GDN_PARAM,
+    GDP_PART,
+    GLU_HALF,
+    LAYERS,
+    MIXER_PARAM,
+    MLA_PARAM,
+    STACKED_LAYERS,
+    TE_OP_FUSER_MLP,
+    fc2_weight_of,
+    root_of,
+)
+from .names import FSDP_DTENSOR, TORCH_DIST
+from .registry import REGISTRY, Allowlist, Sentinel
+
+PENDING_FAMILIES: Mapping[str, str] = {
+    errors.FC_P01: "non-hybrid TransformerBlock layers (GPT or vision decoders, stacked keys)",
+    errors.FC_P02: "models with several roots (language_model., vision_model., vision_projection.)",
+    errors.FC_P03: "mixture-of-experts layers",
+    errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
+    errors.FC_P05: "Gated DeltaProduct mixers",
+    errors.FC_P06: "gated linear_fc1 that fsdp_dtensor keeps fused (args.swiglu off)",
+    errors.FC_P07: "linear_fc1 split into SwiGLU halves (args.swiglu on)",
+    errors.FC_P08: "Mamba-2 mixers",
+    errors.FC_P09: "Gated DeltaNet and linear-attention layers",
+    errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
+    errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
+    errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
+}
+"""Every pending-family code and the family it stands for."""
+
+HYBRID_DECODERS = ("decoder", "language_model.decoder")
+"""Block prefixes of a hybrid model's main decoder (its ``HybridStack``)."""
+
+MTP_BLOCKS = ("mtp", "language_model.mtp")
+"""Block prefixes of multi-token prediction."""
+
+MTP_ROOT = "mtp"
+MODEL_ROOTS = frozenset({"embedding", "decoder", "output_layer"})
+"""Top-level modules of a single-root model that rules cover."""
+
+MULTI_ROOTS = frozenset({"language_model", "vision_model", "vision_projection"})
+"""Top-level modules of a vision-language (LLaVA-style) model."""
+
+HYBRID_SPEC_MODULES = (
+    "megatron.core.models.hybrid.hybrid_layer_specs",
+    "megatron.core.models.mamba.mamba_layer_specs",
+)
+"""Modules exporting the hybrid stack specs (the second re-exports the first)."""
+
+GDP_SPEC_NAMES = frozenset({"gated_delta_product_stack_spec", "gdp_stack_spec"})
+"""Names of the Gated DeltaProduct stack spec in those modules."""
+
+PENDING_SYMBOLS = frozenset("EMG+")
+"""Hybrid layer symbols of pending families (experts, mixers, Gated DeltaNet, MLA)."""
+
+GDN_VARIANTS = frozenset({"gdn", "gdn2", "gated_delta_net"})
+"""``experimental_attention_variant`` values of the Gated DeltaNet family."""
+
+GTP_REMAT_ARGS = ("gtp_weight_remat_size", "expert_gtp_weight_remat_size")
+"""Rematerialization sizes that enable grouped tensor parallelism when above 1."""
+
+GTP_SHARD_ARGS = (
+    ("tensor_parallel_num_weight_shards", "tensor_model_parallel_size"),
+    ("expert_tensor_parallel_num_weight_shards", "expert_tensor_parallel_size"),
+)
+"""Weight-shard counts that enable grouped tensor parallelism when above their tensor-parallel
+size (the expert size defaults to ``tensor_model_parallel_size`` when unset)."""
+
+HETEROGENEOUS_ARGS = (
+    "heterogeneous_layers_config_path",
+    "heterogeneous_layers_config_encoded_json",
+)
+
+REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-")
+REGISTRY.allow(
+    Allowlist.STACK_SPECS,
+    *(
+        f"{module}.{name}"
+        for module in HYBRID_SPEC_MODULES
+        for name in ("hybrid_stack_spec", "mamba_stack_spec")
+    ),
+)
+
+REGISTRY.sentinel(
+    Sentinel(
+        "stacked_layers",
+        TORCH_DIST,
+        STACKED_LAYERS,
+        (errors.FC_P01,),
+        "a tensor stacked over the layers of a block needs the stacked-block rules",
+    )
+)
+REGISTRY.sentinel(
+    Sentinel(
+        "parameter_parts",
+        TORCH_DIST,
+        FACTORY_PART,
+        (errors.FC_P05, errors.FC_P08, errors.FC_P09),
+        "a parameter stored as parts can only be reassembled by its family's rule",
+    )
+)
+REGISTRY.sentinel(
+    Sentinel(
+        "swiglu_halves",
+        FSDP_DTENSOR,
+        GLU_HALF,
+        (errors.FC_P07,),
+        "SwiGLU halves must be merged back into linear_fc1 by the GLU rule",
+    )
+)
+REGISTRY.sentinel(
+    Sentinel(
+        "fused_mixer_projections",
+        FSDP_DTENSOR,
+        FUSED_MIXER,
+        (errors.FC_P05, errors.FC_P08, errors.FC_P09),
+        "a fused mixer projection is packed per tensor-parallel rank and needs its mixer rule",
+    )
+)
+
+
+@dataclass(frozen=True)
+class Facts:
+    """What the refusal detectors see of a conversion (no tensor data).
+
+    Attributes:
+        source: Source format.
+        target: Target format.
+        args: The checkpoint's training arguments.
+        model: The source's model tensors by model-relative key.
+        optimizer: ``drop`` or ``convert`` (``--optimizer``).
+        allowed_roots: Key prefixes accepted besides the known roots (``--allow-root``).
+        allow_missing_fp8_extra_state: ``--allow-missing-fp8-extra-state``.
+    """
+
+    source: str
+    target: str
+    args: ArgsView
+    model: Mapping[str, TensorEntry]
+    optimizer: str = "drop"
+    allowed_roots: tuple[str, ...] = ()
+    allow_missing_fp8_extra_state: bool = False
+
+    def keys_matching(self, pattern: re.Pattern[str]) -> tuple[str, ...]:
+        """The model-relative keys ``pattern`` finds a match in (sorted)."""
+        return tuple(key for key in sorted(self.model) if pattern.search(key))
+
+
+def detect_refusals(facts: Facts) -> list[Refusal]:
+    """Every refusal the registered detectors find for ``facts``."""
+    return [refusal for detector in REGISTRY.detectors.values() for refusal in detector(facts)]
+
+
+def _pending(code: str, evidence: list[str], keys: tuple[str, ...] = ()) -> Iterator[Refusal]:
+    """One pending-family refusal naming its evidence, if there is any."""
+    if evidence or keys:
+        if keys:
+            evidence.append(f"{len(keys)} model key(s) such as {keys[0]}")
+        yield Refusal(
+            code,
+            f"not supported yet: {PENDING_FAMILIES[code]} ({'; '.join(evidence)})",
+            keys=keys,
+            hint="a later version of format_converter adds this family",
+        )
+
+
+def _spec_name(args: ArgsView) -> str | None:
+    """``--spec`` as ``<module>.<name>`` (``None`` when the default spec is used)."""
+    spec = args.get("spec", None)
+    if spec is None:
+        return None
+    return ".".join(str(part) for part in spec) if isinstance(spec, (list, tuple)) else str(spec)
+
+
+def _is_gdp_spec(args: ArgsView) -> bool:
+    spec = _spec_name(args)
+    return spec is not None and spec.rpartition(".")[2] in GDP_SPEC_NAMES
+
+
+def _symbols(facts: Facts) -> frozenset[str]:
+    pattern = hybrid_pattern_of(facts.args)
+    return frozenset() if pattern is None else pattern.symbols
+
+
+@REGISTRY.detector
+def megatron_fsdp_v2(facts: Facts) -> Iterator[Refusal]:
+    """FC-R01: the arguments select Megatron-FSDP v2, whose key prefix differs."""
+    version = facts.args.get("megatron_fsdp_version", 1)
+    if version == 2:
+        yield Refusal(
+            errors.FC_R01,
+            f"args.megatron_fsdp_version={version}: only Megatron-FSDP v1 stores are supported",
+            hint="use a checkpoint of a --megatron-fsdp-version 1 run",
+        )
+
+
+@REGISTRY.detector
+def fsdp_pipeline_parallel(facts: Facts) -> Iterator[Refusal]:
+    """FC-R02: an fsdp_dtensor source saved with pipeline or virtual-pipeline parallelism."""
+    if facts.source != FSDP_DTENSOR:
+        return
+    pp = facts.args.get("pipeline_model_parallel_size", 1) or 1
+    vpp = facts.args.get("virtual_pipeline_model_parallel_size", None)
+    if pp > 1 or (vpp or 1) > 1:
+        yield Refusal(
+            errors.FC_R02,
+            f"args.pipeline_model_parallel_size={pp}, args.virtual_pipeline_model_parallel_size="
+            f"{vpp}: fsdp_dtensor stores hold a single pipeline stage",
+            hint="use a checkpoint saved without pipeline parallelism",
+        )
+
+
+@REGISTRY.detector
+def unsupported_spec(facts: Facts) -> Iterator[Refusal]:
+    """FC-R03: a non-Transformer-Engine implementation, a custom or heterogeneous spec."""
+    impl = facts.args.get("transformer_impl", "transformer_engine")
+    if impl != "transformer_engine":
+        yield Refusal(
+            errors.FC_R03,
+            f"args.transformer_impl={impl!r}: only Transformer Engine layer specs are supported "
+            "(other implementations rename keys in torch_dist only)",
+            hint="convert a checkpoint of a --transformer-impl transformer_engine run",
+        )
+    spec = _spec_name(facts.args)
+    if spec is not None and spec not in REGISTRY.allowed(Allowlist.STACK_SPECS):
+        if not _is_gdp_spec(facts.args):
+            yield Refusal(
+                errors.FC_R03,
+                f"args.spec={spec!r} is not a spec whose keys the rules know",
+                hint="convert a checkpoint built with the default hybrid stack spec",
+            )
+    heterogeneous = [
+        f"args.{name}={facts.args.get(name, None)!r}"
+        for name in HETEROGENEOUS_ARGS
+        if facts.args.get(name, None) is not None
+    ]
+    if facts.args.get("heterogeneous_block_specs", False):
+        heterogeneous.append("args.heterogeneous_block_specs=True")
+    if heterogeneous:
+        yield Refusal(
+            errors.FC_R03,
+            f"heterogeneous layer specs are not supported ({', '.join(heterogeneous)})",
+            hint="convert a checkpoint of a homogeneous-spec model",
+        )
+    fused = facts.keys_matching(TE_OP_FUSER_MLP)
+    if fused:
+        yield Refusal(
+            errors.FC_R03,
+            "MLPs built with the Transformer Engine operation fuser store other keys per format",
+            keys=fused,
+            hint="convert a checkpoint of a model without the operation-fuser MLP",
+        )
+
+
+def _gtp_evidence(args: ArgsView) -> list[str]:
+    """The arguments that enable grouped tensor parallelism (none: it is off).
+
+    Megatron's ``validate_args`` sets an unset ``tensor_parallel_num_weight_shards``
+    to ``tensor_model_parallel_size * gtp_weight_remat_size`` (the expert pair
+    likewise, against the expert tensor-parallel size), so as many shards as
+    the tensor-parallel size is plain tensor parallelism: only more shards, or
+    a rematerialization size above 1, is grouped tensor parallelism.
+    """
+    evidence = [
+        f"args.{name}={args.get(name, None)}"
+        for name in GTP_REMAT_ARGS
+        if (args.get(name, None) or 1) > 1
+    ]
+    tp = args.get("tensor_model_parallel_size", None) or 1
+    expert_tp = args.get("expert_tensor_parallel_size", None) or tp
+    for (shards_name, size_name), size in zip(GTP_SHARD_ARGS, (tp, expert_tp)):
+        shards = args.get(shards_name, None)
+        if shards is not None and shards > size:
+            evidence.append(f"args.{shards_name}={shards} > {size_name}={size}")
+    return evidence
+
+
+@REGISTRY.detector
+def grouped_tensor_parallel(facts: Facts) -> Iterator[Refusal]:
+    """FC-R06: grouped tensor parallelism (weight shards beyond tensor parallelism, remat > 1)."""
+    enabled = _gtp_evidence(facts.args)
+    if enabled:
+        yield Refusal(
+            errors.FC_R06,
+            f"grouped tensor parallelism may pad stored tensors ({', '.join(enabled)})",
+            hint="convert a checkpoint saved without grouped tensor parallelism",
+        )
+
+
+@REGISTRY.detector
+def fp8_delayed_scaling(facts: Facts) -> Iterator[Refusal]:
+    """FC-R07: a torch_dist target of an FP8 delayed-scaling model (its amax history is lost)."""
+    if facts.source != FSDP_DTENSOR or facts.target != TORCH_DIST:
+        return
+    fp8 = facts.args.get("fp8", None)
+    recipe = facts.args.get("fp8_recipe", "delayed")
+    if not fp8 or recipe != "delayed":
+        return
+    if not facts.allow_missing_fp8_extra_state:
+        yield Refusal(
+            errors.FC_R07,
+            f"args.fp8={fp8!r} with args.fp8_recipe={recipe!r}: the torch_dist loader requires "
+            "the FP8 scaling state (_extra_state), which fsdp_dtensor stores do not hold",
+            hint="pass --allow-missing-fp8-extra-state to write the store without it "
+            "(the scaling history restarts)",
+        )
+
+
+@REGISTRY.detector
+def unknown_roots(facts: Facts) -> Iterator[Refusal]:
+    """FC-R13: model keys under a top-level module the rules do not know."""
+    known = MODEL_ROOTS | MULTI_ROOTS | {MTP_ROOT}
+    unknown = tuple(
+        key
+        for key in sorted(facts.model)
+        if root_of(key) not in known
+        and not any(key == p or key.startswith(p + ".") for p in facts.allowed_roots)
+    )
+    if unknown:
+        roots = sorted({root_of(key) for key in unknown})
+        yield Refusal(
+            errors.FC_R13,
+            f"model keys under unknown top-level modules {', '.join(roots)}",
+            keys=unknown,
+            hint="if they are stored identically in both formats, pass --allow-root "
+            + " --allow-root ".join(roots),
+        )
+
+
+@REGISTRY.detector
+def unverified_layers(facts: Facts) -> Iterator[Refusal]:
+    """FC-R20: hybrid symbols or attention variants no rule has been verified for."""
+    verified = REGISTRY.allowed(Allowlist.HYBRID_SYMBOLS)
+    unverified = sorted(_symbols(facts) - verified - PENDING_SYMBOLS)
+    if unverified:
+        unknown = [s for s in unverified if s not in LAYER_SYMBOLS]
+        yield Refusal(
+            errors.FC_R20,
+            f"hybrid layer symbols {''.join(unverified)} have no verified conversion rules"
+            + (f" ({''.join(unknown)} is not a Megatron layer symbol)" if unknown else ""),
+            hint="convert a model built from verified layer types only",
+        )
+    variant = facts.args.get("experimental_attention_variant", None)
+    allowed = REGISTRY.allowed(Allowlist.ATTENTION_VARIANTS)
+    if variant is not None and variant not in allowed | GDN_VARIANTS:
+        yield Refusal(
+            errors.FC_R20,
+            f"args.experimental_attention_variant={variant!r} has no verified conversion rules",
+            hint="convert a model without this attention variant",
+        )
+
+
+def _block_heads(blocks: tuple[str, ...]) -> tuple[str, ...]:
+    """The key prefixes of the layer lists of ``blocks``."""
+    return tuple(f"{block}.{LAYERS}." for block in blocks)
+
+
+def _mtp_keys(facts: Facts) -> tuple[str, ...]:
+    """Keys of multi-token prediction layers."""
+    return tuple(key for key in sorted(facts.model) if key.startswith(_block_heads(MTP_BLOCKS)))
+
+
+def _block_keys(facts: Facts, hybrid: bool) -> tuple[str, ...]:
+    """Keys in a layer list other than the hybrid decoder's and multi-token prediction's.
+
+    Stacked keys (``layers.`` without an index) count wherever they are.
+    """
+    own = _block_heads(MTP_BLOCKS + (HYBRID_DECODERS if hybrid else ()))
+    return tuple(
+        key
+        for key in sorted(facts.model)
+        if STACKED_LAYERS.search(key) or (f".{LAYERS}." in f".{key}" and not key.startswith(own))
+    )
+
+
+@REGISTRY.detector
+def pending_transformer_blocks(facts: Facts) -> Iterator[Refusal]:
+    """FC-P01: TransformerBlock layers (a non-hybrid model, stacked keys, other layer lists)."""
+    hybrid = hybrid_pattern_of(facts.args) is not None
+    evidence = [] if hybrid else ["no hybrid layer pattern in the arguments"]
+    yield from _pending(errors.FC_P01, evidence, _block_keys(facts, hybrid))
+
+
+@REGISTRY.detector
+def pending_multiple_roots(facts: Facts) -> Iterator[Refusal]:
+    """FC-P02: a vision-language model with several roots."""
+    keys = tuple(key for key in sorted(facts.model) if root_of(key) in MULTI_ROOTS)
+    yield from _pending(errors.FC_P02, [], keys)
+
+
+@REGISTRY.detector
+def pending_experts(facts: Facts) -> Iterator[Refusal]:
+    """FC-P03: mixture-of-experts layers."""
+    evidence = []
+    experts = facts.args.get("num_experts", None)
+    if experts:
+        evidence.append(f"args.num_experts={experts}")
+    if "E" in _symbols(facts):
+        evidence.append("hybrid layer symbol E")
+    yield from _pending(errors.FC_P03, evidence, facts.keys_matching(EXPERT_PARAM))
+
+
+@REGISTRY.detector
+def pending_shortcut_and_hybrid_mtp(facts: Facts) -> Iterator[Refusal]:
+    """FC-P04: shortcut-MoE numbering or hybrid multi-token prediction."""
+    pattern = hybrid_pattern_of(facts.args)
+    if pattern is None:
+        return
+    evidence = []
+    if facts.args.get("moe_shortcut_connection", False):
+        evidence.append("args.moe_shortcut_connection=True")
+    if pattern.mtp:
+        evidence.append(f"{len(pattern.mtp)} MTP depth(s) in the hybrid layer pattern")
+    elif facts.args.get("mtp_num_layers", None):
+        evidence.append(f"args.mtp_num_layers={facts.args.get('mtp_num_layers')}")
+    yield from _pending(errors.FC_P04, evidence, _mtp_keys(facts))
+
+
+def _mixer_code(facts: Facts) -> str:
+    """P05 (Gated DeltaProduct) when the spec or the stored parts say so, else P08 (Mamba-2)."""
+    if _is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
+        return errors.FC_P05
+    return errors.FC_P08
+
+
+@REGISTRY.detector
+def pending_mixers(facts: Facts) -> Iterator[Refusal]:
+    """FC-P05 / FC-P08: state-space mixers (Gated DeltaProduct or Mamba-2)."""
+    code = _mixer_code(facts)
+    evidence = []
+    if "M" in _symbols(facts):
+        evidence.append("hybrid layer symbol M")
+    if code == errors.FC_P05 and _is_gdp_spec(facts.args):
+        evidence.append(f"args.spec={_spec_name(facts.args)!r}")
+    yield from _pending(code, evidence, facts.keys_matching(MIXER_PARAM))
+
+
+def _gated_fc1(facts: Facts) -> tuple[str, ...]:
+    """``linear_fc1`` weights with twice the rows ``linear_fc2`` has inputs (gated units)."""
+    gated = []
+    for key in facts.keys_matching(FC1_WEIGHT):
+        fc2 = facts.model.get(fc2_weight_of(key))
+        fc1_shape = facts.model[key].shape
+        if fc2 is not None and len(fc1_shape) >= 2 and fc1_shape[-2] == 2 * fc2.shape[-1]:
+            gated.append(key)
+    return tuple(gated)
+
+
+@REGISTRY.detector
+def pending_glu(facts: Facts) -> Iterator[Refusal]:
+    """FC-P06 / FC-P07: gated linear units, kept fused (swiglu off) or split (swiglu on).
+
+    SwiGLU halves (``linear_fc1.weight_w``/``_v``, fsdp_dtensor) are split
+    units whatever ``args.swiglu`` says.
+    """
+    swiglu = facts.args.get("swiglu", False)
+    halves = facts.keys_matching(GLU_HALF)
+    fused = facts.keys_matching(FC1_WEIGHT) if swiglu else ()
+    evidence = ["args.swiglu=True"] if fused else []
+    if halves:
+        evidence.append("linear_fc1 stored as SwiGLU halves")
+    yield from _pending(errors.FC_P07, evidence, tuple(sorted(fused + halves)))
+    if not swiglu:
+        yield from _pending(errors.FC_P06, [], _gated_fc1(facts))
+
+
+@REGISTRY.detector
+def pending_linear_attention(facts: Facts) -> Iterator[Refusal]:
+    """FC-P09: Gated DeltaNet (hybrid symbol G) and linear attention."""
+    evidence = []
+    if "G" in _symbols(facts):
+        evidence.append("hybrid layer symbol G")
+    variant = facts.args.get("experimental_attention_variant", None)
+    if variant in GDN_VARIANTS:
+        evidence.append(f"args.experimental_attention_variant={variant!r}")
+    yield from _pending(errors.FC_P09, evidence, facts.keys_matching(GDN_PARAM))
+
+
+@REGISTRY.detector
+def pending_gpt_mtp_and_mla(facts: Facts) -> Iterator[Refusal]:
+    """FC-P10: GPT multi-token prediction and multi-latent attention."""
+    evidence = []
+    keys = facts.keys_matching(MLA_PARAM)
+    if hybrid_pattern_of(facts.args) is None:
+        depths = facts.args.get("mtp_num_layers", None)
+        if depths:
+            evidence.append(f"args.mtp_num_layers={depths} without a hybrid layer pattern")
+        keys += _mtp_keys(facts)
+    if facts.args.get("multi_latent_attention", False):
+        evidence.append("args.multi_latent_attention=True")
+    if "+" in _symbols(facts):
+        evidence.append("hybrid layer symbol +")
+    yield from _pending(errors.FC_P10, evidence, tuple(sorted(set(keys))))
+
+
+@REGISTRY.detector
+def pending_optimizer(facts: Facts) -> Iterator[Refusal]:
+    """FC-P11 / FC-P12: converting optimizer state (``--optimizer convert``)."""
+    if facts.optimizer == "convert":
+        code = errors.FC_P11 if facts.source == FSDP_DTENSOR else errors.FC_P12
+        yield from _pending(code, ["--optimizer convert"])

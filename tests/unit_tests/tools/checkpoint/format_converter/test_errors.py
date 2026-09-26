@@ -69,3 +69,19 @@ def test_refusal_categories_map_to_exit_codes():
 def test_refusal_rejects_malformed_codes(bad_code):
     with pytest.raises(ValueError, match="invalid refusal code"):
         Refusal(bad_code, "message")
+
+
+def test_cli_prints_every_refusal_on_its_own_line(monkeypatch, capsys):
+    from tools.checkpoint.format_converter import cli  # pylint: disable=import-outside-toplevel
+
+    def refuse(args):
+        raise errors.refusal_error(
+            [Refusal(errors.FC_P03, "experts", hint="later"), Refusal(errors.FC_R20, "symbol D")]
+        )
+
+    monkeypatch.setattr(cli, "_run_inspect", refuse)
+    assert cli.main(["inspect", "somewhere"]) == ExitCode.REFUSED
+    assert capsys.readouterr().err.splitlines() == [
+        "error: FC-R20: symbol D",
+        "error: FC-P03: experts hint: later",
+    ]

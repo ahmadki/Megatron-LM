@@ -39,7 +39,7 @@ from ..engine.reader import SourceReader
 from ..errors import IntegrityError, InternalError, Refusal, UsageError
 from .base import WHOLE, CommonLayout, RawCommon, Section
 from .detect import LEGACY_COMMON_FILE, TORCH_DIST_COMMON_ITEM, TORCH_DIST_CONFIG_FILE
-from .names import DIALECTS, TORCH_DIST
+from ..core.names import DIALECTS, TORCH_DIST
 
 TORCH_DIST_CONFIG = {"sharded_backend": TORCH_DIST, "sharded_backend_version": 1}
 """Contents of ``metadata.json`` (Megatron's ``CheckpointingConfig``)."""

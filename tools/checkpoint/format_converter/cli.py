@@ -68,7 +68,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return int(args.handler(args))
     except ConverterError as err:
-        sys.stderr.write(f"error: {err.format()}\n")
+        for line in err.format().splitlines():
+            sys.stderr.write(f"error: {line}\n")
         return int(err.exit_code)
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")

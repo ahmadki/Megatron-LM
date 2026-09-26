@@ -227,17 +227,37 @@ codec) and still reports everything.
 | 8 | memory or disk budget exceeded |
 | 130 | interrupted |
 
-Refusals print one line, `FC-xxx: <message> [keys...] hint: <what to do>`:
+Refusals print one line each, `FC-xxx: <message> [keys...] hint: <what to do>`;
+every refusal found is printed, permanent ones (`FC-R`) first. `FC-P` codes
+are pending families: supported configurations whose conversion rules land in
+a later version (see [Roadmap](#roadmap)); they are detected from the training
+arguments and the model keys before any tensor is read.
 
 | Code | Refused input |
 |---|---|
-| `FC-R01` | Megatron-FSDP v2 store (`model.<fqn>` keys without `module.`) |
-| `FC-R02` | virtual-pipeline sections (`model<i>.` or `optimizer.<i>.` keys) |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, a legacy `mp_rank_*` checkpoint, an unknown byte item, or an unknown common-state key |
+| `FC-R01` | Megatron-FSDP v2 store (`model.<fqn>` keys without `module.`) or arguments (`megatron_fsdp_version` 2) |
+| `FC-R02` | virtual-pipeline sections (`model<i>.` or `optimizer.<i>.` keys), or an `fsdp_dtensor` source saved with pipeline or virtual-pipeline parallelism |
+| `FC-R03` | a spec or implementation whose keys the rules do not know: `transformer_impl` other than `transformer_engine`, a `--spec` outside the verified list, heterogeneous layer specs, Transformer Engine operation-fuser MLPs |
+| `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
+| `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, or model keys under an unknown top-level module |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
+| `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones |
+| `FC-P01` | pending: non-hybrid `TransformerBlock` layers (GPT or vision decoders, stacked keys) |
+| `FC-P02` | pending: models with several roots (`language_model.`, `vision_model.`, `vision_projection.`) |
+| `FC-P03` | pending: mixture-of-experts layers (`num_experts`, symbol `E`, expert or router keys) |
+| `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
+| `FC-P05` | pending: Gated DeltaProduct mixers (its spec or its `in_proj`/`conv1d` parts) |
+| `FC-P06` | pending: gated `linear_fc1` that `fsdp_dtensor` keeps fused (`swiglu` off) |
+| `FC-P07` | pending: `linear_fc1` split into SwiGLU halves (`swiglu` on) |
+| `FC-P08` | pending: Mamba-2 mixers (symbol `M` without the Gated DeltaProduct spec) |
+| `FC-P09` | pending: Gated DeltaNet and linear attention (symbol `G`, a Gated DeltaNet `experimental_attention_variant`) |
+| `FC-P10` | pending: GPT multi-token prediction and multi-latent attention (symbol `+`) |
+| `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
+| `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
 | `FC-A05` | `--from` disagrees with the detected format |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |
 | `FC-E02` | the staging directory is not on the destination's filesystem (part files are hard-linked into the output) |

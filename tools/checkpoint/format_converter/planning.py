@@ -42,7 +42,7 @@ from .engine.staging import PublishTarget
 from .errors import IntegrityError, RefusedError, UsageError
 from .formats.base import FormatAdapter, RawCommon, Section, payload_keys
 from .formats.detect import Detection, Iteration, Store, detect_format, open_store
-from .formats.names import TORCH_DIST
+from .core.names import TORCH_DIST
 from .formats.sections import take_census
 from .formats.torch_dist import (
     DROPPED_SECTIONS,

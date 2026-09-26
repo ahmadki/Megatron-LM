@@ -32,10 +32,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import errors
+from ..core.names import DIALECTS, FORMATS, FSDP_DTENSOR, TORCH_DIST
 from ..engine.metadata import METADATA_FILE, MetadataView
 from ..engine.staging import PublishTarget
 from ..errors import IntegrityError, Refusal, UsageError
-from .names import DIALECTS, FORMATS, FSDP_DTENSOR, TORCH_DIST
 
 TRACKER_FILE = "latest_checkpointed_iteration.txt"
 TORCH_DIST_CONFIG_FILE = "metadata.json"

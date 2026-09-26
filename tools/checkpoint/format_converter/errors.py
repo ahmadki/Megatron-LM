@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import enum
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -41,6 +42,15 @@ FC_R01 = "FC-R01"
 FC_R02 = "FC-R02"
 """The store has virtual-pipeline sections (``model<i>.`` or ``optimizer.<i>.`` keys)."""
 
+FC_R03 = "FC-R03"
+"""The model was built with a spec or implementation whose keys the rules do not know."""
+
+FC_R06 = "FC-R06"
+"""The model uses grouped tensor parallelism (weight shards or rematerialization > 1)."""
+
+FC_R07 = "FC-R07"
+"""A torch_dist target would lose FP8 delayed-scaling state that its loader requires."""
+
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""
 
@@ -55,6 +65,45 @@ FC_R18 = "FC-R18"
 
 FC_R19 = "FC-R19"
 """The ``fsdp_dtensor`` store holds split fused-projection sub-keys (unknown layout)."""
+
+FC_R20 = "FC-R20"
+"""The model uses a layer type no rule is verified for (hybrid symbol or attention variant)."""
+
+FC_P01 = "FC-P01"
+"""Pending: non-hybrid ``TransformerBlock`` layers (stacked keys or a stacking decision)."""
+
+FC_P02 = "FC-P02"
+"""Pending: several model roots (``language_model.``, ``vision_model.``, ``vision_projection.``)."""
+
+FC_P03 = "FC-P03"
+"""Pending: mixture-of-experts layers."""
+
+FC_P04 = "FC-P04"
+"""Pending: shortcut-MoE layer numbering or hybrid multi-token prediction."""
+
+FC_P05 = "FC-P05"
+"""Pending: Gated DeltaProduct mixers."""
+
+FC_P06 = "FC-P06"
+"""Pending: gated ``linear_fc1`` that fsdp_dtensor keeps fused (SwiGLU split off)."""
+
+FC_P07 = "FC-P07"
+"""Pending: ``linear_fc1`` split into SwiGLU halves (``args.swiglu`` set)."""
+
+FC_P08 = "FC-P08"
+"""Pending: Mamba-2 mixers."""
+
+FC_P09 = "FC-P09"
+"""Pending: Gated DeltaNet and linear-attention layers."""
+
+FC_P10 = "FC-P10"
+"""Pending: GPT multi-token prediction or multi-latent attention."""
+
+FC_P11 = "FC-P11"
+"""Pending: converting optimizer state from fsdp_dtensor to torch_dist."""
+
+FC_P12 = "FC-P12"
+"""Pending: converting optimizer state from torch_dist to fsdp_dtensor."""
 
 FC_A05 = "FC-A05"
 """``--from`` names a different format than the one detected from the store."""
@@ -113,9 +162,7 @@ class Refusal:
 
     def to_error(self) -> RefusalError:
         """Build the exception that raises this refusal with the right exit code."""
-        if self.category == "A":
-            return AmbiguousError(self)
-        return RefusedError(self)
+        return refusal_error((self,))
 
 
 class ConverterError(Exception):
@@ -169,15 +216,26 @@ class BudgetExceeded(ConverterError):
 
 
 class RefusalError(ConverterError):
-    """Base class of errors that carry a :class:`Refusal`."""
+    """Base class of errors that carry one or more :class:`Refusal` objects.
 
-    def __init__(self, refusal: Refusal) -> None:
+    Attributes:
+        refusal: The first refusal.
+        refusals: Every refusal, in report order.
+    """
+
+    def __init__(self, refusal: Refusal, *others: Refusal) -> None:
         super().__init__(refusal.message, hint=refusal.hint)
         self.refusal = refusal
+        self.refusals = (refusal, *others)
 
     def format(self) -> str:
-        """Render the carried refusal (``FC-xxx: ...``)."""
-        return self.refusal.format()
+        """Render the carried refusals, one ``FC-xxx: ...`` line each."""
+        return "\n".join(refusal.format() for refusal in self.refusals)
+
+    @property
+    def codes(self) -> tuple[str, ...]:
+        """The codes of the carried refusals, in report order."""
+        return tuple(refusal.code for refusal in self.refusals)
 
 
 class RefusedError(RefusalError):
@@ -190,3 +248,23 @@ class AmbiguousError(RefusalError):
     """The input is ambiguous and needs an explicit flag (``FC-A`` codes), exit 4."""
 
     exit_code = ExitCode.AMBIGUOUS
+
+
+_CATEGORY_ORDER = {"R": 0, "E": 1, "A": 2, "P": 3}
+
+
+def refusal_error(refusals: Sequence[Refusal]) -> RefusalError:
+    """One error carrying every refusal, permanent ones first (then by code).
+
+    The error exits 4 (:class:`AmbiguousError`) when every refusal only needs a
+    flag (``FC-A``), else 3 (:class:`RefusedError`).
+
+    Raises:
+        InternalError: ``refusals`` is empty.
+    """
+    if not refusals:
+        raise InternalError("refusal_error() needs at least one refusal")
+    ordered = sorted(refusals, key=lambda r: (_CATEGORY_ORDER[r.category], r.code))
+    if all(refusal.category == "A" for refusal in ordered):
+        return AmbiguousError(*ordered)
+    return RefusedError(*ordered)

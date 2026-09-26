@@ -101,3 +101,47 @@ def join_leaf(path: str, leaf: str) -> str:
 def root_of(key: str) -> str:
     """The first dotted segment of a model-relative key (``embedding``, ``decoder``, ...)."""
     return key.partition(".")[0]
+
+
+STACKED_LAYERS = re.compile(r"(?:^|\.)layers\.(?![0-9]+\.)")
+"""A ``layers.`` segment not followed by a layer index: a tensor stacked over layers."""
+
+FACTORY_PART = re.compile(r"\.(?:weight|bias)\.[A-Za-z_][A-Za-z0-9_]*$")
+"""A torch_dist factory sub-key: one part of a parameter stored as parts (``in_proj.weight.z``)."""
+
+GLU_HALF = re.compile(r"\.(?:weight|bias)[0-9]*_[wv]$")
+"""An fsdp_dtensor SwiGLU half of ``linear_fc1`` (``weight_w``, ``weight3_v``, ``bias_w``)."""
+
+FUSED_MIXER = re.compile(
+    r"\.(?:mixer|self_attention)\."
+    r"(?:in_proj\.(?:weight|bias)|conv1d(?:_weight|_bias|\.weight|\.bias))$"
+)
+"""A fused state-space or linear-attention projection as fsdp_dtensor stores it."""
+
+EXPERT_PARAM = re.compile(r"(?:^|\.)(?:experts|shared_experts|router)\.")
+"""A parameter or buffer of a mixture-of-experts layer."""
+
+MIXER_PARAM = re.compile(r"(?:^|\.)mixer\.")
+"""A parameter of a state-space mixer (Mamba-2 or Gated DeltaProduct)."""
+
+GDP_PART = re.compile(r"\.mixer\.(?:in_proj|conv1d)\.(?:weight|bias)\.(?:[VKb][0-9]+|Q|a)$")
+"""A torch_dist part of a Gated DeltaProduct ``in_proj`` or ``conv1d``."""
+
+GDN_PARAM = re.compile(r"\.self_attention\.(?:in_proj|conv1d)\.")
+"""A projection of a Gated DeltaNet attention (standard attention has ``linear_qkv``)."""
+
+MLA_PARAM = re.compile(
+    r"\.self_attention\.(?:linear_q_proj|linear_(?:q|kv|qkv)_(?:down|up)_proj)\."
+)
+"""A projection of multi-latent attention."""
+
+TE_OP_FUSER_MLP = re.compile(r"\.mlp\.[0-9]+\.")
+"""An MLP built with Transformer Engine's operation fuser (``mlp.<i>.basic_ops...``)."""
+
+FC1_WEIGHT = re.compile(r"(?:^|\.)linear_fc1\.weight$")
+"""The weight of an MLP's first projection (a candidate gated linear unit)."""
+
+
+def fc2_weight_of(fc1_key: str) -> str:
+    """The key of the ``linear_fc2.weight`` beside a ``linear_fc1.weight`` key."""
+    return fc1_key[: -len("fc1.weight")] + "fc2.weight"

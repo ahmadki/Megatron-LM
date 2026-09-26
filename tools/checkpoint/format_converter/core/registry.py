@@ -1,10 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The registry every conversion rule and sentinel is declared in.
+"""The registry every conversion rule, sentinel, refusal detector and allowlist is declared in.
 
 Rule modules register their :class:`~.rule.LeafRule` subclasses with the
 ``@REGISTRY.rule`` decorator when they are imported; planning asks the
-registry for the enabled rules in stage order.
+registry for the enabled rules in stage order. Refusal detectors (functions of
+the conversion's facts that yield refusals, see ``core/refusals.py``) register
+with ``@REGISTRY.detector``, and :class:`Allowlist` entries name the layer
+symbols, specs and attention variants that rules have been verified for.
 
 A :class:`Sentinel` names source keys that the generic identity rule must
 never convert, because they need a specific rule (for example a fused
@@ -17,14 +20,31 @@ past every detector still fails closed.
 
 from __future__ import annotations
 
+import enum
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from ..errors import InternalError
+from ..errors import InternalError, Refusal
 from .rule import LeafRule
 
 RuleT = TypeVar("RuleT", bound=type[LeafRule])
+Detector = Callable[[Any], Iterable[Refusal]]
+"""A refusal detector: yields the refusals the conversion's facts call for."""
+
+
+class Allowlist(enum.Enum):
+    """Values a converted model may use because rules and tests cover them."""
+
+    HYBRID_SYMBOLS = "hybrid layer symbols"
+    """Symbols of ``--hybrid-layer-pattern``."""
+
+    STACK_SPECS = "model specs"
+    """``--spec`` values, as ``<module>.<name>``."""
+
+    ATTENTION_VARIANTS = "experimental attention variants"
+    """Values of ``experimental_attention_variant`` besides ``None``."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,11 +71,13 @@ class Sentinel:
 
 
 class RuleRegistry:
-    """Rules and sentinels, by name."""
+    """Rules, sentinels and refusal detectors by name, and allowlists."""
 
     def __init__(self) -> None:
         self._rules: dict[str, LeafRule] = {}
         self._sentinels: dict[str, Sentinel] = {}
+        self._detectors: dict[str, Detector] = {}
+        self._allowed: dict[Allowlist, frozenset[str]] = {kind: frozenset() for kind in Allowlist}
 
     def rule(self, cls: RuleT) -> RuleT:
         """Class decorator: register one instance of a rule class under its ``name``.
@@ -81,6 +103,31 @@ class RuleRegistry:
         self._sentinels[sentinel.name] = sentinel
         return sentinel
 
+    def detector(self, function: Detector) -> Detector:
+        """Function decorator: register a refusal detector under its name.
+
+        Raises:
+            InternalError: Another detector has the same name.
+        """
+        name = function.__name__
+        if name in self._detectors:
+            raise InternalError(f"refusal detector {name} is registered twice")
+        self._detectors[name] = function
+        return function
+
+    def allow(self, kind: Allowlist, *values: str) -> None:
+        """Add verified values to an allowlist."""
+        self._allowed[kind] = self._allowed[kind] | frozenset(values)
+
+    def allowed(self, kind: Allowlist) -> frozenset[str]:
+        """The verified values of an allowlist."""
+        return self._allowed[kind]
+
+    @property
+    def detectors(self) -> dict[str, Detector]:
+        """Every registered refusal detector by name, in registration order."""
+        return dict(self._detectors)
+
     @property
     def rules(self) -> dict[str, LeafRule]:
         """Every registered rule by name."""
@@ -102,4 +149,4 @@ class RuleRegistry:
 
 
 REGISTRY = RuleRegistry()
-"""The registry of the package's rules and sentinels."""
+"""The registry of the package's rules, sentinels, refusal detectors and allowlists."""
