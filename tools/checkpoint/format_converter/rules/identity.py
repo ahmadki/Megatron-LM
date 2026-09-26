@@ -43,7 +43,8 @@ class IdentityRule(LeafRule):
 
         for piece in pool.take(self.name, unreserved):
             full = Region.full(piece.shape)
+            dtype = ctx.dtype_policy.output_dtype(piece.dtype)
             output = LogicalOutput(
-                piece.lid, piece.shape, piece.dtype, (LogicalCopy(piece.lid, full, full),)
+                piece.lid, piece.shape, dtype, (LogicalCopy(piece.lid, full, full),)
             )
             yield FamilyInstance(self.name, (piece,), (output,))

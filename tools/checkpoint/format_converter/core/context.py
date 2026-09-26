@@ -29,6 +29,8 @@ from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import BlockLayout, classify_blocks
+from .dtype_policy import DtypePolicy
+from .manifest import MANIFEST_FILE, Manifest
 from .names import DIALECTS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, FSDP_OPTIMIZER_STATE, TORCH_DIST
 
 TD_TO_FSDP = "td_to_fsdp"
@@ -77,6 +79,10 @@ class ArchContext:
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
+        dtype_policy: How output dtypes are chosen.
+        manifest: The manifest of the conversion that produced the source, if
+            it has one that describes it (used to restore what that
+            conversion changed).
         derivations: How each field was derived, in derivation order.
     """
 
@@ -93,6 +99,8 @@ class ArchContext:
     blocks: tuple[BlockLayout, ...]
     fsdp_model_prefix: str
     fsdp_optim_depth: str
+    dtype_policy: DtypePolicy
+    manifest: Manifest | None
     derivations: tuple[Derivation, ...]
 
     def derivation_log(self) -> list[dict[str, Any]]:
@@ -107,6 +115,9 @@ def build_arch_context(
     args: ArgsView,
     model: Mapping[str, TensorEntry],
     optimizer_keys: Iterable[str] = (),
+    manifest: Manifest | None = None,
+    metadata_sha256: str = "",
+    manifest_ignored: bool = False,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -116,11 +127,16 @@ def build_arch_context(
         args: The checkpoint's training arguments.
         model: The source's model tensors by model-relative key.
         optimizer_keys: The source's optimizer-state keys (evidence only).
+        manifest: The manifest found in the source store, if any.
+        metadata_sha256: SHA-256 of the source's ``.metadata`` (a manifest
+            must name it to describe the source).
+        manifest_ignored: The source's manifest was not read (``--ignore-manifest``).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction.
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
             and ``fp16``; FC-R11 for layer indices the blocks do not explain).
+        AmbiguousError: The source holds a manifest of another store (FC-A06).
     """
     direction = DIRECTIONS.get((source, target))
     if direction is None:
@@ -144,6 +160,10 @@ def build_arch_context(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
     depth = _fsdp_optim_depth(params_dtype, source, optimizer_keys, log)
+    log.append(Derivation("dtype_policy", DtypePolicy.PRESERVE.value, "weights-only conversion"))
+    if manifest_ignored:
+        manifest = None
+    _check_manifest(manifest, source, metadata_sha256, log, ignored=manifest_ignored)
     return ArchContext(
         direction=direction,
         source=(source, DIALECTS[source]),
@@ -158,7 +178,44 @@ def build_arch_context(
         blocks=blocks,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
+        dtype_policy=DtypePolicy.PRESERVE,
+        manifest=manifest,
         derivations=tuple(log),
+    )
+
+
+def _check_manifest(
+    manifest: Manifest | None,
+    source: str,
+    metadata_sha256: str,
+    log: list[Derivation],
+    *,
+    ignored: bool,
+) -> None:
+    """A source's manifest must describe the source store itself."""
+    if ignored:
+        log.append(Derivation("manifest", None, f"{MANIFEST_FILE} ignored (--ignore-manifest)"))
+        return
+    if manifest is None:
+        log.append(Derivation("manifest", None, f"the source has no {MANIFEST_FILE}"))
+        return
+    written = manifest.target.get("format")
+    if written != source or manifest.output_metadata_sha256 != metadata_sha256:
+        raise Refusal(
+            errors.FC_A06,
+            f"the source's {MANIFEST_FILE} describes another store (a {written} store whose "
+            f".metadata digest is {manifest.output_metadata_sha256}; this {source} store's is "
+            f"{metadata_sha256})",
+            keys=(MANIFEST_FILE,),
+            hint="pass --ignore-manifest to convert without restoring what it records",
+        ).to_error()
+    log.append(
+        Derivation(
+            "manifest",
+            manifest.source.get("format"),
+            f"{MANIFEST_FILE} of the conversion from {manifest.source.get('iter_dir')} "
+            "(restores its sanitized arguments and content_metadata)",
+        )
     )
 
 

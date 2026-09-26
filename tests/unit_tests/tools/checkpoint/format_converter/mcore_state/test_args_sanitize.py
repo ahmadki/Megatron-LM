@@ -8,7 +8,11 @@ import argparse
 
 import torch
 
-from tools.checkpoint.format_converter.mcore_state.args_sanitize import sanitize_weights_only
+from tools.checkpoint.format_converter.mcore_state.args_sanitize import (
+    sanitize_for_fsdp_dtensor,
+    sanitize_for_torch_dist,
+    sanitize_weights_only,
+)
 
 
 def test_existing_fields_are_set_and_reported():
@@ -34,3 +38,60 @@ def test_missing_fields_are_not_added_and_unchanged_ones_not_reported():
     assert result.changes == {} and result.consulted == {"no_save_optim": True}
     assert vars(result.args) == {"no_save_optim": True, "num_layers": 2}
     assert result.args is not args
+
+
+def _training_args(**overrides):
+    fields = {
+        "ckpt_format": "torch_dist",
+        "use_megatron_fsdp": False,
+        "no_save_optim": False,
+        "no_save_rng": False,
+        "pipeline_model_parallel_size": 2,
+        "virtual_pipeline_model_parallel_size": 2,
+        "num_layers_per_virtual_pipeline_stage": None,
+        "hybrid_layer_pattern": "*-|*-|*-|*-",
+        "params_dtype": torch.bfloat16,
+    }
+    fields.update(overrides)
+    return argparse.Namespace(**fields)
+
+
+def test_fsdp_dtensor_arguments_describe_a_single_stage_megatron_fsdp_store():
+    args = _training_args()
+    result = sanitize_for_fsdp_dtensor(args)
+    assert result.changes == {
+        "no_save_optim": (False, True),
+        "no_save_rng": (False, True),
+        "ckpt_format": ("torch_dist", "fsdp_dtensor"),
+        "use_megatron_fsdp": (False, True),
+        "pipeline_model_parallel_size": (2, 1),
+        "virtual_pipeline_model_parallel_size": (2, None),
+        "hybrid_layer_pattern": ("*-|*-|*-|*-", "*-*-*-*-"),
+    }
+    assert vars(result.args)["params_dtype"] is torch.bfloat16
+    assert "transformer_pipeline_model_parallel_size" not in vars(result.args)  # never added
+    assert vars(args) == vars(_training_args())
+
+
+def test_torch_dist_arguments_restore_a_manifest_but_never_clear_no_save_flags():
+    fsdp = sanitize_for_fsdp_dtensor(_training_args())
+    restore = {field: old for field, (old, _) in fsdp.changes.items()}
+    back = sanitize_for_torch_dist(fsdp.args, restore)
+    assert back.changes == {
+        "ckpt_format": ("fsdp_dtensor", "torch_dist"),
+        "use_megatron_fsdp": (True, False),
+        "pipeline_model_parallel_size": (1, 2),
+        "virtual_pipeline_model_parallel_size": (None, 2),
+        "hybrid_layer_pattern": ("*-*-*-*-", "*-|*-|*-|*-"),
+    }
+    assert vars(back.args) == {**vars(_training_args()), "no_save_optim": True, "no_save_rng": True}
+
+
+def test_torch_dist_arguments_without_a_manifest():
+    fsdp_args = _training_args(ckpt_format="fsdp_dtensor", use_megatron_fsdp=True, no_save_rng=True)
+    result = sanitize_for_torch_dist(fsdp_args)
+    assert result.changes == {
+        "ckpt_format": ("fsdp_dtensor", "torch_dist"),
+        "use_megatron_fsdp": (True, False),
+        "no_save_optim": (False, True),
+    }

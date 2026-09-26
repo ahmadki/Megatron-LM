@@ -260,6 +260,7 @@ arguments and the model keys before any tensor is read.
 | `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
 | `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
 | `FC-A05` | `--from` disagrees with the detected format |
+| `FC-A06` | the source's `conversion_manifest.json` describes another store (its `.metadata` digest differs); `--ignore-manifest` converts without restoring what it records |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |
 | `FC-E02` | the staging directory is not on the destination's filesystem (part files are hard-linked into the output) |
 

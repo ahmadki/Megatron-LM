@@ -16,9 +16,10 @@ from tools.checkpoint.format_converter.core.context import (
     TD_TO_FSDP,
     build_arch_context,
 )
+from tools.checkpoint.format_converter.core.manifest import Manifest
 from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
-from tools.checkpoint.format_converter.errors import RefusedError, UsageError
+from tools.checkpoint.format_converter.errors import AmbiguousError, RefusedError, UsageError
 
 
 def _model(**dtypes: torch.dtype) -> dict[str, TensorEntry]:
@@ -76,6 +77,12 @@ def test_torch_dist_to_fsdp_context_and_its_log():
             "value": "module.module.module.",
             "evidence": "params_dtype bfloat16",
         },
+        {"field": "dtype_policy", "value": "preserve", "evidence": "weights-only conversion"},
+        {
+            "field": "manifest",
+            "value": None,
+            "evidence": "the source has no conversion_manifest.json",
+        },
     ]
     assert args.consumed.keys() >= {"bf16", "fp16", "tensor_model_parallel_size"}
 
@@ -130,3 +137,59 @@ def test_contradictory_precision_is_refused():
 def test_same_format_is_not_a_cross_format_context():
     with pytest.raises(UsageError):
         build_arch_context(source=TORCH_DIST, target=TORCH_DIST, args=_args(), model={})
+
+
+def _manifest(fmt: str = FSDP_DTENSOR, digest: str = "abc") -> Manifest:
+    return Manifest(
+        tool_version="0.1.0",
+        torch_version="2.8.0",
+        source={"iter_dir": "/ckpt/iter_0000007", "format": TORCH_DIST},
+        target={"format": fmt, "dialect": "mfsdp_v1"},
+        options={},
+        derivations=(),
+        args_sanitized={"ckpt_format": ("torch_dist", "fsdp_dtensor")},
+        content_metadata={"present": False},
+        dropped=(),
+        output_metadata_sha256=digest,
+    )
+
+
+def test_a_manifest_must_describe_the_source_store():
+    def build(manifest, digest="abc"):
+        return build_arch_context(
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+            args=_args(),
+            model={},
+            manifest=manifest,
+            metadata_sha256=digest,
+        )
+
+    manifest = _manifest()
+    ctx = build(manifest)
+    assert ctx.manifest is manifest and ctx.dtype_policy.value == "preserve"
+    (logged,) = [d for d in ctx.derivations if d.field == "manifest"]
+    assert logged.value == TORCH_DIST and "from /ckpt/iter_0000007" in logged.evidence
+    for stale in (_manifest(digest="other"), _manifest(fmt=TORCH_DIST)):
+        with pytest.raises(AmbiguousError) as excinfo:
+            build(stale)
+        assert excinfo.value.refusal.code == errors.FC_A06
+        assert "--ignore-manifest" in excinfo.value.refusal.hint
+
+
+def test_an_ignored_manifest_is_logged_as_ignored():
+    ctx = build_arch_context(
+        source=FSDP_DTENSOR,
+        target=TORCH_DIST,
+        args=_args(),
+        model={},
+        manifest=_manifest(digest="other"),  # not checked either
+        metadata_sha256="abc",
+        manifest_ignored=True,
+    )
+    assert ctx.manifest is None
+    (logged,) = [d for d in ctx.derivations if d.field == "manifest"]
+    assert (logged.value, logged.evidence) == (
+        None,
+        "conversion_manifest.json ignored (--ignore-manifest)",
+    )

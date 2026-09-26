@@ -111,6 +111,9 @@ FC_P12 = "FC-P12"
 FC_A05 = "FC-A05"
 """``--from`` names a different format than the one detected from the store."""
 
+FC_A06 = "FC-A06"
+"""The source holds a conversion manifest that describes another store."""
+
 FC_E01 = "FC-E01"
 """The common state needs Megatron's classes, which this process cannot import."""
 
