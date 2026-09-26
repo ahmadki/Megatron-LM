@@ -24,6 +24,7 @@ class FindingKind(enum.Enum):
     LAYOUT = "layout"
     VALUE = "value"
     BYTES = "bytes"
+    COMMON = "common"
     ORACLE_INCONSISTENT = "oracle_inconsistent"
 
 
@@ -67,6 +68,7 @@ class VerifyReport:
         values_compared: Tensors whose values were compared.
         byte_items_compared: Byte items whose payloads were compared.
         read_stats: What reading both sides cost.
+        common_fields_compared: Common-state fields compared semantically.
     """
 
     a: Path
@@ -77,6 +79,7 @@ class VerifyReport:
     values_compared: int
     byte_items_compared: int
     read_stats: ReadStats
+    common_fields_compared: int = 0
 
     @property
     def ok(self) -> bool:
@@ -95,6 +98,7 @@ class VerifyReport:
             "keys_compared": self.keys_compared,
             "values_compared": self.values_compared,
             "byte_items_compared": self.byte_items_compared,
+            "common_fields_compared": self.common_fields_compared,
             "bytes_read": self.read_stats.bytes_read,
             "items_read": self.read_stats.items_touched,
             "read_amplification": self.read_stats.amplification,

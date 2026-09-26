@@ -2,6 +2,9 @@
 
 """Chunk-aligned, bitwise comparison of two stores key by key (identity key map).
 
+With ``--common semantic`` the common states are decoded and compared field by
+field (see :mod:`.common`) instead of byte for byte.
+
 For every key present on both sides the shapes and dtypes are compared, then
 (depending on the mode) the values. Values are compared per *compare unit*: a
 connected component of the overlap graph between A's and B's stored chunks.
@@ -29,8 +32,10 @@ from ..engine.reader import ReadReq, ReadStats, SourceReader
 from ..engine.regions import Region, bounding_box
 from ..engine.sizes import format_bytes
 from ..errors import BudgetExceeded
-from ..formats.detect import Store
+from ..formats.common_summary import common_state_keys
+from ..formats.detect import Store, detect_format
 from ..options import VerifyOptions
+from .common import compare_common
 from .report import Finding, FindingKind, VerifyReport, sort_findings
 
 T = TypeVar("T")
@@ -94,15 +99,23 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
     units = [u for key in value_keys for u in overlap_units(a_tensors[key], b_tensors[key])]
     for unit in units:
         _check_unit_budget(unit, opts.max_item_bytes)
+    detections = (detect_format(a), detect_format(b)) if opts.common == "semantic" else None
     byte_sizes: dict[str, int] = {}
-    if opts.common == "bytes":
-        key_findings, byte_sizes = _plan_byte_items(a, b, opts)
+    if opts.common != "skip":
+        common_keys = frozenset().union(*map(common_state_keys, detections or ()))
+        key_findings, byte_sizes = _plan_byte_items(a, b, opts, common_keys)
         findings.extend(key_findings)
     reader_a = SourceReader(a.view, max_item_bytes=opts.max_item_bytes)
     reader_b = SourceReader(b.view, max_item_bytes=opts.max_item_bytes)
     differences, stats = _compare_units(reader_a, reader_b, units, opts.workers)
     findings.extend(_value_findings(differences, a_tensors))
     findings.extend(_compare_byte_items(reader_a, reader_b, byte_sizes))
+    common_fields = 0
+    if detections is not None:
+        common_findings, common_fields = compare_common(
+            *detections, reader_a, reader_b, opts.ignores
+        )
+        findings.extend(common_findings)
     return VerifyReport(
         a=a.iter_dir,
         reference=str(b.iter_dir),
@@ -112,6 +125,7 @@ def compare_stores(a: Store, b: Store, opts: VerifyOptions) -> VerifyReport:
         values_compared=len(value_keys),
         byte_items_compared=len(byte_sizes),
         read_stats=stats,
+        common_fields_compared=common_fields,
     )
 
 
@@ -305,15 +319,21 @@ def _value_findings(
 
 
 def _plan_byte_items(
-    a: Store, b: Store, opts: VerifyOptions
+    a: Store, b: Store, opts: VerifyOptions, excluded: frozenset[str]
 ) -> tuple[list[Finding], dict[str, int]]:
     """Key-set findings of the byte items and the payload size of each shared one.
+
+    Byte items in ``excluded`` (common state compared semantically) are skipped.
 
     Raises:
         BudgetExceeded: A shared byte item is larger than ``opts.max_item_bytes``.
     """
-    a_items = {k: e for k, e in a.view.byte_items.items() if not opts.ignores(k)}
-    b_items = {k: e for k, e in b.view.byte_items.items() if not opts.ignores(k)}
+    a_items = {
+        k: e for k, e in a.view.byte_items.items() if k not in excluded and not opts.ignores(k)
+    }
+    b_items = {
+        k: e for k, e in b.view.byte_items.items() if k not in excluded and not opts.ignores(k)
+    }
     sizes = {
         k: max(a_items[k].length, b_items[k].length)
         for k in sorted(a_items.keys() & b_items.keys())

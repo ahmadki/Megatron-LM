@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -16,7 +17,11 @@ import pytest
 import torch
 
 from tools.checkpoint.format_converter import cli
-from tools.checkpoint.format_converter.api import convert_checkpoint, plan_conversion
+from tools.checkpoint.format_converter.api import (
+    convert_checkpoint,
+    plan_conversion,
+    verify_checkpoint,
+)
 from tools.checkpoint.format_converter.engine import memory
 from tools.checkpoint.format_converter.engine.metadata import MetadataView
 from tools.checkpoint.format_converter.engine.reader import ReadReq, SourceReader
@@ -24,7 +29,7 @@ from tools.checkpoint.format_converter.engine.regions import Region
 from tools.checkpoint.format_converter.engine.staging import PublishTarget
 from tools.checkpoint.format_converter.errors import InternalError
 from tools.checkpoint.format_converter.mcore_state.common_state import megatron_available
-from tools.checkpoint.format_converter.options import ConvertOptions, PlanOptions
+from tools.checkpoint.format_converter.options import ConvertOptions, PlanOptions, VerifyOptions
 
 from ._harness import REPO_ROOT, scrubbed_env
 from ._synthetic import (
@@ -199,6 +204,22 @@ def test_convert_keeps_weights_and_drops_training_state(tmp_path, capsys, legacy
     )
     ignore = [arg for pattern in IGNORED for arg in ("--ignore-key", pattern)]
     assert _run("verify", out, src / ITER, "--layout", "--common", "skip", *ignore) == 0
+    semantic = verify_checkpoint(
+        out,
+        src / ITER,
+        VerifyOptions(layout=True, common="semantic", ignore_keys=tuple(map(re.compile, IGNORED))),
+    )
+    assert {(f.key, f.detail) for f in semantic.findings} == {
+        ("args.no_save_optim", "A True vs B False"),
+        ("args.no_save_rng", "A True vs B False"),
+        ("opt_param_scheduler", "only in B"),
+        ("optimizer", "only in B"),
+        ("rerun_state_machine", "only in B"),
+    }
+    accepted = [*IGNORED, r"^args\.no_save_(optim|rng)$", "^(optimizer|opt_param_scheduler)$"]
+    accepted.append("^rerun_state_machine$")
+    ignore = [arg for pattern in accepted for arg in ("--ignore-key", pattern)]
+    assert _run("verify", out, src / ITER, "--layout", "--common", "semantic", *ignore) == 0
 
 
 def test_plan_reports_without_writing(tmp_path, capsys):

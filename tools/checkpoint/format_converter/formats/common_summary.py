@@ -25,7 +25,13 @@ from typing import Any
 from ..engine.metadata import Stub, decode_payload
 from ..engine.reader import SourceReader
 from .base import unwrap_common
-from .detect import FSDP_COMMON_ITEMS, FSDP_OPTIONAL_COMMON_ITEMS, TORCH_DIST, Detection
+from .detect import (
+    FSDP_COMMON_ITEMS,
+    FSDP_OPTIONAL_COMMON_ITEMS,
+    TORCH_DIST,
+    TORCH_DIST_COMMON_ITEM,
+    Detection,
+)
 from .torch_dist import TorchDistAdapter
 
 SUMMARY_ARGS = (
@@ -81,8 +87,23 @@ class CommonSummary:
         }
 
 
-def summarize_common_state(detection: Detection, reader: SourceReader) -> CommonSummary | None:
-    """Read and summarize the common state of the detected store, if it has one.
+@dataclass(frozen=True)
+class DisplayCommon:
+    """A common state decoded for display (unknown classes stubbed).
+
+    Attributes:
+        state: The common dict.
+        source: Where it was read from.
+        stubbed: Classes that were stubbed while decoding.
+    """
+
+    state: dict[str, Any]
+    source: str
+    stubbed: frozenset[str]
+
+
+def read_common_state(detection: Detection, reader: SourceReader) -> DisplayCommon | None:
+    """Read the common state of the detected store for display, if it has one.
 
     Raises:
         IntegrityError: The common state cannot be decoded or has the wrong shape.
@@ -91,15 +112,32 @@ def summarize_common_state(detection: Detection, reader: SourceReader) -> Common
         common, source, stubbed = _torch_dist_common(reader)
     else:
         common, source, stubbed = _fsdp_common(reader)
+    return None if common is None else DisplayCommon(common, source, stubbed)
+
+
+def common_state_keys(detection: Detection) -> frozenset[str]:
+    """The byte items that hold a store's common state in its format."""
+    if detection.fmt == TORCH_DIST:
+        return frozenset({TORCH_DIST_COMMON_ITEM})
+    return frozenset(FSDP_COMMON_ITEMS + FSDP_OPTIONAL_COMMON_ITEMS)
+
+
+def summarize_common_state(detection: Detection, reader: SourceReader) -> CommonSummary | None:
+    """Read and summarize the common state of the detected store, if it has one.
+
+    Raises:
+        IntegrityError: The common state cannot be decoded or has the wrong shape.
+    """
+    common = read_common_state(detection, reader)
     if common is None:
         return None
     return CommonSummary(
-        source=source,
-        keys=tuple(sorted(str(k) for k in common)),
-        iteration=to_plain(common.get("iteration")),
-        checkpoint_version=to_plain(common.get("checkpoint_version")),
-        args=_selected_args(common.get("args")),
-        stubbed=tuple(sorted(stubbed)),
+        source=common.source,
+        keys=tuple(sorted(str(k) for k in common.state)),
+        iteration=to_plain(common.state.get("iteration")),
+        checkpoint_version=to_plain(common.state.get("checkpoint_version")),
+        args=_selected_args(common.state.get("args")),
+        stubbed=tuple(sorted(common.stubbed)),
     )
 
 

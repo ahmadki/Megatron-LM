@@ -75,7 +75,7 @@ class InspectOptions:
         return self.keys is None or self.keys.search(key) is not None
 
 
-COMMON_MODES = ("skip", "bytes")
+COMMON_MODES = ("skip", "bytes", "semantic")
 _MODE_PATTERN = re.compile(r"^(?:(?P<kind>meta|full)|sample:(?P<size>[1-9]\d*))$")
 
 
@@ -126,7 +126,8 @@ class VerifyOptions:
         seed: Seed of the key sample for ``sample:N``.
         layout: Also require identical chunk grids.
         common: ``bytes`` compares byte items (common state) byte for byte;
-            ``skip`` ignores them.
+            ``semantic`` decodes both common states and compares them field by
+            field (other byte items byte for byte); ``skip`` ignores byte items.
         ignore_keys: Keys matching any of these (``re.search``) are ignored.
         oracle: Glob of digest files to verify against instead of a second store.
         oracle_key_map: Python file mapping oracle keys to store keys.
@@ -153,6 +154,10 @@ class VerifyOptions:
             raise UsageError("--oracle-key-map needs --oracle")
         if self.layout and self.oracle is not None:
             raise UsageError("--layout compares two stores; it cannot be used with --oracle")
+        if self.common == "semantic" and self.oracle is not None:
+            raise UsageError(
+                "--common semantic compares two stores; it cannot be used with --oracle"
+            )
 
     def ignores(self, key: str) -> bool:
         """Whether ``key`` is excluded by ``ignore_keys``."""

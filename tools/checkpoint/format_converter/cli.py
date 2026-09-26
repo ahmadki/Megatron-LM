@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 PROG = "python -m tools.checkpoint.format_converter"
 FORMAT_CHOICES = ("torch_dist", "fsdp_dtensor")
 TARGET_CHOICES = ("torch_dist",)
-COMMON_CHOICES = ("skip", "bytes")
+COMMON_CHOICES = ("skip", "bytes", "semantic")
 RESUME_CHOICES = ("auto", "never")
 MAX_PRINTED_FINDINGS = 20
 
@@ -208,7 +208,9 @@ def _add_verify(subparsers: Any) -> None:
         "--common",
         choices=COMMON_CHOICES,
         default="bytes",
-        help="bytes: byte items (common state) must be byte-identical (default); skip: ignore them",
+        help="bytes: byte items (common state) must be byte-identical (default); semantic: "
+        "decode both common states and compare their fields (args field by field); "
+        "skip: ignore byte items",
     )
     parser.add_argument(
         "--ignore-key",
@@ -477,7 +479,8 @@ def render_verify(report: VerifyReport) -> str:
         f"a:          {report.a}",
         f"reference:  {report.reference}",
         f"compared:   {report.keys_compared} tensors, values of {report.values_compared} "
-        f"(mode {report.mode}), {report.byte_items_compared} byte items",
+        f"(mode {report.mode}), {report.byte_items_compared} byte items, "
+        f"{report.common_fields_compared} common-state fields",
         f"read:       {format_bytes(stats.bytes_read)} in {stats.items_touched} stored items "
         f"(amplification {stats.amplification:.2f})",
         f"findings:   {len(report.findings)}",

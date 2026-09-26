@@ -74,6 +74,10 @@ JSON line per finding followed by a summary line.
 
 With `B`, the checks are: key sets (after `--ignore-key`), shape and dtype per
 key, optionally identical chunk grids (`--layout`), and values bit for bit.
+With `--common semantic`, common-state differences are reported per field as
+`args.<field>` or `<key>`; `--ignore-key` patterns apply to these names too, for
+example `--ignore-key '^args\.no_save_(optim|rng)$'` to accept the arguments a
+weights-only conversion sets.
 Values are compared through `uint8` views, so `-0.0` versus `0.0` and different
 NaN payloads count as differences. The two stores may use different chunk
 grids unless `--layout` is given.
@@ -83,7 +87,7 @@ grids unless `--layout` is given.
 | `--mode MODE` | `meta` (keys, shapes, dtypes), `full` (all values, default) or `sample:N` (values of `N` keys drawn with `--seed`) |
 | `--seed SEED` | seed of `sample:N` (default 0) |
 | `--layout` | also require identical chunk grids (not with `--oracle`) |
-| `--common {skip,bytes}` | `bytes` (default): byte items must be byte-identical; `skip`: ignore them |
+| `--common {skip,bytes,semantic}` | `bytes` (default): byte items must be byte-identical; `semantic`: decode both common states (stubbing unknown classes) and compare them, `args` field by field, wherever each side stores them (in-DCP item, `common.pt`, or `fsdp_dtensor` top-level items); other byte items byte for byte; `skip`: ignore byte items |
 | `--ignore-key RE` | ignore keys matching `RE`, repeatable |
 | `--oracle GLOB` | verify `A` against these digest files instead of `B` |
 | `--oracle-key-map PY` | Python file defining `to_store_key(oracle_key, file_index)` |
