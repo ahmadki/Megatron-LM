@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 PROG = "python -m tools.checkpoint.format_converter"
 FORMAT_CHOICES = ("torch_dist", "fsdp_dtensor")
-TARGET_CHOICES = ("torch_dist",)
+OPTIMIZER_CHOICES = ("drop", "convert")
 COMMON_CHOICES = ("skip", "bytes", "semantic")
 RESUME_CHOICES = ("auto", "never")
 MAX_PRINTED_FINDINGS = 20
@@ -266,9 +266,9 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--to",
         dest="to_format",
-        choices=TARGET_CHOICES,
+        choices=FORMAT_CHOICES,
         required=True,
-        help="target format (this version: torch_dist, a weights-only rewrite)",
+        help="target format: fsdp_dtensor (from torch_dist) or torch_dist (from either)",
     )
     parser.add_argument(
         "--from",
@@ -284,7 +284,42 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="KEY",
-        help="drop this unknown common-state key instead of refusing (repeatable)",
+        help="drop this common-state key: an unknown one instead of refusing, or a kept one "
+        "that is not required, such as content_metadata (repeatable)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        choices=OPTIMIZER_CHOICES,
+        default="drop",
+        help="drop: write model weights only (default); convert: convert optimizer state "
+        "(not supported yet, refused with FC-P11/FC-P12)",
+    )
+    parser.add_argument(
+        "--allow-root",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="convert model keys under this top-level prefix unchanged although no rule knows "
+        "them (repeatable; cross-format only)",
+    )
+    parser.add_argument(
+        "--max-output-chunk-bytes",
+        type=_size,
+        metavar="SIZE",
+        help="largest chunk of an fsdp_dtensor output tensor; larger tensors are split along "
+        "dimension 0 (default: 1GiB)",
+    )
+    parser.add_argument(
+        "--allow-missing-fp8-extra-state",
+        action="store_true",
+        help="write a torch_dist store for an FP8 delayed-scaling model without its scaling "
+        "state, which fsdp_dtensor stores do not hold (the scaling history restarts)",
+    )
+    parser.add_argument(
+        "--ignore-manifest",
+        action="store_true",
+        help="do not restore the arguments and content metadata the source's "
+        "conversion_manifest.json records",
     )
     parser.add_argument(
         "--workers",
@@ -327,6 +362,10 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "from_format": args.from_format,
         "iteration": args.iteration,
         "drop_common_keys": frozenset(args.drop_common_key),
+        "optimizer": args.optimizer,
+        "allow_roots": tuple(args.allow_root),
+        "allow_missing_fp8_extra_state": args.allow_missing_fp8_extra_state,
+        "ignore_manifest": args.ignore_manifest,
     }
     for name in (
         "workers",
@@ -334,6 +373,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "max_unit_bytes_hard",
         "writer_threads",
         "max_host_bytes",
+        "max_output_chunk_bytes",
     ):
         if getattr(args, name) is not None:
             options[name] = getattr(args, name)
@@ -345,7 +385,8 @@ def _add_plan(subparsers: Any) -> None:
         "plan",
         help="dry-run a conversion: what is kept or dropped, units, memory and disk",
         description="Plan a conversion from the source's metadata and common state: "
-        "refusals, sections kept and dropped, the common state, units, and the memory and "
+        "refusals, the derived architecture and the rules that convert it (cross-format), "
+        "sections kept, converted and dropped, the common state, units, and the memory and "
         "disk estimates. Exits 3 when convert would be refused and 8 when the conversion "
         "exceeds the memory budgets, without writing anything; the free disk space is "
         "checked by convert. On a host without Megatron, a common state that references "
@@ -373,11 +414,12 @@ def _run_plan(args: argparse.Namespace) -> int:
 def _add_convert(subparsers: Any) -> None:
     parser = subparsers.add_parser(
         "convert",
-        help="convert a store (this version: weights-only torch_dist rewrite)",
+        help="convert a store between torch_dist and fsdp_dtensor (model weights only)",
         description="Convert SRC into a new store under DST with bounded host memory and no "
-        "GPU. This version rewrites a torch_dist store as torch_dist with model weights only: "
-        "optimizer, RNG and rerun state are dropped, extra state and the chunk grid are kept, "
-        "and the common state is written into the store (a legacy common.pt is migrated). "
+        "GPU, keeping model weights only. torch_dist to fsdp_dtensor and back converts the "
+        "model tensors through the rules and writes a conversion manifest; torch_dist to "
+        "torch_dist rewrites the store with its chunk grid and extra state (a legacy "
+        "common.pt is migrated). Optimizer, RNG and rerun state are dropped. "
         "DST is a checkpoint root (it gets iter_NNNNNNN and the tracker, written last and "
         "only moved forward) or, if named iter_NNNNNNN or release, the iteration directory "
         "itself. An interrupted run resumes when rerun with the same arguments.",

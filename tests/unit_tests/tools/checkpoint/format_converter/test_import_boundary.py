@@ -24,7 +24,13 @@ import pytest
 import torch
 
 from ._harness import REPO_ROOT
-from ._synthetic import default_args, torch_save_bytes, write_torch_dist_store
+from ._synthetic import (
+    default_args,
+    hybrid_args,
+    hybrid_tensors,
+    torch_save_bytes,
+    write_torch_dist_store,
+)
 
 ENUMS = "megatron.core.transformer.enums"
 
@@ -218,6 +224,36 @@ def test_commands_run_without_megatron(tmp_path, scrubbed_env):
     assert "(plain codec)" in result.stdout
     assert f"published:  {dst}" in result.stdout
     assert digests.is_file()
+
+
+@pytest.mark.usefixtures("local_rank_zero")
+def test_cross_format_conversion_runs_without_megatron(tmp_path, scrubbed_env):
+    store = write_torch_dist_store(
+        tmp_path / "store",
+        hybrid_tensors(),
+        common={"args": hybrid_args(), "iteration": 7, "checkpoint_version": 3.0},
+    )
+    fsdp, back = tmp_path / "fsdp" / "iter_0000007", tmp_path / "back" / "iter_0000007"
+    result = _run(
+        f"""
+        from tools.checkpoint.format_converter import cli
+        codes = [
+            cli.main(["plan", {str(store)!r}, "--to", "fsdp_dtensor"]),
+            cli.main(["convert", {str(store)!r}, {str(fsdp)!r}, "--to", "fsdp_dtensor",
+                      "--workers", "0"]),
+            cli.main(["convert", {str(fsdp)!r}, {str(back)!r}, "--to", "torch_dist",
+                      "--workers", "0"]),
+            cli.main(["verify", {str(back)!r}, {str(store)!r}, "--layout", "--common",
+                      "semantic", "--ignore-key", "^args.no_save_(optim|rng)$"]),
+        ]
+        assert not [m for m in sys.modules if m.split(".")[0] in BLOCKED]
+        sys.exit(max(codes))
+        """,
+        scrubbed_env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "rules:      model tensors claimed: identity" in result.stdout
+    assert "verify:     OK" in result.stdout
 
 
 @pytest.mark.usefixtures("local_rank_zero")

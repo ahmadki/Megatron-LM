@@ -119,8 +119,17 @@ def render_plan(plan: Mapping[str, Any]) -> str:
         f"source:     {source['iter_dir']} ({source['format']}, {source['dialect']}), "
         f"iteration {source['iteration'] if source['iteration'] is not None else 'unknown'}",
         f"target:     {target['format']} ({target['dialect']}), model weights only",
-        f"sections:   {'section':<16} {'action':<8} {'keys':>8}  {'tensor bytes':>12}",
     ]
+    for index, derivation in enumerate(plan.get("derivations", ())):
+        label = "derived:" if index == 0 else ""
+        lines.append(
+            f"{label:<11} {derivation['field']} = {json.dumps(derivation['value'])} "
+            f"({derivation['evidence']})"
+        )
+    if "claims" in plan:
+        claims = ", ".join(f"{rule} {count}" for rule, count in plan["claims"].items())
+        lines.append(f"rules:      model tensors claimed: {claims or 'none'}")
+    lines.append(f"sections:   {'section':<16} {'action':<8} {'keys':>8}  {'tensor bytes':>12}")
     for section in plan["sections"]:
         size = format_bytes(section["tensor_bytes"]) if section["tensor_bytes"] else "-"
         lines.append(

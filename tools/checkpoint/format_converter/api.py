@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from collections.abc import Mapping
@@ -11,9 +13,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .core.manifest import MANIFEST_FILE
 from .engine.fs import write_atomic
 from .engine.hashing import TensorDigest, compute_digests
-from .engine.metadata import MetadataView
+from .engine.metadata import METADATA_FILE, MetadataView
 from .engine.reader import ReadStats, SourceReader
 from .engine.regions import Region
 from .engine.runner import RunOptions, run_program
@@ -23,9 +26,9 @@ from .formats.common_summary import CommonSummary, summarize_common_state
 from .formats.detect import Detection, detect_format, open_store, publish_target
 from .formats.sections import Census, Section, classify_key, take_census
 from .options import ConvertOptions, InspectOptions, PlanOptions, VerifyOptions
-from .planning import ConversionPlan, plan_weights_only
+from .planning import ConversionPlan, build_plan
 from .report import ConvertReport, peak_rss
-from .sidecars import copy_sidecars, write_integrity_manifest
+from .sidecars import INTEGRITY_MANIFEST, copy_sidecars, write_integrity_manifest
 from .verify.compare import compare_stores
 from .verify.oracle import verify_against_oracle
 from .verify.report import VerifyReport
@@ -215,10 +218,11 @@ def verify_checkpoint(a: Path, b: Path | None, opts: VerifyOptions) -> VerifyRep
 def plan_conversion(src: Path, opts: PlanOptions) -> ConversionPlan:
     """Dry-run a conversion of ``src`` from its metadata and common state (nothing is written).
 
-    Byte items are sized from the metadata rather than read. On a host
-    without Megatron, a common state that references Megatron classes is
-    decoded with stubs (codec ``stub``): the plan is complete, but ``convert``
-    needs the Megatron container. The plan cannot be executed.
+    Every refusal ``convert`` would raise is raised here. Byte items are sized
+    from the metadata rather than read. On a host without Megatron, a common
+    state that references Megatron classes is decoded with stubs (codec
+    ``stub``): the plan is complete, but ``convert`` needs the Megatron
+    container. The plan cannot be executed.
 
     Args:
         src: A store directory or a checkpoint root.
@@ -232,7 +236,7 @@ def plan_conversion(src: Path, opts: PlanOptions) -> ConversionPlan:
 
 
 def _plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan:
-    plan = plan_weights_only(Path(src), opts, dry_run=dry_run)
+    plan = build_plan(Path(src), opts, dry_run=dry_run)
     _LOGGER.info(
         "planned %d units, about %s of host memory",
         len(plan.units),
@@ -268,8 +272,13 @@ def convert_checkpoint(src: Path, dst: Path, opts: ConvertOptions) -> ConvertRep
             write_atomic(final_dir / name, payload)
         if opts.copy_sidecars:
             copy_sidecars(plan.sidecars, plan.store.iter_dir, final_dir)
+        if plan.manifest is not None:
+            digest = hashlib.sha256((final_dir / METADATA_FILE).read_bytes()).hexdigest()
+            record = plan.manifest.for_output(digest).to_json()
+            # Unsorted: the recorded content_metadata keeps the source's key order.
+            write_atomic(final_dir / MANIFEST_FILE, json.dumps(record, indent=2).encode())
         plan.adapter.validate_published(final_dir)
-        if plan.sidecars.regenerated:
+        if INTEGRITY_MANIFEST in plan.sidecars.regenerated:
             write_integrity_manifest(final_dir)  # last: it hashes every other file
 
     run = run_program(

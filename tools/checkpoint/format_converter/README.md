@@ -15,10 +15,12 @@ and Megatron-FSDP v1 `fsdp_dtensor` stores. It reads stores chunk by chunk
 with bounded host memory, never uses a GPU or a process group, and runs on a
 host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 
-This version inspects and verifies stores and rewrites `torch_dist` stores
-with model weights only. Conversion between the two formats lands in later
-changes (see [Roadmap](#roadmap)); this file is the living design document of
-the package.
+This version inspects and verifies stores, rewrites `torch_dist` stores with
+model weights only, and converts the model weights of per-layer hybrid models
+(attention `*` and MLP `-` layers) between `torch_dist` and `fsdp_dtensor` in
+both directions. Every other model family is refused, before anything is
+read, with a pending-family code until the change that supports it lands (see
+[Roadmap](#roadmap)). This file is the living design document of the package.
 
 ## Commands
 
@@ -28,7 +30,9 @@ Run from the repository root (or with it on `PYTHONPATH`):
 python -m tools.checkpoint.format_converter inspect SRC
 python -m tools.checkpoint.format_converter verify A B
 python -m tools.checkpoint.format_converter verify A --oracle 'digests_rank*.json' --oracle-key-map map.py
-python -m tools.checkpoint.format_converter plan SRC --to torch_dist
+python -m tools.checkpoint.format_converter plan SRC --to fsdp_dtensor
+python -m tools.checkpoint.format_converter convert SRC DST --to fsdp_dtensor
+python -m tools.checkpoint.format_converter convert FSDP_SRC DST --to torch_dist
 python -m tools.checkpoint.format_converter convert SRC DST --to torch_dist
 ```
 
@@ -133,7 +137,78 @@ missing from either side, shapes and dtypes (every mode), and SHA-256 values
 
 ### `plan` and `convert`
 
-`convert SRC DST --to torch_dist` rewrites a `torch_dist` store as a
+`convert` writes model weights only; optimizer, scheduler, RNG and rerun state
+are dropped and reported (converting optimizer state lands later:
+`--optimizer convert` is refused with `FC-P11`/`FC-P12`).
+
+#### Between `torch_dist` and `fsdp_dtensor`
+
+`convert SRC DST --to fsdp_dtensor` converts a `torch_dist` store into a
+Megatron-FSDP v1 store, and `convert SRC DST --to torch_dist` an
+`fsdp_dtensor` store into a `torch_dist` one. Before anything is read, the
+training arguments and the model keys (names and shapes) go through the
+refusal fence: a model part no rule is verified for is refused with an `FC-R`
+(never supported) or `FC-P` (pending family) code, and every refusal found is
+printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
+from attention (`*`) and MLP (`-`) layers with a single model root
+(`embedding`, `decoder`, `output_layer`); stage separators (`|`) in the
+pattern are fine, and a `torch_dist` source may have been saved with pipeline
+parallelism (its keys are global).
+
+* **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
+  `module.` level; the store's planner data records `('model', 'module.<name>')`);
+  `torch_dist` keys are the bare names. Layer indices are the same in both
+  formats for these models.
+* **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
+  Megatron's loaders cast on load, so bfloat16 weights load exactly into
+  Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
+  `fsdp_dtensor` store round to the parameters of a `torch_dist` job as the
+  training step would.
+* **Chunk grids.** `fsdp_dtensor` tensors are written as one chunk split along
+  dimension 0 into chunks of at most `--max-output-chunk-bytes` (1 GiB);
+  `torch_dist` tensors as one chunk (larger than half a unit: split along
+  dimension 0). Both loaders read any grid.
+* **Common state.** `fsdp_dtensor` stores get the byte items `args`,
+  `iteration`, `checkpoint_version` and `num_floating_point_operations_so_far`
+  (`content_metadata`, which they cannot hold, is recorded in the manifest; a
+  source without one of the first three, which the loader requires, is
+  refused with `FC-R13`);
+  `torch_dist` stores get `common_state/shard_0_1` and `metadata.json`.
+  `fsdp_dtensor` stores never get a `metadata.json` (Megatron would read them as
+  `torch_dist`). TE `_extra_state` is dropped (`fsdp_dtensor` does not store
+  it).
+* **Arguments.** `no_save_optim` and `no_save_rng` are set; `fsdp_dtensor`
+  stores get `ckpt_format='fsdp_dtensor'`, `use_megatron_fsdp=True`, one
+  pipeline stage (the pipeline and virtual-pipeline fields are reset and `|` is
+  removed from the hybrid pattern); `torch_dist` stores get
+  `ckpt_format='torch_dist'` and `use_megatron_fsdp=False`. Only existing
+  fields change; every change is reported.
+* **Conversion manifest.** The output gets `conversion_manifest.json`: the
+  source, the options, the derived architecture, the sanitized argument fields
+  with their original values, the source's `content_metadata` (in its key
+  order), the dropped sections, and the digest of the output's `.metadata`.
+  Converting an `fsdp_dtensor` store back to `torch_dist` restores the
+  original arguments and `content_metadata` from it (never clearing
+  `no_save_optim` or `no_save_rng`; `--drop-common-key content_metadata` leaves
+  that out), so a round trip gives the source back except for the dropped
+  state. A manifest whose digest does not match its store is refused
+  (`FC-A06`); `--ignore-manifest` converts without restoring. Tensors never
+  depend on the manifest.
+
+Resume from a converted store without its optimizer and RNG state, and with
+the default strict loads (never `--finetune`, `--dist-ckpt-strictness log_all`
+or `--no-strict-fsdp-dtensor-load` to validate a conversion):
+
+* `fsdp_dtensor`: `--use-megatron-fsdp --ckpt-format fsdp_dtensor --no-load-optim --no-load-rng`;
+* `torch_dist`: `--ckpt-format torch_dist --ckpt-drop-redundant-extra-state --no-load-optim --no-load-rng`
+  (the store has no TE `_extra_state`).
+
+`plan SRC --to FORMAT` prints the derived architecture (every field with its
+evidence) and the number of model tensors each rule claims.
+
+#### `torch_dist` to `torch_dist`
+
+`convert SRC DST --to torch_dist` on a `torch_dist` store rewrites it as a
 `torch_dist` store holding the model weights only:
 
 * model tensors and TE `_extra_state` (tensors and byte items) are copied
@@ -147,7 +222,8 @@ missing from either side, shapes and dtypes (every mode), and SHA-256 values
   loads it without looking for optimizer or RNG state), and is written as the
   in-DCP item `common_state/shard_0_1` (a legacy `common.pt` is migrated);
 * `run_config.yaml` and `tokenizer/` are copied, `train_dataloader_dprank*.pt`
-  is dropped, other files are listed but not copied;
+  and a `conversion_manifest.json` (which describes the source's files) are
+  dropped, other files are listed but not copied;
 * a Megatron integrity manifest (`integrity.json`, checked on load with
   `--verify-integrity`) is written anew over the converted store's files.
 
@@ -189,15 +265,20 @@ codec) and still reports everything.
 
 | Flag (`plan` and `convert`) | Meaning |
 |---|---|
-| `--to torch_dist` | target format (required) |
+| `--to {torch_dist,fsdp_dtensor}` | target format (required) |
 | `--from {torch_dist,fsdp_dtensor}` | format to assume when the store has no format markers |
 | `--iteration N` | iteration to open under a checkpoint root |
-| `--drop-common-key KEY` | drop this unknown common-state key instead of refusing (repeatable) |
+| `--drop-common-key KEY` | drop this common-state key: an unknown one instead of refusing, or a kept one that is not required, such as `content_metadata` (repeatable) |
 | `--workers N` | worker processes; `0` runs the units in the driver (default `min(4, cores/8)`) |
 | `--unit-bytes SIZE` | target peak memory of one unit (default `4GiB`) |
 | `--max-unit-bytes-hard SIZE` | largest memory one unit may need, else exit 8 (default 0.6 x `MemAvailable` / workers) |
 | `--writer-threads N` | data files written per unit (default 4) |
 | `--max-host-bytes SIZE` | host-memory budget of the whole conversion, else exit 8 (default 0.8 x `MemAvailable`) |
+| `--optimizer {drop,convert}` | `drop` optimizer state (default); `convert` is not supported yet (`FC-P11`, `FC-P12`) |
+| `--allow-root PREFIX` | convert model keys under this unknown top-level prefix unchanged (repeatable; cross-format) |
+| `--max-output-chunk-bytes SIZE` | largest chunk of an `fsdp_dtensor` output tensor (default `1GiB`) |
+| `--allow-missing-fp8-extra-state` | write a `torch_dist` store for an FP8 delayed-scaling model without its scaling state (`FC-R07` otherwise) |
+| `--ignore-manifest` | do not restore what the source's `conversion_manifest.json` records |
 | `--json` | print the report as JSON |
 
 | Flag (`convert` only) | Meaning |

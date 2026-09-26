@@ -36,6 +36,7 @@ from typing import Any, ClassVar
 import torch
 
 from .. import errors
+from ..core.keys import EXTRA_STATE
 from ..core.names import DIALECTS, TORCH_DIST
 from ..engine.metadata import MetadataView
 from ..engine.reader import SourceReader
@@ -63,11 +64,8 @@ REQUIRED_COMMON_KEYS = ("args", "iteration", "checkpoint_version")
 """Common-state keys that ``--drop-common-key`` may not drop (the loader reads them)."""
 
 KEPT_SECTIONS = frozenset({Section.MODEL, Section.EXTRA_STATE})
-DROPPED_SECTIONS = frozenset(
-    {Section.OPTIMIZER_STATE, Section.OPTIMIZER_OTHER, Section.RNG, Section.RERUN}
-)
+"""Sections a weights-only rewrite copies (the others but the common state are dropped)."""
 
-_EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
 _OPTIMIZER_STATE = re.compile(r"^(chained_\d+\.)?optimizer\.state\.")
 _OPTIMIZER = re.compile(r"^(chained_\d+\.)?optimizer\.")
 
@@ -78,7 +76,7 @@ def classify_key(key: str, *, is_bytes: bool) -> Section:
         return Section.RNG
     if key.startswith("rerun_state_machine_state"):
         return Section.RERUN
-    if _EXTRA_STATE.search(key):
+    if EXTRA_STATE.search(key):
         return Section.EXTRA_STATE
     if _OPTIMIZER_STATE.match(key):
         return Section.OPTIMIZER_STATE
@@ -198,7 +196,8 @@ def weights_only_common(
 
     Args:
         common: The decoded common dict.
-        drop_keys: Unknown keys to drop instead of refusing them.
+        drop_keys: Keys to drop: unknown ones instead of refusing them, and
+            kept ones (``content_metadata``, ...) that are not required.
 
     Raises:
         UsageError: ``drop_keys`` names a key the loader requires.
@@ -232,7 +231,11 @@ def weights_only_common(
             keys=tuple(unknown),
             hint="pass --drop-common-key KEY for each key that may be dropped",
         ).to_error()
-    kept = {key: value for key, value in common.items() if key in KEPT_COMMON_KEYS}
+    kept = {
+        key: value
+        for key, value in common.items()
+        if key in KEPT_COMMON_KEYS and key not in drop_keys
+    }
     return CommonRewrite(kept, tuple(sorted(set(common) - set(kept))))
 
 

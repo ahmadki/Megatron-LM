@@ -2,31 +2,52 @@
 
 """Planning a conversion from metadata and the common state: sections, units and budgets.
 
-This version plans the weights-only rewrite of a torch_dist store into
-torch_dist: model tensors and extra state are copied chunk for chunk (so the
-output has the source's chunk grid), optimizer, RNG and rerun state are
-dropped, and the common state is decoded, filtered, its args sanitized and
-re-encoded as the in-DCP ``common_state`` item (a legacy ``common.pt`` is
-migrated). Every refusal, and the host-memory preflight, happens here, before
-any tensor is read.
+Two kinds of conversion are planned here, both weights only:
 
-A dry run (``plan``) reads nothing but the metadata and the common state: byte
-items are sized from the metadata, and a common state that only Megatron's
-codec can decode (FC-E01 on a host without Megatron) is decoded with stubs, so
-the plan is still complete; ``convert`` needs the real codec.
+* **torch_dist to torch_dist** (a rewrite): model tensors and extra state are
+  copied chunk for chunk (so the output has the source's chunk grid),
+  optimizer, RNG and rerun state are dropped, and the common state is decoded,
+  filtered, its args sanitized and re-encoded as the in-DCP ``common_state``
+  item (a legacy ``common.pt`` is migrated).
+* **torch_dist to fsdp_dtensor and back** (cross-format): the refusal fence
+  (``core/refusals.py``) runs on the arguments and the model keys, the
+  architecture context is derived (``core/context.py``), the rules plan the
+  model section (``core/planner.py``), extra, optimizer, scheduler, RNG and
+  rerun state are dropped, and the common state is rewritten for the target
+  format with its args sanitized (and, converting back, what the source's
+  conversion manifest recorded restored). The plan carries the manifest the
+  converted store gets.
+
+Every refusal, and the host-memory preflight, happens here, before any tensor
+is read. A dry run (``plan``) reads nothing but the metadata and the common
+state: byte items are sized from the metadata, and a common state that only
+Megatron's codec can decode (FC-E01 on a host without Megatron) is decoded with
+stubs, so the plan is still complete; ``convert`` needs the real codec.
 """
 
 from __future__ import annotations
 
+import argparse
+import dataclasses
 import hashlib
 import json
-from dataclasses import dataclass
+import logging
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from . import rules  # pylint: disable=unused-import  # importing it registers the rules
 from . import __version__, errors
+from .core.args_view import ArgsView
+from .core.context import ArchContext, build_arch_context
+from .core.manifest import MANIFEST_FILE, Manifest
+from .core.names import FSDP_DTENSOR, TORCH_DIST
+from .core.planner import plan_model
+from .core.refusals import Facts, detect_refusals
+from .core.registry import REGISTRY
 from .engine.memory import (
     MemoryEstimate,
     check_host_memory,
@@ -39,24 +60,39 @@ from .engine.reader import SourceReader
 from .engine.runner import WriteProgram, choose_checked
 from .engine.scheduler import dispatch_order, pack_units
 from .engine.staging import PublishTarget
-from .errors import IntegrityError, RefusedError, UsageError
-from .formats.base import FormatAdapter, RawCommon, Section, payload_keys
-from .formats.detect import Detection, Iteration, Store, detect_format, open_store
-from .core.names import TORCH_DIST
+from .errors import IntegrityError, Refusal, RefusedError, UsageError, refusal_error
+from .formats.base import FormatAdapter, RawCommon, Section, model_tensors, payload_keys
+from .formats.detect import (
+    FSDP_COMMON_ITEMS,
+    Detection,
+    Iteration,
+    Store,
+    detect_format,
+    open_store,
+)
+from .formats.fsdp_mfsdp_v1 import COMMON_ITEMS as FSDP_COMMON_KEYS
+from .formats.fsdp_mfsdp_v1 import FsdpMfsdpV1Adapter
 from .formats.sections import take_census
 from .formats.torch_dist import (
-    DROPPED_SECTIONS,
     KEPT_SECTIONS,
     TorchDistAdapter,
     weights_only_common,
     weights_only_sections,
 )
-from .mcore_state.args_sanitize import sanitize_weights_only
-from .mcore_state.common_state import CodecMode, auto_mode, decode, encode
+from .mcore_state.args_sanitize import (
+    SanitizedArgs,
+    sanitize_for_fsdp_dtensor,
+    sanitize_for_torch_dist,
+    sanitize_weights_only,
+)
+from .mcore_state.common_state import CodecMode, DecodedCommon, auto_mode, decode, encode
 from .options import PlanOptions
 from .sidecars import SidecarPlan, plan_sidecars
 
-KEEP, DROP, REWRITE = "keep", "drop", "rewrite"
+KEEP, DROP, REWRITE, CONVERT = "keep", "drop", "rewrite", "convert"
+CONTENT_METADATA = "content_metadata"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +101,8 @@ class SectionAction:
 
     Attributes:
         section: The section.
-        action: ``keep`` (copied), ``drop`` or ``rewrite`` (decoded and re-encoded).
+        action: ``keep`` (copied as stored), ``convert`` (through the rules),
+            ``drop`` or ``rewrite`` (decoded and re-encoded).
         keys: Keys of the section in the source.
         tensor_bytes: Decoded size of its tensors.
     """
@@ -139,6 +176,10 @@ class ConversionPlan:
         units: The packed units.
         memory: The host-memory estimate (already checked against the budget).
         output_bytes: Estimated size of the output store.
+        context: The architecture context (cross-format conversions).
+        claims: Source model tensors claimed per rule (cross-format conversions).
+        manifest: The manifest the converted store gets (cross-format
+            conversions), without the output digest.
     """
 
     store: Store
@@ -152,6 +193,9 @@ class ConversionPlan:
     units: tuple[Unit, ...]
     memory: MemoryEstimate
     output_bytes: int
+    context: ArchContext | None = None
+    claims: dict[str, int] = field(default_factory=dict)
+    manifest: Manifest | None = None
 
     def fingerprint(self, target: PublishTarget) -> str:
         """Identity of this conversion into ``target`` (staging is resumed only on a match).
@@ -193,7 +237,7 @@ class ConversionPlan:
     def to_json(self) -> dict[str, Any]:
         """JSON-serializable summary (the ``plan`` report)."""
         pieces = sum(len(unit.pieces) for unit in self.units)
-        return {
+        summary = {
             "source": {
                 "iter_dir": str(self.detection.iter_dir),
                 "format": self.detection.fmt,
@@ -215,10 +259,14 @@ class ConversionPlan:
             "memory": {**self.memory.to_json(), "budget": self.options.max_host_bytes},
             "output_bytes": self.output_bytes,
         }
+        if self.context is not None:
+            summary["derivations"] = self.context.derivation_log()
+            summary["claims"] = dict(self.claims)
+        return summary
 
 
-def plan_weights_only(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan:
-    """Plan the weights-only torch_dist rewrite of ``src``.
+def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan:
+    """Plan the conversion of ``src`` into ``opts.to_format``.
 
     Args:
         src: A store directory or a checkpoint root.
@@ -229,34 +277,351 @@ def plan_weights_only(src: Path, opts: PlanOptions, *, dry_run: bool) -> Convers
             executed.
 
     Raises:
-        UsageError: The source is not a torch_dist store.
-        RefusedError: A refusal (FC-R13, FC-R14, FC-R17, FC-R18; FC-E01 unless
-            ``dry_run``).
+        UsageError: The conversion is not supported (fsdp_dtensor to
+            fsdp_dtensor, or ``--optimizer convert`` in a rewrite).
+        RefusedError: A refusal (FC-R, FC-P; FC-E01 unless ``dry_run``).
+        AmbiguousError: The source holds another store's manifest (FC-A06).
         IntegrityError: The store is unreadable or has no common state.
         BudgetExceeded: A unit or the whole conversion exceeds its memory budget.
     """
     store = open_store(src, iteration=opts.iteration)
     detection = detect_format(store, from_format=opts.from_format)
-    if detection.fmt != TORCH_DIST:
+    if detection.fmt == opts.to_format == TORCH_DIST:
+        if opts.optimizer != "drop":
+            raise UsageError(
+                "a torch_dist rewrite keeps model weights only", hint="drop --optimizer convert"
+            )
+        return _plan_rewrite(store, detection, opts, dry_run=dry_run)
+    if detection.fmt == opts.to_format:
         raise UsageError(
-            f"{store.iter_dir} is a {detection.fmt} store; this version converts torch_dist "
-            "stores to torch_dist only",
-            hint="conversion between torch_dist and fsdp_dtensor lands in a later version",
+            f"{store.iter_dir} is already a {detection.fmt} store; only torch_dist stores can "
+            "be rewritten in their own format",
+            hint="convert to torch_dist",
         )
+    return _plan_cross_format(store, detection, opts, dry_run=dry_run)
+
+
+def _plan_rewrite(
+    store: Store, detection: Detection, opts: PlanOptions, *, dry_run: bool
+) -> ConversionPlan:
+    """Plan the weights-only torch_dist rewrite of ``store`` (see the module docstring)."""
     adapter = TorchDistAdapter()
     view = store.view
     sections = weights_only_sections(view)
-    sidecars = plan_sidecars(view)
+    sidecars = plan_sidecars(view, writes_manifest=False)
     reader = SourceReader(view, max_item_bytes=opts.max_unit_bytes_hard)
-    common, common_pieces = _plan_common(adapter, reader, opts, dry_run=dry_run)
+    raw, decoded = _decode_common(adapter, reader, dry_run=dry_run)
+    rewrite = weights_only_common(decoded.state, drop_keys=opts.drop_common_keys)
+    common, sanitized = _sanitize(rewrite.kept, sanitize_weights_only)
+    common_plan, common_pieces = _encode_common(
+        common, raw, decoded, adapter, rewrite.dropped, sanitized
+    )
     extra_state = sorted(k for k in view.byte_items if sections[k] is Section.EXTRA_STATE)
     if dry_run:
         extra_pieces = [BytePiece.sized(key, view.byte_items[key].length) for key in extra_state]
     else:
         payloads = reader.read_bytes(extra_state)
         extra_pieces = [BytePiece(key, payloads[key]) for key in extra_state]
-    byte_pieces = (*common_pieces, *extra_pieces)
-    pieces = _kept_pieces(store, sections)
+    pieces = [
+        piece
+        for key in sorted(view.tensors)
+        if sections[key] in KEPT_SECTIONS
+        for piece in copy_pieces(view.tensors[key])
+    ]
+    actions = _section_actions(store, TORCH_DIST, KEPT_SECTIONS, frozenset())
+    return _finish(
+        store,
+        detection,
+        adapter,
+        opts,
+        pieces,
+        (*common_pieces, *extra_pieces),
+        common_plan,
+        sidecars,
+        actions,
+    )
+
+
+def _plan_cross_format(
+    store: Store, detection: Detection, opts: PlanOptions, *, dry_run: bool
+) -> ConversionPlan:
+    """Plan a weights-only conversion of ``store`` into the other format."""
+    source, target = _adapter(detection.fmt), _adapter(opts.to_format)
+    view = store.view
+    sections = source.sections(view)
+    reader = SourceReader(view, max_item_bytes=opts.max_unit_bytes_hard)
+    raw, decoded = _decode_common(source, reader, dry_run=dry_run)
+    if "args" not in decoded.state:
+        raise IntegrityError(f"the common state of {store.iter_dir} has no args")
+    args = ArgsView(decoded.state["args"])
+    model = model_tensors(view, sections, source)
+    refusals = detect_refusals(
+        Facts(
+            source=source.fmt,
+            target=target.fmt,
+            args=args,
+            model=model,
+            optimizer=opts.optimizer,
+            allowed_roots=opts.allow_roots,
+            allow_missing_fp8_extra_state=opts.allow_missing_fp8_extra_state,
+        )
+    )
+    if refusals:
+        raise refusal_error(refusals)
+    ctx = build_arch_context(
+        source=source.fmt,
+        target=target.fmt,
+        args=args,
+        model=model,
+        optimizer_keys=[k for k, s in sections.items() if s is Section.OPTIMIZER_STATE],
+        manifest=None if opts.ignore_manifest else _source_manifest(store, source.fmt),
+        metadata_sha256=view.metadata_sha256,
+        manifest_ignored=opts.ignore_manifest,
+    )
+    _warn_lost_fp8_state(ctx, sections)
+    model_plan = plan_model(
+        ctx,
+        model,
+        target,
+        rules=REGISTRY.rules_for(ctx),
+        max_chunk_bytes=opts.max_output_chunk_bytes,
+    )
+    common, dropped_common, content_metadata = _cross_format_common(decoded.state, ctx, opts)
+    common, sanitized = _sanitize(common, _cross_format_sanitizer(ctx))
+    common_plan, common_pieces = _encode_common(
+        common, raw, decoded, target, dropped_common, sanitized, consulted=args.consumed
+    )
+    plan = _finish(
+        store,
+        detection,
+        target,
+        opts,
+        list(model_plan.pieces),
+        common_pieces,
+        common_plan,
+        plan_sidecars(view, writes_manifest=True),
+        _section_actions(store, source.fmt, frozenset(), frozenset({Section.MODEL})),
+    )
+    manifest = _manifest(plan, ctx, content_metadata)
+    return dataclasses.replace(plan, context=ctx, claims=model_plan.claims, manifest=manifest)
+
+
+def _manifest(plan: ConversionPlan, ctx: ArchContext, content_metadata: dict[str, Any]) -> Manifest:
+    """The manifest the converted store of ``plan`` gets (without its output digest)."""
+    return Manifest(
+        tool_version=__version__,
+        torch_version=torch.__version__,
+        source={
+            "iter_dir": str(plan.store.iter_dir.absolute()),
+            "format": plan.detection.fmt,
+            "dialect": plan.detection.dialect,
+            "iteration": plan.iteration,
+            "fingerprint": plan.store.view.fingerprint(),
+        },
+        target={"format": plan.adapter.fmt, "dialect": plan.adapter.dialect},
+        options=plan.options.output_fields(),
+        derivations=tuple(ctx.derivation_log()),
+        args_sanitized=plan.common.args_changes,
+        content_metadata=content_metadata,
+        dropped=tuple(a.to_json() for a in plan.sections if a.action == DROP),
+    )
+
+
+def _adapter(fmt: str) -> FormatAdapter:
+    return TorchDistAdapter() if fmt == TORCH_DIST else FsdpMfsdpV1Adapter()
+
+
+def _source_manifest(store: Store, fmt: str) -> Manifest | None:
+    """The conversion manifest an fsdp_dtensor source holds, if any (torch_dist ones are unused).
+
+    Raises:
+        IntegrityError: The manifest is unreadable or malformed.
+    """
+    path = store.iter_dir / MANIFEST_FILE
+    if fmt != FSDP_DTENSOR or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as err:
+        raise IntegrityError(
+            f"cannot read {path}: {err}", hint="pass --ignore-manifest to convert without it"
+        ) from err
+    return Manifest.from_json(data, label=str(path))
+
+
+def _warn_lost_fp8_state(ctx: ArchContext, sections: Mapping[str, Section]) -> None:
+    """A torch_dist source's FP8 delayed-scaling history does not survive in fsdp_dtensor."""
+    if not any(section is Section.EXTRA_STATE for section in sections.values()):
+        return
+    fp8 = ctx.args.get("fp8", None)
+    if fp8 and ctx.args.get("fp8_recipe", "delayed") == "delayed":
+        _LOGGER.warning(
+            "args.fp8=%r uses delayed scaling: its amax history (_extra_state) is dropped and "
+            "restarts when training resumes",
+            fp8,
+        )
+
+
+def _cross_format_common(
+    common: Mapping[str, Any], ctx: ArchContext, opts: PlanOptions
+) -> tuple[dict[str, Any], tuple[str, ...], dict[str, Any]]:
+    """The target's common dict, the dropped keys and the ``content_metadata`` record.
+
+    torch_dist to fsdp_dtensor keeps what a weights-only rewrite keeps and fsdp
+    stores (``content_metadata`` goes to the manifest), and every item the
+    fsdp_dtensor loader requires must be there; fsdp_dtensor to torch_dist
+    keeps its items and restores ``content_metadata`` from the source's
+    manifest. ``--drop-common-key`` applies in both directions.
+
+    Raises:
+        UsageError: ``--drop-common-key`` names a key the loader requires.
+        RefusedError: The source's common state lacks an item the
+            fsdp_dtensor loader requires (FC-R13).
+    """
+    rewrite = weights_only_common(common, drop_keys=opts.drop_common_keys)
+    if ctx.target[0] == FSDP_DTENSOR:
+        kept = {key: value for key, value in rewrite.kept.items() if key in FSDP_COMMON_KEYS}
+        missing = tuple(key for key in FSDP_COMMON_ITEMS if key not in kept)
+        if missing:
+            raise Refusal(
+                errors.FC_R13,
+                f"the common state has no {', '.join(missing)}, which the fsdp_dtensor loader "
+                "requires",
+                keys=missing,
+                hint="convert a checkpoint whose common state holds "
+                + ", ".join(FSDP_COMMON_ITEMS),
+            ).to_error()
+        dropped = tuple(sorted(set(common) - set(kept)))
+        return kept, dropped, _content_metadata_record(rewrite.kept)
+    kept, dropped = dict(rewrite.kept), set(rewrite.dropped)
+    manifest = ctx.manifest
+    if manifest is not None and manifest.content_metadata["present"]:
+        if CONTENT_METADATA in opts.drop_common_keys:
+            dropped.add(CONTENT_METADATA)
+        else:
+            kept[CONTENT_METADATA] = manifest.source_content_metadata
+    return kept, tuple(sorted(dropped)), {"present": False}
+
+
+def _content_metadata_record(common: Mapping[str, Any]) -> dict[str, Any]:
+    """The manifest's record of the ``content_metadata`` a conversion keeps, if any.
+
+    Raises:
+        RefusedError: The manifest (JSON) cannot hold its value (FC-R13).
+    """
+    if CONTENT_METADATA not in common:
+        return {"present": False}
+    value = common[CONTENT_METADATA]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError) as err:
+        raise Refusal(
+            errors.FC_R13,
+            f"content_metadata holds values the conversion manifest cannot record ({err})",
+            keys=(CONTENT_METADATA,),
+            hint=f"pass --drop-common-key {CONTENT_METADATA} to convert without it",
+        ).to_error() from err
+    return {"present": True, "value": value}
+
+
+def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], SanitizedArgs]:
+    """The args sanitation of the target format (restoring the source manifest's originals)."""
+    if ctx.target[0] == FSDP_DTENSOR:
+        return sanitize_for_fsdp_dtensor
+    restore = {} if ctx.manifest is None else ctx.manifest.original_args()
+    return lambda args: sanitize_for_torch_dist(args, restore)
+
+
+def _sanitize(
+    common: Mapping[str, Any], sanitizer: Callable[[argparse.Namespace], SanitizedArgs]
+) -> tuple[dict[str, Any], SanitizedArgs | None]:
+    """``common`` with its args sanitized, and the sanitation (``None`` without args)."""
+    common = dict(common)
+    if "args" not in common:
+        return common, None
+    sanitized = sanitizer(common["args"])
+    common["args"] = sanitized.args
+    return common, sanitized
+
+
+def _decode_common(
+    adapter: FormatAdapter, reader: SourceReader, *, dry_run: bool
+) -> tuple[RawCommon, DecodedCommon]:
+    """Read and decode the source's common state (stub-decoded in a dry run without Megatron)."""
+    raw = adapter.read_common_raw(reader)
+    if raw is None:
+        raise IntegrityError(f"{reader.view.iter_dir} has no common state")
+    try:
+        return raw, decode(raw, auto_mode())
+    except RefusedError as err:
+        if not dry_run or err.refusal.code != errors.FC_E01:
+            raise
+        return raw, decode(raw, CodecMode.STUB)  # the plan reports everything; convert refuses
+
+
+def _encode_common(
+    common: Mapping[str, Any],
+    raw: RawCommon,
+    decoded: DecodedCommon,
+    target: FormatAdapter,
+    dropped: tuple[str, ...],
+    sanitized: SanitizedArgs | None,
+    *,
+    consulted: Mapping[str, Any] | None = None,
+) -> tuple[CommonPlan, tuple[BytePiece, ...]]:
+    """The target's common-state byte items (sized only when stub-decoded) and their plan.
+
+    ``consulted`` adds the argument fields other decisions read to the ones
+    the sanitation read.
+    """
+    items = {key: target.common_item(key) for key in payload_keys(common, target.common_layout)}
+    if decoded.mode is CodecMode.STUB:
+        pieces = tuple(
+            BytePiece.sized(item, _estimated_size(raw, key), path)
+            for key, (item, path) in items.items()
+        )
+    else:
+        payloads = encode(
+            common, target.common_layout, mode=decoded.mode, label="the output common state"
+        )
+        pieces = tuple(BytePiece(item, payloads[key], path) for key, (item, path) in items.items())
+    iteration = common.get("iteration")
+    if isinstance(iteration, bool) or not isinstance(iteration, int):
+        iteration = None
+    plan = CommonPlan(
+        raw.source,
+        decoded.mode.value,
+        tuple(common),
+        dropped,
+        {} if sanitized is None else sanitized.changes,
+        dict(
+            sorted(
+                {**(consulted or {}), **({} if sanitized is None else sanitized.consulted)}.items()
+            )
+        ),
+        iteration,
+    )
+    return plan, pieces
+
+
+def _estimated_size(raw: RawCommon, key: str) -> int:
+    """The size of an output payload that cannot be encoded here: its source payload's size."""
+    source = raw.payloads.get(key)
+    return raw.nbytes if source is None else len(source)
+
+
+def _finish(
+    store: Store,
+    detection: Detection,
+    adapter: FormatAdapter,
+    opts: PlanOptions,
+    pieces: list[Piece],
+    byte_pieces: tuple[BytePiece, ...],
+    common: CommonPlan,
+    sidecars: SidecarPlan,
+    actions: tuple[SectionAction, ...],
+) -> ConversionPlan:
+    """Pack the pieces into units, check the memory budget and assemble the plan."""
     units = pack_units(
         pieces, byte_pieces, unit_bytes=opts.unit_bytes, hard_cap=opts.max_unit_bytes_hard
     )
@@ -268,7 +633,7 @@ def plan_weights_only(src: Path, opts: PlanOptions, *, dry_run: bool) -> Convers
         adapter=adapter,
         options=opts,
         iteration=_iteration(detection, common),
-        sections=_section_actions(store),
+        sections=actions,
         common=common,
         sidecars=sidecars,
         units=units,
@@ -277,73 +642,21 @@ def plan_weights_only(src: Path, opts: PlanOptions, *, dry_run: bool) -> Convers
     )
 
 
-def _plan_common(
-    adapter: FormatAdapter, reader: SourceReader, opts: PlanOptions, *, dry_run: bool
-) -> tuple[CommonPlan, tuple[BytePiece, ...]]:
-    raw = adapter.read_common_raw(reader)
-    if raw is None:
-        raise IntegrityError(
-            f"{reader.view.iter_dir} has no common state (common_state/shard_0_1 or common.pt)"
-        )
-    mode = auto_mode()
-    try:
-        decoded = decode(raw, mode)
-    except RefusedError as err:
-        if not dry_run or err.refusal.code != errors.FC_E01:
-            raise
-        mode = CodecMode.STUB  # plan still reports everything; convert will refuse
-        decoded = decode(raw, mode)
-    rewrite = weights_only_common(decoded.state, drop_keys=opts.drop_common_keys)
-    common = dict(rewrite.kept)
-    changes: dict[str, tuple[Any, Any]] = {}
-    consulted: dict[str, Any] = {}
-    if "args" in common:
-        sanitized = sanitize_weights_only(common["args"])
-        common["args"], changes, consulted = sanitized.args, sanitized.changes, sanitized.consulted
-    items = {key: adapter.common_item(key) for key in payload_keys(common, adapter.common_layout)}
-    if mode is CodecMode.STUB:
-        pieces = tuple(
-            BytePiece.sized(item, _estimated_size(raw, key), path)
-            for key, (item, path) in items.items()
-        )
-    else:
-        payloads = encode(common, adapter.common_layout, mode=mode, label="the output common state")
-        pieces = tuple(BytePiece(item, payloads[key], path) for key, (item, path) in items.items())
-    iteration = common.get("iteration")
-    if isinstance(iteration, bool) or not isinstance(iteration, int):
-        iteration = None
-    plan = CommonPlan(
-        raw.source, mode.value, tuple(common), rewrite.dropped, changes, consulted, iteration
-    )
-    return plan, pieces
-
-
-def _estimated_size(raw: RawCommon, key: str) -> int:
-    """The size of an output payload that cannot be encoded here: its source payload's size."""
-    source = raw.payloads.get(key)
-    return raw.nbytes if source is None else len(source)
-
-
-def _kept_pieces(store: Store, sections: dict[str, Section]) -> list[Piece]:
-    tensors = store.view.tensors
-    return [
-        piece
-        for key in sorted(tensors)
-        if sections[key] in KEPT_SECTIONS
-        for piece in copy_pieces(tensors[key])
-    ]
-
-
-def _section_actions(store: Store) -> tuple[SectionAction, ...]:
-    census = take_census(store.view, TORCH_DIST)
+def _section_actions(
+    store: Store, fmt: str, kept: frozenset[Section], converted: frozenset[Section]
+) -> tuple[SectionAction, ...]:
+    """The action per source section: kept, converted, common rewritten, the rest dropped."""
+    census = take_census(store.view, fmt)
     actions = []
     for section, totals in census.sections.items():
-        if section in KEPT_SECTIONS:
+        if section in kept:
             action = KEEP
-        elif section in DROPPED_SECTIONS:
-            action = DROP
-        else:
+        elif section in converted:
+            action = CONVERT
+        elif section is Section.COMMON:
             action = REWRITE
+        else:
+            action = DROP
         actions.append(SectionAction(section, action, totals.keys, totals.tensor_bytes))
     return tuple(actions)
 

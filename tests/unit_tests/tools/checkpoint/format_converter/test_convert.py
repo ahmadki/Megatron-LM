@@ -289,7 +289,18 @@ def test_refusals_and_budgets_exit_with_their_codes(tmp_path, capsys):
         match="hard unit cap",
     )
     fsdp = write_fsdp_store(tmp_path / "fsdp", {"decoder.final_layernorm.weight": torch.ones(2)})
-    _expect(capsys, 2, "plan", fsdp, "--to", "torch_dist", match="this version converts torch_dist")
+    _expect(capsys, 2, "plan", fsdp, "--to", "fsdp_dtensor", match="already a fsdp_dtensor store")
+    _expect(
+        capsys,
+        2,
+        "plan",
+        good,
+        "--to",
+        "torch_dist",
+        "--optimizer",
+        "convert",
+        match="keeps model weights only",
+    )
     (tmp_path / "dst" / ITER).mkdir(parents=True)
     _expect(
         capsys, 6, "convert", good, tmp_path / "dst", "--to", "torch_dist", match="already exists"

@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .core.names import FORMATS, TORCH_DIST
 from .engine.memory import available_memory_bytes
 from .errors import UsageError
-from .core.names import FORMATS, TORCH_DIST
 
 DEFAULT_WORKERS = 4
 MAX_ITEM_FRACTION_OF_AVAILABLE = 0.25
@@ -180,9 +180,10 @@ HOST_BUDGET_FRACTION = 0.8
 HARD_CAP_FRACTION = 0.6
 """Default ``--max-unit-bytes-hard``: this fraction of ``MemAvailable``, split among the workers."""
 _FALLBACK_AVAILABLE_BYTES = 16 * 2**30
-CONVERT_FORMATS = (TORCH_DIST,)
-"""Target formats ``plan`` and ``convert`` support."""
+DEFAULT_MAX_OUTPUT_CHUNK_BYTES = 2**30
+"""Default ``--max-output-chunk-bytes``: fsdp_dtensor output chunks are split at 1 GiB."""
 RESUME_CHOICES = ("auto", "never")
+OPTIMIZER_CHOICES = ("drop", "convert")
 
 
 def default_convert_workers() -> int:
@@ -211,6 +212,14 @@ class PlanOptions:
         writer_threads: Writer threads (data files) per part store.
         max_host_bytes: Host-memory budget of the whole conversion
             (default: 0.8 x ``MemAvailable``).
+        optimizer: ``drop`` optimizer state (weights only) or ``convert`` it
+            (cross-format only; not supported yet).
+        allow_roots: Top-level model key prefixes (without the trailing dot)
+            to convert as identity although the rules do not know them.
+        max_output_chunk_bytes: Largest chunk of an fsdp_dtensor output tensor.
+        allow_missing_fp8_extra_state: Write a torch_dist store for an FP8
+            delayed-scaling model without its scaling state.
+        ignore_manifest: Do not restore what the source's conversion manifest records.
     """
 
     to_format: str = TORCH_DIST
@@ -222,13 +231,21 @@ class PlanOptions:
     max_unit_bytes_hard: int | None = None
     writer_threads: int = DEFAULT_WRITER_THREADS
     max_host_bytes: int | None = None
+    optimizer: str = "drop"
+    allow_roots: tuple[str, ...] = ()
+    max_output_chunk_bytes: int = DEFAULT_MAX_OUTPUT_CHUNK_BYTES
+    allow_missing_fp8_extra_state: bool = False
+    ignore_manifest: bool = False
 
     def __post_init__(self) -> None:
-        if self.to_format not in CONVERT_FORMATS:
-            raise UsageError(
-                f"--to {self.to_format} is not supported yet; this version writes "
-                f"{', '.join(CONVERT_FORMATS)} only"
-            )
+        if self.to_format not in FORMATS:
+            raise UsageError(f"--to must be one of {', '.join(FORMATS)}, got {self.to_format!r}")
+        if self.optimizer not in OPTIMIZER_CHOICES:
+            raise UsageError(f"--optimizer must be one of {', '.join(OPTIMIZER_CHOICES)}")
+        roots = tuple(sorted({root.rstrip(".") for root in self.allow_roots}))
+        if any(not root for root in roots):
+            raise UsageError("--allow-root needs a non-empty key prefix")
+        object.__setattr__(self, "allow_roots", roots)
         if self.from_format is not None and self.from_format not in FORMATS:
             raise UsageError(f"--from must be one of {', '.join(FORMATS)}")
         if self.iteration is not None and self.iteration < 0:
@@ -247,6 +264,7 @@ class PlanOptions:
             ("--unit-bytes", self.unit_bytes),
             ("--max-unit-bytes-hard", self.max_unit_bytes_hard),
             ("--max-host-bytes", self.max_host_bytes),
+            ("--max-output-chunk-bytes", self.max_output_chunk_bytes),
         ):
             if value <= 0:
                 raise UsageError(f"{flag} must be positive, got {value}")
@@ -258,6 +276,11 @@ class PlanOptions:
             "drop_common_keys": sorted(self.drop_common_keys),
             "unit_bytes": self.unit_bytes,
             "writer_threads": self.writer_threads,
+            "optimizer": self.optimizer,
+            "allow_roots": list(self.allow_roots),
+            "max_output_chunk_bytes": self.max_output_chunk_bytes,
+            "allow_missing_fp8_extra_state": self.allow_missing_fp8_extra_state,
+            "ignore_manifest": self.ignore_manifest,
         }
 
 

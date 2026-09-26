@@ -9,6 +9,9 @@ it references, ``metadata.json`` and a legacy ``common.pt``) and possibly:
 * ``integrity.json``: Megatron's integrity manifest (SHA-256 of every file,
   checked on load with ``--verify-integrity``); the data files change, so it is
   written anew for the converted store (:func:`write_integrity_manifest`);
+* ``conversion_manifest.json``: the record of the conversion that produced the
+  store; a cross-format conversion reads it and writes its own, a same-format
+  rewrite drops it (it describes the source store's files);
 * ``train_dataloader_dprank*.pt``: per-rank data-loader state, tied to the
   source job's data-parallel layout; dropped with a warning;
 * ``modelopt_state``: refused (FC-R18), a weights-only rewrite would lose it;
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from . import errors
+from .core.manifest import MANIFEST_FILE
 from .engine.fs import write_atomic
 from .engine.metadata import METADATA_FILE, MetadataView
 from .errors import Refusal
@@ -52,7 +56,7 @@ class SidecarPlan:
         dropped: Names dropped (with a warning).
         unknown: Names neither copied nor understood.
         regenerated: Names written anew for the converted store (the integrity
-            manifest).
+            manifest and the conversion manifest).
     """
 
     copy: tuple[str, ...]
@@ -70,8 +74,12 @@ class SidecarPlan:
         }
 
 
-def plan_sidecars(view: MetadataView) -> SidecarPlan:
+def plan_sidecars(view: MetadataView, *, writes_manifest: bool) -> SidecarPlan:
     """Classify every entry of the source iteration directory that is not part of the store.
+
+    Args:
+        view: The source store.
+        writes_manifest: Whether the conversion writes its own conversion manifest.
 
     Raises:
         RefusedError: The directory holds a ModelOpt state (FC-R18).
@@ -90,8 +98,10 @@ def plan_sidecars(view: MetadataView) -> SidecarPlan:
                 keys=(MODELOPT_STATE,),
                 hint="convert the checkpoint before applying ModelOpt",
             ).to_error()
-        if name == INTEGRITY_MANIFEST:
+        if name == INTEGRITY_MANIFEST or (name == MANIFEST_FILE and writes_manifest):
             regenerated.append(name)
+        elif name == MANIFEST_FILE:
+            dropped.append(name)
         elif name in COPIED_SIDECARS:
             copy.append(name)
         elif any(fnmatch.fnmatch(name, pattern) for pattern in DROPPED_SIDECARS):
@@ -99,7 +109,7 @@ def plan_sidecars(view: MetadataView) -> SidecarPlan:
         else:
             unknown.append(name)
     if dropped:
-        _LOGGER.warning("dropping data-loader state tied to the source job: %s", ", ".join(dropped))
+        _LOGGER.warning("dropping files tied to the source store: %s", ", ".join(dropped))
     if unknown:
         _LOGGER.warning("not copying unknown files: %s", ", ".join(unknown))
     return SidecarPlan(tuple(copy), tuple(dropped), tuple(unknown), tuple(regenerated))

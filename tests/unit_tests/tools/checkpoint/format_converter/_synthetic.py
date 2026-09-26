@@ -274,3 +274,57 @@ def write_tracker(root: Path, value: int | str) -> Path:
     tracker = root / "latest_checkpointed_iteration.txt"
     tracker.write_text(f"{value}\n")
     return tracker
+
+
+def hybrid_args(pattern: str = "*-|*-", **overrides: Any) -> argparse.Namespace:
+    """Training arguments of a per-layer hybrid model (``*`` attention and ``-`` MLP layers)."""
+    values = {
+        "hybrid_layer_pattern": pattern,
+        "num_layers": len(pattern.split("/")[0].replace("|", "")),
+        "hidden_size": 8,
+        "transformer_impl": "transformer_engine",
+        "spec": None,
+        "swiglu": False,
+        "num_experts": None,
+        "bf16": True,
+        "fp16": False,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 2,
+        "virtual_pipeline_model_parallel_size": None,
+        "ckpt_format": "torch_dist",
+        "use_megatron_fsdp": False,
+        "no_save_optim": False,
+        "no_save_rng": False,
+        "lr": 3e-4,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def hybrid_tensors(
+    pattern: str = "*-*-", hidden: int = 8, ffn: int = 16
+) -> dict[str, torch.Tensor]:
+    """Random model tensors of a per-layer hybrid model, by model-relative key.
+
+    Weights are bfloat16 drawn from a fixed seed; ``decoder.final_norm.weight``
+    is float32.
+    """
+    shapes = {"embedding.word_embeddings.weight": (32, hidden)}
+    for index, symbol in enumerate(pattern):
+        layer = f"decoder.layers.{index}."
+        if symbol == "*":
+            shapes[layer + "self_attention.linear_qkv.weight"] = (3 * hidden, hidden)
+            shapes[layer + "self_attention.linear_qkv.layer_norm_weight"] = (hidden,)
+            shapes[layer + "self_attention.linear_proj.weight"] = (hidden, hidden)
+        else:
+            shapes[layer + "mlp.linear_fc1.weight"] = (ffn, hidden)
+            shapes[layer + "mlp.linear_fc1.layer_norm_weight"] = (hidden,)
+            shapes[layer + "mlp.linear_fc2.weight"] = (hidden, ffn)
+    shapes["output_layer.weight"] = (32, hidden)
+    generator = torch.Generator().manual_seed(1234)
+    tensors = {
+        key: torch.randn(shape, generator=generator).to(torch.bfloat16)
+        for key, shape in shapes.items()
+    }
+    tensors["decoder.final_norm.weight"] = torch.randn(hidden, generator=generator)
+    return tensors

@@ -160,6 +160,8 @@ def test_weights_only_common_keeps_model_facts_and_drops_training_state():
     ]
     assert rewrite.kept["content_metadata"] is common["content_metadata"]
     assert rewrite.dropped == ("opt_param_scheduler", "optimizer", "rerun_state_machine")
+    without = weights_only_common(common, drop_keys=frozenset({"content_metadata"}))
+    assert "content_metadata" not in without.kept and "content_metadata" in without.dropped
 
 
 def _refusal(common, **kwargs):

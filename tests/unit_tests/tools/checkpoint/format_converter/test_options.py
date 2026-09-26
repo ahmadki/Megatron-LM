@@ -51,7 +51,7 @@ def test_key_selection():
 def test_cli_choices_match_the_options():
     assert cli.FORMAT_CHOICES == FORMATS
     assert cli.COMMON_CHOICES == options.COMMON_MODES
-    assert cli.TARGET_CHOICES == options.CONVERT_FORMATS
+    assert cli.OPTIMIZER_CHOICES == options.OPTIMIZER_CHOICES
     assert cli.RESUME_CHOICES == options.RESUME_CHOICES == RESUME_MODES
 
 
@@ -70,7 +70,10 @@ def test_conversion_budgets_default_to_fractions_of_available_memory(monkeypatch
 @pytest.mark.parametrize(
     "kwargs, message",
     [
-        ({"to_format": "fsdp_dtensor"}, "--to fsdp_dtensor is not supported yet"),
+        ({"to_format": "zarr"}, "--to must be one of"),
+        ({"optimizer": "keep"}, "--optimizer"),
+        ({"allow_roots": ("vision.", ".")}, "--allow-root"),
+        ({"max_output_chunk_bytes": 0}, "--max-output-chunk-bytes"),
         ({"from_format": "zarr"}, "--from"),
         ({"iteration": -1}, "--iteration"),
         ({"workers": -1}, "--workers"),
@@ -93,5 +96,15 @@ def test_output_fields_cover_what_shapes_the_output():
         "drop_common_keys": ["a", "b"],
         "unit_bytes": 4 * 2**30,
         "writer_threads": 4,
+        "optimizer": "drop",
+        "allow_roots": [],
+        "max_output_chunk_bytes": 2**30,
+        "allow_missing_fp8_extra_state": False,
+        "ignore_manifest": False,
         "copy_sidecars": True,
     }
+
+
+def test_allowed_roots_are_normalized():
+    opts = options.PlanOptions(allow_roots=("vision.", "audio", "vision"))
+    assert opts.allow_roots == ("audio", "vision")
