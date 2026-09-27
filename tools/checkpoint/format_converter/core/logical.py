@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..engine.regions import Region, find_tiling_defect
+from ..engine.regions import Region, corresponding, find_tiling_defect
 from ..errors import InternalError
 from .keys import join_leaf
 
@@ -76,24 +76,44 @@ class LogicalId:
 class LogicalSlice:
     """A region of one stored source tensor that holds one logical tensor.
 
-    The logical tensor has the region's shape.
+    The logical tensor has the region's shape without its first ``squeezed``
+    axes, which have size 1: one layer ``[l:l+1, ...]`` of a tensor stacked
+    over the layers of a block is a logical tensor of the layer's shape.
 
     Attributes:
         lid: The logical tensor.
         key: The stored source key (with the format envelope).
         region: The box of ``key`` that holds the logical tensor.
         dtype: Element type of the stored tensor.
+        squeezed: Leading size-1 axes of ``region`` the logical tensor does not have.
+
+    Raises:
+        InternalError: ``region`` does not have ``squeezed`` leading size-1 axes.
     """
 
     lid: LogicalId
     key: str
     region: Region
     dtype: torch.dtype
+    squeezed: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.squeezed <= self.region.ndim or any(
+            size != 1 for size in self.region.sizes[: self.squeezed]
+        ):
+            raise InternalError(
+                f"{self.lid} in {self.key}: {self.region} has no {self.squeezed} leading "
+                "size-1 axes to squeeze"
+            )
 
     @property
     def shape(self) -> tuple[int, ...]:
         """Shape of the logical tensor."""
-        return self.region.sizes
+        return self.region.sizes[self.squeezed :]
+
+    def stored_box(self, box: Region) -> Region:
+        """The box of ``key`` that holds ``box`` of the logical tensor."""
+        return corresponding(box, Region.full(self.shape), self.region)
 
 
 @dataclass(frozen=True, slots=True)

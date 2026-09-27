@@ -333,3 +333,102 @@ def hybrid_tensors(
     }
     tensors["decoder.final_norm.weight"] = torch.randn(hidden, generator=generator)
     return tensors
+
+
+def gpt_args(num_layers: int = 3, **overrides: Any) -> argparse.Namespace:
+    """Training arguments of a GPT model (Transformer Engine spec, no hybrid pattern)."""
+    values = {
+        "num_layers": num_layers,
+        "hidden_size": 8,
+        "hybrid_layer_pattern": None,
+        "transformer_impl": "transformer_engine",
+        "spec": None,
+        "swiglu": False,
+        "num_experts": None,
+        "moe_layer_freq": 1,
+        "bf16": True,
+        "fp16": False,
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+        "virtual_pipeline_model_parallel_size": None,
+        "ckpt_format": "torch_dist",
+        "use_megatron_fsdp": False,
+        "no_save_optim": False,
+        "no_save_rng": False,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def transformer_layers(
+    block: str, layers: int, hidden: int = 8, ffn: int = 16, seed: int = 99
+) -> dict[str, torch.Tensor]:
+    """Random tensors of a ``TransformerBlock`` (Transformer Engine layers with biases), one
+    key per layer as fsdp_dtensor stores them (``<block>.layers.<l>.<name>``), plus the block's
+    final layer norm.
+
+    Weights are bfloat16; the layer norms are float32, as frozen or fp32 tensors may be.
+    """
+    shapes = {
+        "self_attention.linear_qkv.layer_norm_weight": (hidden,),
+        "self_attention.linear_qkv.layer_norm_bias": (hidden,),
+        "self_attention.linear_qkv.weight": (3 * hidden, hidden),
+        "self_attention.linear_qkv.bias": (3 * hidden,),
+        "self_attention.linear_proj.weight": (hidden, hidden),
+        "self_attention.linear_proj.bias": (hidden,),
+        "mlp.linear_fc1.layer_norm_weight": (hidden,),
+        "mlp.linear_fc1.layer_norm_bias": (hidden,),
+        "mlp.linear_fc1.weight": (ffn, hidden),
+        "mlp.linear_fc1.bias": (ffn,),
+        "mlp.linear_fc2.weight": (hidden, ffn),
+        "mlp.linear_fc2.bias": (hidden,),
+    }
+    generator = torch.Generator().manual_seed(seed)
+    tensors = {}
+    for layer in range(layers):
+        for name, shape in shapes.items():
+            value = torch.randn(shape, generator=generator)
+            dtype = torch.float32 if "layer_norm" in name else torch.bfloat16
+            tensors[f"{block}.layers.{layer}.{name}"] = value.to(dtype)
+    tensors[f"{block}.final_layernorm.weight"] = torch.randn(hidden, generator=generator)
+    return tensors
+
+
+def gpt_tensors(layers: int = 3, hidden: int = 8, ffn: int = 16) -> dict[str, torch.Tensor]:
+    """Random model tensors of a GPT model, one key per layer (see :func:`transformer_layers`)."""
+    generator = torch.Generator().manual_seed(7)
+    return {
+        "embedding.word_embeddings.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+        **transformer_layers("decoder", layers, hidden, ffn),
+        "output_layer.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+    }
+
+
+def stack_layers(tensors: Mapping[str, torch.Tensor], block: str) -> dict[str, torch.Tensor]:
+    """The tensors with ``block``'s layers stacked as torch_dist stores a homogeneous block.
+
+    ``<block>.layers.<l>.<name>`` for ``l = 0..L-1`` become ``<block>.layers.<name>`` of shape
+    ``[L, ...]`` (``torch.stack`` in layer order); other keys are kept.
+    """
+    head = f"{block}.layers."
+    stacked: dict[str, list[torch.Tensor]] = {}
+    kept = {}
+    for key, tensor in tensors.items():
+        if key.startswith(head):
+            index, name = key[len(head) :].split(".", 1)
+            layers = stacked.setdefault(f"{head}{name}", [])
+            assert int(index) == len(layers), f"{key} is out of layer order"
+            layers.append(tensor)
+        else:
+            kept[key] = tensor
+    return {**kept, **{key: torch.stack(layers) for key, layers in stacked.items()}}
+
+
+def layer_grids(tensors: Mapping[str, torch.Tensor], block: str) -> dict[str, tuple[Region, ...]]:
+    """One chunk per layer for every tensor stacked over ``block``'s layers (as Megatron saves)."""
+    head = f"{block}.layers."
+    return {
+        key: dim0_grid(tuple(tensor.shape), 1)
+        for key, tensor in tensors.items()
+        if key.startswith(head) and not key[len(head)].isdigit()
+    }

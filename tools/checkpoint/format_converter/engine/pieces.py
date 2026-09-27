@@ -20,19 +20,24 @@ import torch
 
 from ..errors import InternalError
 from .metadata import StoredChunk, TensorEntry
-from .regions import Region, find_tiling_defect
+from .regions import Region, find_tiling_defect, same_up_to_leading_ones
 
 
 @dataclass(frozen=True, slots=True)
 class CopyOp:
     """Copy one box of a stored source chunk into a box of a piece buffer.
 
+    The two boxes hold the same elements in the same row-major order: their
+    sizes are equal up to leading size-1 axes, so a layer ``[l:l+1, ...]`` of
+    a tensor stacked over layers can be copied into a tensor of its own and
+    back (see :func:`~.regions.same_up_to_leading_ones`).
+
     Attributes:
         src: The stored source chunk read from.
         src_region: The box to copy, in the global coordinates of ``src.key``;
             it lies inside ``src``.
         dst_region: Where the box goes, in the local coordinates of the piece
-            buffer; same sizes as ``src_region``.
+            buffer; same sizes as ``src_region`` up to leading size-1 axes.
     """
 
     src: StoredChunk
@@ -47,10 +52,10 @@ class CopyOp:
                 f"copy from {self.src.key}: {self.src_region} is outside stored chunk "
                 f"{self.src.region}"
             )
-        if self.src_region.sizes != self.dst_region.sizes:
+        if not same_up_to_leading_ones(self.src_region.sizes, self.dst_region.sizes):
             raise InternalError(
                 f"copy from {self.src.key}: source box {self.src_region} and destination box "
-                f"{self.dst_region} differ in shape"
+                f"{self.dst_region} differ in shape beyond leading size-1 axes"
             )
 
 

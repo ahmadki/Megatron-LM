@@ -132,6 +132,44 @@ def dim0_only(chunks: Iterable[Region], shape: Sequence[int]) -> bool:
     return all(c.offsets[1:] == (0,) * len(rest) and c.sizes[1:] == rest for c in chunks)
 
 
+def same_up_to_leading_ones(a: Sequence[int], b: Sequence[int]) -> bool:
+    """Whether boxes of sizes ``a`` and ``b`` hold the same elements in the same row-major order.
+
+    That is the case when the sizes are equal once aligned on their last axes
+    and the extra leading axes of the longer one are all 1: a layer
+    ``[l:l+1, :, :]`` of a stacked tensor and a tensor of its own of the
+    layer's shape, e.g. ``(1, 4, 8)`` and ``(4, 8)``.
+    """
+    common = min(len(a), len(b))
+    longer = a if len(a) > len(b) else b
+    return tuple(a[len(a) - common :]) == tuple(b[len(b) - common :]) and all(
+        size == 1 for size in longer[: len(longer) - common]
+    )
+
+
+def corresponding(part: Region, of: Region, onto: Region) -> Region:
+    """The box of ``onto`` that holds the elements ``part`` holds in ``of``.
+
+    ``of`` and ``onto`` hold the same elements (their sizes are equal up to
+    leading unit axes, see :func:`same_up_to_leading_ones`) and may live in
+    tensors of different ranks; ``part`` lies inside ``of``.
+
+    Raises:
+        ValueError: ``of`` and ``onto`` differ in more than leading unit axes,
+            or ``part`` is not inside ``of``.
+    """
+    if not same_up_to_leading_ones(of.sizes, onto.sizes):
+        raise ValueError(f"{of} and {onto} do not hold the same elements")
+    if not of.contains(part):
+        raise ValueError(f"{part} is not inside {of}")
+    common = min(of.ndim, onto.ndim)
+    lead, skip = onto.ndim - common, of.ndim - common
+    offsets = onto.offsets[:lead] + tuple(
+        o + p - f for o, p, f in zip(onto.offsets[lead:], part.offsets[skip:], of.offsets[skip:])
+    )
+    return Region(offsets, onto.sizes[:lead] + part.sizes[skip:])
+
+
 def find_tiling_defect(regions: Sequence[Region], shape: Sequence[int]) -> str | None:
     """Check that ``regions`` tile a tensor of ``shape`` exactly.
 

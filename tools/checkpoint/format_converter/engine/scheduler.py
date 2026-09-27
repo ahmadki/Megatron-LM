@@ -29,7 +29,7 @@ from ..errors import BudgetExceeded, InternalError
 from .metadata import StoredChunk
 from .pieces import BytePiece, CopyOp, Piece, Unit
 from .reader_dcp import staging_bytes
-from .regions import Region
+from .regions import Region, corresponding
 from .sizes import format_bytes
 
 _Item = tuple[str, int]
@@ -155,8 +155,7 @@ def _slab(piece: Piece, local: Region) -> Piece:
         part = op.dst_region.intersect(local)
         if part is None:
             continue
-        delta = tuple(p - d for p, d in zip(part.offsets, op.dst_region.offsets))
-        source = Region(tuple(s + d for s, d in zip(op.src_region.offsets, delta)), part.sizes)
+        source = corresponding(part, op.dst_region, op.src_region)
         ops.append(CopyOp(op.src, source, part.relative_to(local)))
     chunk = Region(tuple(c + o for c, o in zip(piece.chunk.offsets, local.offsets)), local.sizes)
     return Piece(piece.key, piece.global_shape, piece.dtype, chunk, tuple(ops), piece.planner_path)

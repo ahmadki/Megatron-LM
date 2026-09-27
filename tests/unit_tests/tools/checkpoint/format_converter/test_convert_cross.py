@@ -316,11 +316,10 @@ def _expect(capsys, code, *argv, lines):
 
 
 def test_refusals_are_all_reported_before_anything_is_read(tmp_path, capsys):
-    gpt = write_torch_dist_source(
-        tmp_path / "gpt", common={**COMMON, "args": hybrid_args(hybrid_layer_pattern=None)}
-    )
+    args = hybrid_args(hybrid_layer_pattern=None, pipeline_model_parallel_size=1)
+    gpt = write_fsdp_store(tmp_path / "gpt" / ITER, MODEL, args=args)
     _expect(
-        capsys, 3, "plan", gpt, "--to", "fsdp_dtensor", lines=["error: FC-P01: not supported yet"]
+        capsys, 3, "plan", gpt, "--to", "torch_dist", lines=["error: FC-P01: not supported yet"]
     )
     moe = write_torch_dist_source(
         tmp_path / "moe",

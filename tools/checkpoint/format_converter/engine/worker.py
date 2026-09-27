@@ -104,9 +104,13 @@ def execute_unit(staging: Staging, plan: StagingPlan, uid: int, worker_id: int) 
 
 
 def read_requests(pieces: Sequence[Piece], buffers: Sequence[torch.Tensor]) -> list[ReadReq]:
-    """One read request per copy, targeting the copy's box of its piece buffer."""
+    """One read request per copy, targeting the copy's box of its piece buffer.
+
+    The box is viewed with the source box's shape (they differ at most in
+    leading size-1 axes, which a view adds or removes without copying).
+    """
     return [
-        ReadReq(op.src.key, op.src_region, buffer[op.dst_region.slices()])
+        ReadReq(op.src.key, op.src_region, buffer[op.dst_region.slices()].view(op.src_region.sizes))
         for piece, buffer in zip(pieces, buffers)
         for op in piece.ops
     ]

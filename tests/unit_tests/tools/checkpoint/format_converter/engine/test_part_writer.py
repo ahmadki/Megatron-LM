@@ -181,6 +181,17 @@ def test_pieces_are_validated():
         CopyOp(_chunk(), top, full)
 
 
+def test_copies_may_add_or_drop_leading_size_1_axes():
+    stacked = _chunk((0, 0, 0), (2, 8, 4))
+    layer = Region((1, 0, 0), (1, 8, 4))
+    CopyOp(stacked, layer, Region((0, 0), (8, 4)))
+    CopyOp(_chunk(), Region((0, 0), (8, 4)), Region((0, 0, 0), (1, 8, 4)))
+    with pytest.raises(InternalError, match="beyond leading size-1 axes"):
+        CopyOp(stacked, Region((0, 0, 0), (2, 8, 4)), Region((0, 0), (8, 4)))
+    with pytest.raises(InternalError, match="beyond leading size-1 axes"):
+        CopyOp(stacked, layer, Region((0, 0, 0), (8, 1, 4)))
+
+
 def test_copy_pieces_mirror_the_stored_grid(source):
     entry = source.tensors["w"]
     pieces = copy_pieces(entry)

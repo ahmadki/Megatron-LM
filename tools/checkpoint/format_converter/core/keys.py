@@ -172,9 +172,6 @@ def root_of(key: str) -> str:
     return key.partition(".")[0]
 
 
-STACKED_LAYERS = re.compile(r"(?:^|\.)layers\.(?![0-9]+\.)")
-"""A ``layers.`` segment not followed by a layer index: a tensor stacked over layers."""
-
 FACTORY_PART = re.compile(r"\.(?:weight|bias)\.[A-Za-z_][A-Za-z0-9_]*$")
 """A torch_dist factory sub-key: one part of a parameter stored as parts (``in_proj.weight.z``)."""
 

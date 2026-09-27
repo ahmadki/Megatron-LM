@@ -6,8 +6,9 @@ Rule modules register their :class:`~.rule.LeafRule` subclasses with the
 ``@REGISTRY.rule`` decorator when they are imported; planning asks the
 registry for the enabled rules in stage order. Refusal detectors (functions of
 the conversion's facts that yield refusals, see ``core/refusals.py``) register
-with ``@REGISTRY.detector``, block classifiers (functions of the arguments that
-yield block layouts, see ``core/blocks.py``) with ``@REGISTRY.classifier``, and
+with ``@REGISTRY.detector``, block classifiers (functions of the arguments and
+the stored keys that yield block layouts, see ``core/blocks.py``) with
+``@REGISTRY.classifier``, and
 :class:`Allowlist` entries name the layer symbols, specs and attention variants
 that rules have been verified for.
 
@@ -32,8 +33,7 @@ from ..errors import InternalError, Refusal
 from .rule import LeafRule
 
 if TYPE_CHECKING:
-    from .args_view import ArgsView
-    from .blocks import BlockLayout
+    from .blocks import BlockFacts, BlockLayout
     from .context import ArchContext
     from .refusals import Facts
 
@@ -41,8 +41,8 @@ RuleT = TypeVar("RuleT", bound=type[LeafRule])
 Detector = Callable[["Facts"], Iterable[Refusal]]
 """A refusal detector: yields the refusals the conversion's facts call for."""
 
-Classifier = Callable[["ArgsView"], Iterable["BlockLayout"]]
-"""A block classifier: yields the layouts of the blocks of its kind the arguments describe."""
+Classifier = Callable[["BlockFacts"], Iterable["BlockLayout"]]
+"""A block classifier: yields the layouts of the blocks of its kind the model has."""
 
 
 class Allowlist(enum.Enum):

@@ -5,8 +5,9 @@
 :func:`plan_model` runs the rule pipeline and compiles its result into
 engine pieces:
 
-1. **Decompose** every source model tensor into a logical slice (the key
-   grammar and the blocks' layer numbering, ``core/structure.py``).
+1. **Decompose** every source model tensor into logical slices (the key
+   grammar and the blocks' layer numbering, ``core/structure.py``): one per
+   tensor, or one per layer of a tensor stacked over a block's layers.
 2. **Claim**: the rules run in stage order over one :class:`~.rule.LogicalPool`;
    every slice is claimed and consumed exactly once. Slices left over
    (including those a sentinel reserves) are refused with FC-R13 and the
@@ -31,7 +32,7 @@ import torch
 from .. import errors
 from ..engine.metadata import TensorEntry
 from ..engine.pieces import CopyOp, Piece, expected_tensors
-from ..engine.regions import Region, find_tiling_defect
+from ..engine.regions import Region, corresponding, find_tiling_defect
 from ..errors import InternalError, Refusal
 from .context import ArchContext
 from .keys import KeyGrammarError
@@ -121,11 +122,9 @@ def _decompose_all(ctx: ArchContext, source: Mapping[str, TensorEntry]) -> list[
     slices, malformed = [], []
     for relative, entry in source.items():
         try:
-            lid = decompose(relative, ctx.blocks, ctx.source[0])
+            slices.extend(decompose(relative, entry, ctx.blocks, ctx.source[0]))
         except KeyGrammarError as err:
             malformed.append((entry.key, str(err)))
-            continue
-        slices.append(LogicalSlice(lid, entry.key, Region.full(entry.shape), entry.dtype))
     if malformed:
         raise Refusal(
             errors.FC_R13,
@@ -183,29 +182,25 @@ def _chunk_ops(
     slices: Mapping[LogicalId, LogicalSlice],
     entries: Mapping[str, TensorEntry],
 ) -> list[CopyOp]:
-    """The copies of stored source boxes that fill output chunk ``chunk``."""
+    """The copies of stored source boxes that fill output chunk ``chunk``.
+
+    Each copy's destination box is cut to the chunk, mapped to the box of the
+    stored source tensor that holds it (through the source slice, which may
+    be one layer of a stacked tensor) and split along the source's stored
+    chunks; every piece of it becomes a copy into the chunk's buffer.
+    """
     ops = []
     for copy in output.copies:
         part = copy.dst_region.intersect(chunk)
         if part is None:
             continue
         source = slices[copy.src]
-        offset = tuple(p - d for p, d in zip(part.offsets, copy.dst_region.offsets))
-        box = Region(
-            tuple(
-                s + o + r for s, o, r in zip(copy.src_region.offsets, offset, source.region.offsets)
-            ),
-            part.sizes,
-        )
+        src_box = source.stored_box(corresponding(part, copy.dst_region, copy.src_region))
+        dst_box = part.relative_to(chunk)
         for stored in entries[source.key].chunks:
-            read = box.intersect(stored.region)
-            if read is None:
-                continue
-            into = tuple(
-                r - b + p - c
-                for r, b, p, c in zip(read.offsets, box.offsets, part.offsets, chunk.offsets)
-            )
-            ops.append(CopyOp(stored, read, Region(into, read.sizes)))
+            read = src_box.intersect(stored.region)
+            if read is not None:
+                ops.append(CopyOp(stored, read, corresponding(read, src_box, dst_box)))
     return ops
 
 

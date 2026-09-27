@@ -50,17 +50,30 @@ def test_unreserved_slices_are_copied_whole_with_their_dtype():
     assert pool.remaining() == [] and pool.unconsumed_claims() == []
 
 
+def test_a_layer_of_a_stacked_tensor_is_copied_with_the_layer_shape():
+    lid = LogicalId("decoder", 1, "mlp.linear_fc1", "weight")
+    layer = LogicalSlice(
+        lid,
+        "decoder.layers.mlp.linear_fc1.weight",
+        Region((1, 0, 0), (1, 16, 8)),
+        torch.bfloat16,
+        1,
+    )
+    (instance,) = IdentityRule().claim(LogicalPool([layer]), _context(TORCH_DIST, FSDP_DTENSOR))
+    (output,) = instance.outputs
+    assert (output.lid, output.shape) == (lid, (16, 8))
+    assert output.copies == (LogicalCopy(lid, Region.full((16, 8)), Region.full((16, 8))),)
+
+
 def test_sentinel_keys_are_declined_with_their_reason():
-    stacked = _slice("decoder.layers.mlp.linear_fc1.weight", (2, 8, 8))
     part = _slice("decoder.layers.0.mixer.in_proj.weight.z", (8, 8))
     plain = _slice("output_layer.weight", (16, 8))
-    pool = LogicalPool([stacked, part, plain])
+    pool = LogicalPool([part, plain])
     taken = list(IdentityRule().claim(pool, _context(TORCH_DIST, FSDP_DTENSOR)))
     assert [instance.inputs for instance in taken] == [(plain,)]
-    assert pool.remaining() == [stacked, part]
-    (reason,) = pool.declined(stacked.lid)
-    assert reason.startswith("a tensor stacked over the layers") and "FC-P01" in reason
-    assert "FC-P05, FC-P08, FC-P09" in pool.declined(part.lid)[0]
+    assert pool.remaining() == [part]
+    (reason,) = pool.declined(part.lid)
+    assert reason.startswith("a parameter stored as parts") and "FC-P05, FC-P08, FC-P09" in reason
 
 
 def test_sentinels_apply_to_their_source_format_only():

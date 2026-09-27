@@ -16,11 +16,13 @@ with bounded host memory, never uses a GPU or a process group, and runs on a
 host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 
 This version inspects and verifies stores, rewrites `torch_dist` stores with
-model weights only, and converts the model weights of per-layer hybrid models
+model weights only, converts the model weights of per-layer hybrid models
 (attention `*` and MLP `-` layers) between `torch_dist` and `fsdp_dtensor` in
-both directions. Every other model family is refused, before anything is
-read, with a pending-family code until the change that supports it lands (see
-[Roadmap](#roadmap)). This file is the living design document of the package.
+both directions, and converts GPT models (`TransformerBlock` decoders, stacked
+or per layer) from `torch_dist` to `fsdp_dtensor`. Every other model family is
+refused, before anything is read, with a pending-family code until the change
+that supports it lands (see [Roadmap](#roadmap)). This file is the living
+design document of the package.
 
 ## Commands
 
@@ -195,14 +197,26 @@ refusal fence: a model part no rule is verified for is refused with an `FC-R`
 (never supported) or `FC-P` (pending family) code, and every refusal found is
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
 from attention (`*`) and MLP (`-`) layers with a single model root
-(`embedding`, `decoder`, `output_layer`); stage separators (`|`) in the
-pattern are fine, and a `torch_dist` source may have been saved with pipeline
-parallelism (its keys are global).
+(`embedding`, `decoder`, `output_layer`) in both directions, and GPT models
+(no hybrid pattern; attention and MLP `TransformerBlock` layers) from
+`torch_dist` to `fsdp_dtensor`; stage separators (`|`) in the pattern are
+fine, and a `torch_dist` source may have been saved with pipeline parallelism
+(its keys are global).
 
 * **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
   `module.` level; the store's planner data records `('model', 'module.<name>')`);
   `torch_dist` keys are the bare names. Layer indices are the same in both
   formats for these models.
+* **Stacked layers.** `torch_dist` stores a `TransformerBlock` (a GPT decoder)
+  either stacked, one key per tensor with the layers along a new first axis
+  (`decoder.layers.<name>`, shape `[L, ...]`, one chunk per layer), or per
+  layer (`decoder.layers.<l>.<name>`, `l` the global layer index);
+  `fsdp_dtensor` always stores one key per layer. Converting from `torch_dist`,
+  the layout is observed from the keys: layer `l` of a stacked tensor
+  (`[l:l+1, ...]`) is written as its own tensor, read straight from its
+  stored chunk. Stacked tensors must agree on the number of layers, a
+  per-layer block must hold layers `0..L-1`, a block holds one form only, and
+  the decoder must have `args.num_layers` layers (`FC-R12` otherwise).
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
@@ -373,13 +387,14 @@ arguments and the model keys before any tensor is read.
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`), model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, a tensor stacked over layers, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
+| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers` for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, or a hybrid decoder holds stacked tensors |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`), model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones |
-| `FC-P01` | pending: non-hybrid `TransformerBlock` layers (GPT or vision decoders, stacked keys) |
+| `FC-P01` | pending: `TransformerBlock` layers (GPT decoders, stacked keys, other layer lists) of an `fsdp_dtensor` source, whose `torch_dist` stacking must be decided |
 | `FC-P02` | pending: models with several roots (`language_model.`, `vision_model.`, `vision_projection.`) |
 | `FC-P03` | pending: mixture-of-experts layers (`num_experts`, symbol `E`, expert or router keys) |
 | `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
@@ -586,10 +601,11 @@ only (`core/`, `rules/`):
 * **Sentinels** (`Sentinel` in `core/registry.py`, registered in
   `core/refusals.py`, which the identity rule imports so that it never runs
   without them) name source keys the generic identity rule must never convert
-  (a parameter stored as parts, a tensor stacked over layers, SwiGLU halves,
-  fused mixer projections). Each is owned by the rule, or while it is pending
-  the `FC-P` code, that handles such keys; a reserved slice nobody claims is
-  refused (`FC-R13`) with the sentinel's reason.
+  (a parameter stored as parts, SwiGLU halves, fused mixer projections). Each
+  is owned by the rule, or while it is pending the `FC-P` code, that handles
+  such keys; a reserved slice nobody claims is refused (`FC-R13`) with the
+  sentinel's reason. (A tensor stacked over layers needs no sentinel: every
+  stacked key belongs to a block of the census, whose layout is checked.)
 * **Compile** (`core/planner.py`). `core/structure.py` composes every
   output's model-relative key, and the target adapter adds its envelope,
   planner path and chunk grid; each output chunk becomes an engine piece whose
@@ -598,10 +614,18 @@ only (`core/`, `rules/`):
   output tensor, and write each key once.
 
 This version has one rule, `identity` (tensors stored the same way in both
-formats), and one block classifier, the `HybridStack` decoder of a hybrid
-model (stored per layer, numbered by pattern position in `torch_dist`, which
-equals the dense index without shortcut-MoE grouping). The verified hybrid
-symbols are `*` and `-`.
+formats), and two kinds of blocks. The blocks a store holds are found from its
+keys (each key's innermost layer list); the registered block classifier
+recognizes the `HybridStack` decoder of a hybrid model (stored per layer,
+numbered by pattern position in `torch_dist`, which equals the dense index
+without shortcut-MoE grouping), and every other block is a `TransformerBlock`
+(`core/stacking.py`), numbered identically in both formats and stored stacked
+or per layer in `torch_dist`. A stacked `torch_dist` tensor decomposes into
+one logical slice per layer: the box `[l:l+1, ...]` holding a logical tensor
+of the layer's shape (the slice records the squeezed leading axis), so rules
+never see the stacking; engine copies may add or drop leading size-1 axes
+(`CopyOp` boxes are equal up to them). The verified hybrid symbols are `*` and
+`-`.
 
 ### Extension contract
 

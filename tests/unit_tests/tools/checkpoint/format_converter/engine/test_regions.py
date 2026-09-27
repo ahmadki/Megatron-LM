@@ -13,8 +13,10 @@ import torch
 from tools.checkpoint.format_converter.engine.regions import (
     Region,
     bounding_box,
+    corresponding,
     dim0_only,
     find_tiling_defect,
+    same_up_to_leading_ones,
 )
 
 SHAPE = (4, 3)
@@ -176,3 +178,43 @@ def test_find_tiling_defect_messages():
     assert find_tiling_defect([Region((), ())], ()) is None
     assert "overlap" in find_tiling_defect([Region((), ()), Region((), ())], ())
     assert find_tiling_defect([Region((0, 0), (0, 3))], (0, 3)) is None
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        ((1, 4, 3), (4, 3), True),
+        ((4, 3), (1, 1, 4, 3), True),
+        ((1,), (), True),
+        ((), (), True),
+        ((1, 1, 3), (1, 3), True),
+        ((2, 4, 3), (4, 3), False),
+        ((4, 1, 3), (4, 3), False),
+        ((4, 3), (3, 4), False),
+        ((1, 4, 3), (4, 1, 3), False),
+    ],
+)
+def test_same_up_to_leading_ones(a, b, same):
+    assert same_up_to_leading_ones(a, b) is same
+    assert same_up_to_leading_ones(b, a) is same
+
+
+def test_corresponding_maps_cells_between_ranks_exhaustively():
+    """Every sub-box of a (4, 3) box maps to the same cells of layer 2 of a (5, 4, 3) tensor."""
+    of = Region.full(SHAPE)
+    onto = Region((2, 0, 0), (1, *SHAPE))
+    for part in NONEMPTY:
+        mapped = corresponding(part, of, onto)
+        assert _cells(mapped) == {(2, *cell) for cell in _cells(part)}
+        assert corresponding(mapped, onto, of) == part
+
+
+def test_corresponding_follows_the_offsets_of_both_boxes():
+    of = Region((1, 3), (2, 2))
+    onto = Region((7, 0, 5), (1, 2, 2))
+    assert corresponding(Region((2, 4), (1, 1)), of, onto) == Region((7, 1, 6), (1, 1, 1))
+    assert corresponding(Region((), ()), Region((), ()), Region((4,), (1,))) == Region((4,), (1,))
+    with pytest.raises(ValueError, match="do not hold the same elements"):
+        corresponding(of, of, Region((0, 0), (2, 3)))
+    with pytest.raises(ValueError, match="is not inside"):
+        corresponding(Region((0, 0), (1, 1)), of, onto)

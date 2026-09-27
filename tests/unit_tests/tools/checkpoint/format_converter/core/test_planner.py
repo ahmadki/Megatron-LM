@@ -100,16 +100,59 @@ def test_fsdp_to_torch_dist_merges_chunks_into_one():
     assert sorted(p.key for p in plan.pieces) == sorted([QKV, FC1, NORM])
 
 
+def test_a_stacked_decoder_is_written_one_layer_per_key():
+    """A GPT decoder stored stacked, each layer split in two column chunks (tensor parallel)."""
+    fc1, norm = (
+        "decoder.layers.mlp.linear_fc1.weight",
+        "decoder.layers.mlp.linear_fc1.layer_norm_weight",
+    )
+    grid = [Region((layer, 0, col), (1, 4, 2)) for layer in (0, 1) for col in (0, 2)]
+    model = {fc1: entry(fc1, (2, 4, 4), grid), norm: entry(norm, (2, 4))}
+    args = ArgsView(argparse.Namespace(num_layers=2))
+    ctx = build_arch_context(source=TORCH_DIST, target=FSDP_DTENSOR, args=args, model=model)
+    (block,) = ctx.blocks
+    assert (block.prefix, block.td_layout, block.num_modules) == ("decoder", "stacked", 2)
+    plan = plan_model(ctx, model, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=32)
+    assert plan.claims == {"identity": 4} and plan.outputs == 4
+    chunks = model[fc1].chunks
+    expected = []
+    for layer in (0, 1):
+        for rows in (0, 2):  # 16-byte rows, 2 per 32-byte chunk
+            left, right = chunks[2 * layer], chunks[2 * layer + 1]
+            expected.append(
+                (
+                    f"model.module.decoder.layers.{layer}.mlp.linear_fc1.weight",
+                    Region((rows, 0), (2, 4)),
+                    (
+                        CopyOp(left, Region((layer, rows, 0), (1, 2, 2)), Region((0, 0), (2, 2))),
+                        CopyOp(right, Region((layer, rows, 2), (1, 2, 2)), Region((0, 2), (2, 2))),
+                    ),
+                )
+            )
+    weights = [p for p in plan.pieces if p.key.endswith("linear_fc1.weight")]
+    assert [(p.key, p.chunk, p.ops) for p in weights] == expected
+    assert {p.global_shape for p in weights} == {(4, 4)}
+    norms = [p for p in plan.pieces if p.key.endswith("layer_norm_weight")]
+    (norm_chunk,) = model[norm].chunks
+    assert [(p.key, p.ops) for p in norms] == [
+        (
+            f"model.module.decoder.layers.{layer}.mlp.linear_fc1.layer_norm_weight",
+            (CopyOp(norm_chunk, Region((layer, 0), (1, 4)), Region((0,), (4,))),),
+        )
+        for layer in (0, 1)
+    ]
+
+
 def test_unclaimed_slices_are_refused_with_the_reasons():
     model = source()
     ctx = context(TORCH_DIST, FSDP_DTENSOR, model)
-    stacked = "encoder.layers.mlp.linear_fc2.weight"  # outside every block, so a sentinel sees it
-    extended = {**model, stacked: entry(stacked, (2, 4, 4))}
+    part = "decoder.layers.0.mixer.in_proj.weight.z"  # a part a sentinel reserves
+    extended = {**model, part: entry(part, (4, 4))}
     with pytest.raises(RefusedError) as excinfo:
         plan_model(ctx, extended, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=64)
     refusal = excinfo.value.refusal
-    assert refusal.code == errors.FC_R13 and refusal.keys == (stacked,)
-    assert "not handled by any rule: a tensor stacked over the layers" in refusal.message
+    assert refusal.code == errors.FC_R13 and refusal.keys == (part,)
+    assert "not handled by any rule: a parameter stored as parts" in refusal.message
 
 
 @pytest.mark.parametrize(

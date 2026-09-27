@@ -54,6 +54,9 @@ FC_R07 = "FC-R07"
 FC_R11 = "FC-R11"
 """The layer indices a store holds contradict the hybrid layer pattern."""
 
+FC_R12 = "FC-R12"
+"""A block's layers are stacked inconsistently, or its layer indices are not contiguous."""
+
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""
 

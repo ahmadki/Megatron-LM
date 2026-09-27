@@ -44,7 +44,6 @@ from .keys import (
     LAYER_SEGMENT,
     MIXER_PARAM,
     MLA_PARAM,
-    STACKED_LAYERS,
     TE_OP_FUSER_MLP,
     KeyGrammarError,
     fc2_weight_of,
@@ -55,7 +54,7 @@ from .names import FSDP_DTENSOR, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P01: "non-hybrid TransformerBlock layers (GPT or vision decoders, stacked keys)",
+    errors.FC_P01: "TransformerBlock layers converted to torch_dist (deciding how it stacks them)",
     errors.FC_P02: "models with several roots (language_model., vision_model., vision_projection.)",
     errors.FC_P03: "mixture-of-experts layers",
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
@@ -123,15 +122,6 @@ REGISTRY.allow(
     ),
 )
 
-REGISTRY.sentinel(
-    Sentinel(
-        "stacked_layers",
-        TORCH_DIST,
-        STACKED_LAYERS,
-        (errors.FC_P01,),
-        "a tensor stacked over the layers of a block needs the stacked-block rules",
-    )
-)
 REGISTRY.sentinel(
     Sentinel(
         "parameter_parts",
@@ -431,7 +421,13 @@ def _in_other_block(key: str, decoders: tuple[str, ...]) -> bool:
 
 @REGISTRY.detector
 def pending_transformer_blocks(facts: Facts) -> Iterator[Refusal]:
-    """FC-P01: TransformerBlock layers (a non-hybrid model, stacked keys, other layer lists)."""
+    """FC-P01: TransformerBlock layers of an fsdp_dtensor source (a stacking decision).
+
+    A non-hybrid model's decoder, stacked keys and other layer lists; a
+    torch_dist source stores its layout, which conversion observes.
+    """
+    if facts.source != FSDP_DTENSOR:
+        return
     hybrid = hybrid_pattern_of(facts.args) is not None
     evidence = [] if hybrid else ["no hybrid layer pattern in the arguments"]
     yield from _pending(errors.FC_P01, evidence, _block_keys(facts, hybrid))

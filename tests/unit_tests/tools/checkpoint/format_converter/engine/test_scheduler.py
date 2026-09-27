@@ -27,7 +27,7 @@ from tools.checkpoint.format_converter.engine.staging import PublishTarget
 from tools.checkpoint.format_converter.errors import BudgetExceeded, ExitCode, InternalError
 
 from .._programs import packed_program
-from .._synthetic import dim0_grid, write_store
+from .._synthetic import dim0_grid, product_grid, write_store
 
 W = torch.arange(32, dtype=torch.float32).reshape(8, 4)  # 4 stored chunks of 2 rows (32 B each)
 BIG = torch.arange(256, dtype=torch.float32).reshape(16, 16)  # one stored chunk of 1 KiB
@@ -142,6 +142,32 @@ def test_piece_reading_several_items_is_split_along_dim0(view, tmp_path):
         [ReadReq("w_all", Region.full((8, 4)), buffer)]
     )
     assert torch.equal(buffer, W)
+
+
+def test_layer_copies_of_a_stacked_tensor_are_split_and_run(tmp_path):
+    """A tensor of its own filled from one layer of a stacked tensor (rank 3 into rank 2)."""
+    stacked = torch.arange(96, dtype=torch.float32).reshape(3, 8, 4)
+    grid = product_grid((3, 8, 4), [[1, 2], [4], []])  # one chunk per layer and row half
+    write_store(tmp_path / "src", {"s": stacked}, grids={"s": grid})
+    view = MetadataView.load(tmp_path / "src")
+    halves = [c for c in view.tensors["s"].chunks if c.offsets[0] == 1]
+    ops = tuple(CopyOp(c, c.region, Region((c.offsets[1], 0), (4, 4))) for c in reversed(halves))
+    piece = Piece("layer1", (8, 4), torch.float32, Region.full((8, 4)), ops)
+    slabs = split_piece(piece, 32)  # 16-byte rows: two rows per slab
+    assert [s.chunk for s in slabs] == [Region((r, 0), (2, 4)) for r in (0, 2, 4, 6)]
+    assert [(op.src_region, op.dst_region) for op in slabs[3].ops] == [
+        (Region((1, 6, 0), (1, 2, 4)), Region((0, 0), (2, 4)))
+    ]
+    target = PublishTarget(tmp_path / "out")
+    run_program(
+        packed_program(view, target, [piece], unit_bytes=64, hard_cap=4096), target, RunOptions()
+    )
+    buffer = torch.empty(8, 4)
+    out = MetadataView.load(tmp_path / "out")
+    SourceReader(out, max_item_bytes=4096).read_into(
+        [ReadReq("layer1", Region.full((8, 4)), buffer)]
+    )
+    assert torch.equal(buffer, stacked[1])
 
 
 def test_piece_reading_one_item_is_never_split(view):

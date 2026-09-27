@@ -28,10 +28,11 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
-from .blocks import BlockLayout, classify_blocks
+from .blocks import BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .manifest import MANIFEST_FILE, Manifest
 from .names import DIALECTS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, FSDP_OPTIMIZER_STATE, TORCH_DIST
+from .stacking import transformer_block
 
 TD_TO_FSDP = "td_to_fsdp"
 FSDP_TO_TD = "fsdp_to_td"
@@ -135,7 +136,8 @@ def build_arch_context(
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction.
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
-            and ``fp16``; FC-R11 for layer indices the blocks do not explain).
+            and ``fp16``; FC-R11 for layer indices the blocks do not explain;
+            FC-R12 for inconsistently stacked layers).
         AmbiguousError: The source holds a manifest of another store (FC-A06).
     """
     direction = DIRECTIONS.get((source, target))
@@ -151,7 +153,7 @@ def build_arch_context(
     pp = _parallel_size(args, "pipeline_model_parallel_size", 1, log, field="pp")
     vpp = args.get("virtual_pipeline_model_parallel_size", None)
     log.append(Derivation("vpp", vpp, f"args.virtual_pipeline_model_parallel_size={vpp}"))
-    blocks = classify_blocks(args, model, source)
+    blocks = classify_blocks(BlockFacts(args, source, model), default=transformer_block)
     log.extend(
         Derivation(f"blocks.{block.prefix}", _block_summary(block), block.evidence)
         for block in blocks
