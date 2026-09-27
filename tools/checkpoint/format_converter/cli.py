@@ -33,6 +33,7 @@ COMMON_CHOICES = ("skip", "bytes", "semantic")
 MAP_CHOICES = ("identity", "convert")
 EXPECTED_DIFF_CHOICES = ("A", "B", "C", "D", "E")
 RESUME_CHOICES = ("auto", "never")
+TORCH_DIST_LAYOUTS = ("native", "per-layer")
 MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
@@ -347,6 +348,14 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "conversion_manifest.json records",
     )
     parser.add_argument(
+        "--torch-dist-layout",
+        choices=TORCH_DIST_LAYOUTS,
+        default="native",
+        help="fsdp_dtensor to torch_dist: native stacks each TransformerBlock as Megatron would "
+        "(default); per-layer stores every TransformerBlock one layer per key and sets "
+        "non_homogeneous_layers in content_metadata, so Megatron loads it per layer",
+    )
+    parser.add_argument(
         "--block-layout",
         type=_block_layout,
         action="append",
@@ -402,6 +411,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "allow_missing_fp8_extra_state": args.allow_missing_fp8_extra_state,
         "ignore_manifest": args.ignore_manifest,
         "block_layouts": tuple(args.block_layout),
+        "torch_dist_layout": args.torch_dist_layout,
     }
     for name in (
         "workers",

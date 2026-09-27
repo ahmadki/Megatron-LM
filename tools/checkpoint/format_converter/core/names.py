@@ -29,3 +29,12 @@ PER_LAYER = "per_layer"
 
 TD_LAYOUTS = (STACKED, PER_LAYER)
 """How torch_dist stores a block's layers."""
+
+NATIVE_LAYOUT = "native"
+"""``--torch-dist-layout``: stack each TransformerBlock as Megatron would (the default)."""
+
+PER_LAYER_LAYOUT = "per-layer"
+"""``--torch-dist-layout``: every TransformerBlock per layer, marked in ``content_metadata``."""
+
+TORCH_DIST_LAYOUTS = (NATIVE_LAYOUT, PER_LAYER_LAYOUT)
+"""Values of ``--torch-dist-layout``."""

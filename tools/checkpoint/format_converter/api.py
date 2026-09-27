@@ -243,6 +243,7 @@ _REPLAYED_OPTIONS = {
     "allow_missing_fp8_extra_state": bool,
     "ignore_manifest": bool,
     "block_layouts": _pairs,
+    "torch_dist_layout": str,
 }
 """Options a conversion manifest records that shape the replayed plan, and their parsers."""
 

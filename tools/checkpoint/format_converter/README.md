@@ -228,16 +228,25 @@ been saved with pipeline parallelism (its keys are global).
   that make it stacked while its layers differ in names, shapes or dtypes are
   refused (`FC-R12`); the layout is never switched silently. A layer list of
   an unknown kind needs `--block-layout` (`FC-A02`).
+  `--torch-dist-layout per-layer` stores every `TransformerBlock` one layer
+  per key and sets `non_homogeneous_layers` in the store's `content_metadata`
+  (from the one the manifest records, or Megatron's defaults
+  `singleton_local_shards=False`, `chained_optim_avoid_prefix=True`), so
+  Megatron loads every block per layer; it cannot be combined with
+  `--drop-common-key content_metadata`.
   `--block-layout PREFIX=stacked|per_layer` (repeatable) decides for the
-  `TransformerBlock` with that prefix (stacking needs layers that are alike).
-  It does not change the `content_metadata`, so the job that loads the store
-  must build the block that way: a layout of the decoder other than the one
-  Megatron builds from the arguments and the `content_metadata` is written
-  with a warning, since a job built from them cannot load it strictly.
+  `TransformerBlock` with that prefix (stacking needs layers that are alike);
+  it wins over the other rules. It does not change the `content_metadata`, so
+  the job that loads the store must build the block that way: a layout of the
+  decoder other than the one Megatron builds from the arguments and the
+  `content_metadata` is written with a warning, since a job built from them
+  cannot load it strictly (`--torch-dist-layout per-layer` is the loadable way
+  to store the decoder per layer). Both flags are refused (exit 2) unless an
+  `fsdp_dtensor` store is converted to `torch_dist`.
   When the source's manifest records another `torch_dist` layout of a block
-  than the one decided, the conversion is refused (`FC-A06`) unless
-  `--block-layout` names the block or `--ignore-manifest` is given, so a round
-  trip restores the source's layout or fails.
+  than the one decided, the conversion is refused (`FC-A06`) unless a flag
+  asks for the block's layout or `--ignore-manifest` is given, so a round trip
+  restores the source's layout or fails.
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an

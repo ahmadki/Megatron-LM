@@ -198,6 +198,8 @@ class BlockFacts:
             (fsdp_dtensor sources; ``None`` when it gets none).
         layouts: How torch_dist stores a block, by prefix, as requested with
             ``--block-layout`` (fsdp_dtensor sources).
+        per_layer: torch_dist stores every TransformerBlock per layer
+            (``--torch-dist-layout per-layer``; fsdp_dtensor sources).
     """
 
     args: ArgsView
@@ -205,6 +207,7 @@ class BlockFacts:
     model: Mapping[str, TensorEntry]
     content_metadata: Mapping[str, Any] | None = None
     layouts: Mapping[str, str] = field(default_factory=dict)
+    per_layer: bool = False
 
     @functools.cached_property
     def census(self) -> dict[str, BlockCensus]:

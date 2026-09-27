@@ -25,8 +25,10 @@ Converting an fsdp_dtensor store, the layout is decided the way the loading
 job will ask for it, block by block:
 
 * ``--block-layout PREFIX=stacked|per_layer`` decides for its block (stacking
-  needs layers that are alike). It does not change the ``content_metadata``,
-  so a layout other than the one Megatron builds from the arguments and the
+  needs layers that are alike); ``--torch-dist-layout per-layer`` makes every
+  other block per layer (its ``content_metadata`` then tells Megatron to load
+  them so). ``--block-layout`` does not change the ``content_metadata``, so a
+  layout other than the one Megatron builds from the arguments and the
   ``content_metadata`` is only loadable by a job whose configuration differs
   (:func:`requested_layout_warnings`).
 * The language model's decoder is per layer iff Megatron builds it so: the
@@ -68,6 +70,11 @@ PER_LAYER_METADATA = ("non_homogeneous_layers", "singleton_local_shards")
 
 LAYER_FREQUENCIES = ("moe_layer_freq", "linear_attention_freq")
 """Layer-type frequencies that make a TransformerBlock per layer as an int above 1 or a list."""
+
+_PER_LAYER_ADVICE = (
+    "; --torch-dist-layout per-layer marks the per-layer blocks in content_metadata, so that "
+    "Megatron loads them per layer"
+)
 
 
 def transformer_block(facts: BlockFacts, census: BlockCensus) -> BlockLayout:
@@ -125,7 +132,7 @@ def requested_layout_warnings(facts: BlockFacts, blocks: Iterable[BlockLayout]) 
     return [
         f"--block-layout {block.prefix}={block.td_layout}: a job built from these arguments and "
         f"this content_metadata builds {block.prefix} {built} ({why}), so it cannot load this "
-        "store strictly"
+        "store strictly" + (_PER_LAYER_ADVICE if block.td_layout == PER_LAYER else "")
         for block in blocks
         if block.prefix in facts.layouts and block.prefix == LM_DECODER and block.td_layout != built
     ]
@@ -180,6 +187,8 @@ def _torch_dist_layout(facts: BlockFacts, census: BlockCensus) -> tuple[str, str
                 hint=f"pass --block-layout {prefix}={PER_LAYER}",
             )
         return requested, f"--block-layout {prefix}={requested}"
+    if facts.per_layer:
+        return PER_LAYER, "--torch-dist-layout per-layer"
     if prefix != LM_DECODER:
         raise Refusal(
             errors.FC_A02,
@@ -194,7 +203,8 @@ def _torch_dist_layout(facts: BlockFacts, census: BlockCensus) -> tuple[str, str
         raise _refusal(
             f"the arguments make Megatron stack {prefix}, but its layers differ: {difference}",
             (),
-            hint="check that the arguments belong to this checkpoint",
+            hint="pass --torch-dist-layout per-layer to store every block one layer per key "
+            "(its content_metadata then makes Megatron load them so)",
         )
     return STACKED, "Megatron stacks it (no per-layer setting) and its layers are alike"
 

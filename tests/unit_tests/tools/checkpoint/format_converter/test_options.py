@@ -9,6 +9,7 @@ import re
 import pytest
 
 from tools.checkpoint.format_converter import cli, options
+from tools.checkpoint.format_converter.core.names import TORCH_DIST_LAYOUTS
 from tools.checkpoint.format_converter.engine.staging import RESUME_MODES
 from tools.checkpoint.format_converter.errors import UsageError
 from tools.checkpoint.format_converter.formats.detect import FORMATS
@@ -103,8 +104,23 @@ def test_output_fields_cover_what_shapes_the_output():
         "allow_missing_fp8_extra_state": False,
         "ignore_manifest": False,
         "block_layouts": {},
+        "torch_dist_layout": "native",
         "copy_sidecars": True,
     }
+
+
+def test_torch_dist_layout_is_validated():
+    assert cli.TORCH_DIST_LAYOUTS == TORCH_DIST_LAYOUTS
+    assert options.PlanOptions(torch_dist_layout="per-layer").torch_dist_layout == "per-layer"
+    with pytest.raises(UsageError, match="must be one of native, per-layer"):
+        options.PlanOptions(torch_dist_layout="flat")
+    with pytest.raises(UsageError, match="--drop-common-key content_metadata drops"):
+        options.PlanOptions(
+            torch_dist_layout="per-layer", drop_common_keys=frozenset({"content_metadata"})
+        )
+    with pytest.raises(UsageError, match="asks for decoder stacked"):
+        options.PlanOptions(torch_dist_layout="per-layer", block_layouts=(("decoder", "stacked"),))
+    options.PlanOptions(torch_dist_layout="per-layer", block_layouts=(("encoder", "per_layer"),))
 
 
 def test_block_layouts_are_normalized_and_validated():

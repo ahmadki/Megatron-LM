@@ -211,7 +211,8 @@ def test_an_fsdp_dtensor_training_save_converts_to_a_stacked_store(tmp_path):
 UNLOADABLE = (
     "--block-layout decoder=per_layer: a job built from these arguments and this "
     "content_metadata builds decoder stacked (no per-layer setting), so it cannot load this "
-    "store strictly"
+    "store strictly; --torch-dist-layout per-layer marks the per-layer blocks in "
+    "content_metadata, so that Megatron loads them per layer"
 )
 
 
@@ -227,7 +228,9 @@ def test_block_layout_asks_for_another_layout(tmp_path, capsys, caplog):
     assert "encoder is no layer list of this model" in capsys.readouterr().err
     src = write_gpt_source(tmp_path / "src", STACKED)
     assert run("plan", src, "--to", "fsdp_dtensor", "--block-layout", "decoder=stacked") == 2
-    assert "--block-layout decides how torch_dist stores" in capsys.readouterr().err
+    assert "only fsdp_dtensor to torch_dist conversions take --block-layout" in (
+        capsys.readouterr().err
+    )
 
 
 def test_layers_that_differ_are_not_stacked(tmp_path, capsys, caplog):
@@ -239,6 +242,8 @@ def test_layers_that_differ_are_not_stacked(tmp_path, capsys, caplog):
     assert (
         "FC-R12: the arguments make Megatron stack decoder, but its layers differ: layer 0 " in err
     )
+    assert "hint: pass --torch-dist-layout per-layer" in err
+    assert run("plan", store, "--to", "torch_dist", "--torch-dist-layout", "per-layer") == 0
     assert run("plan", store, "--to", "torch_dist", "--block-layout", "decoder=per_layer") == 0
     assert UNLOADABLE in caplog.text
 
@@ -256,9 +261,11 @@ def test_the_layout_the_manifest_records_is_restored_or_refused(tmp_path, capsys
         "per_layer, but this conversion would store it stacked"
     ) in err
     assert (
-        "hint: keep the content_metadata the manifest records (no --drop-common-key "
-        "content_metadata) if it makes Megatron load decoder per layer, or --ignore-manifest"
+        "hint: keep the content_metadata the manifest records or pass --torch-dist-layout "
+        "per-layer (neither with --drop-common-key content_metadata) so that Megatron loads "
+        "decoder per layer, or --ignore-manifest"
     ) in err
+    assert run("plan", fsdp, "--to", "torch_dist", "--torch-dist-layout", "per-layer") == 0
     assert run("plan", fsdp, "--to", "torch_dist", *dropped, "--ignore-manifest") == 0
     assert run("plan", fsdp, "--to", "torch_dist") == 0
     assert "cannot load this store strictly" not in caplog.text
@@ -267,3 +274,34 @@ def test_the_layout_the_manifest_records_is_restored_or_refused(tmp_path, capsys
         == 0
     )
     assert UNLOADABLE in caplog.text  # without the content_metadata, Megatron stacks it
+
+
+def test_torch_dist_layout_per_layer_marks_the_store(tmp_path, capsys):
+    fp32 = {key: tensor.float() for key, tensor in PER_LAYER.items()}
+    args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, fp32, args=args)
+    argv = ["convert", store, tmp_path / "td", "--to", "torch_dist", "--workers", "0"]
+    assert run(*argv, "--torch-dist-layout", "per-layer") == 0
+    out = tmp_path / "td" / ITER
+    assert set(MetadataView.load(out).tensors) == set(PER_LAYER)
+    assert read_common(out)["content_metadata"] == {
+        "non_homogeneous_layers": True,
+        "singleton_local_shards": False,
+        "chained_optim_avoid_prefix": True,
+    }
+    src = write_gpt_source(tmp_path / "src", STACKED)
+    assert run("plan", src, "--to", "fsdp_dtensor", "--torch-dist-layout", "per-layer") == 2
+    assert "take --torch-dist-layout per-layer" in capsys.readouterr().err
+
+
+def test_a_stacked_store_comes_back_per_layer_when_asked(tmp_path):
+    content = {"distrib_optim_sharding_type": "fully_reshardable", "singleton_local_shards": False}
+    src = write_gpt_source(tmp_path / "src", STACKED, content_metadata=content)
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    options = ConvertOptions(workers=0, torch_dist_layout="per-layer")
+    convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", options)  # the manifest says stacked
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(PER_LAYER)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, PER_LAYER[key]), key
+    assert read_common(out)["content_metadata"] == {**content, "non_homogeneous_layers": True}

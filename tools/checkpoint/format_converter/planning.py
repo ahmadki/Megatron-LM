@@ -44,7 +44,7 @@ from . import __version__, errors
 from .core.args_view import ArgsView
 from .core.context import ArchContext, build_arch_context
 from .core.manifest import MANIFEST_FILE, Manifest
-from .core.names import FSDP_DTENSOR, TORCH_DIST
+from .core.names import FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
 from .core.planner import plan_model
 from .core.refusals import Facts, detect_refusals
 from .core.registry import REGISTRY
@@ -279,8 +279,8 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
     Raises:
         UsageError: The conversion is not supported (fsdp_dtensor to
             fsdp_dtensor, or ``--optimizer convert`` in a rewrite), or
-            ``--block-layout`` is given without an fsdp_dtensor source and a
-            torch_dist target.
+            ``--block-layout`` or ``--torch-dist-layout per-layer`` is given
+            without an fsdp_dtensor source and a torch_dist target.
         RefusedError: A refusal (FC-R, FC-P; FC-E01 unless ``dry_run``),
             including layer lists the layouts cannot explain (FC-R11, FC-R12).
         AmbiguousError: The source holds another store's manifest, or one
@@ -291,11 +291,8 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
     """
     store = open_store(src, iteration=opts.iteration)
     detection = detect_format(store, from_format=opts.from_format)
-    if opts.block_layouts and (detection.fmt, opts.to_format) != (FSDP_DTENSOR, TORCH_DIST):
-        raise UsageError(
-            "--block-layout decides how torch_dist stores the blocks of an fsdp_dtensor source",
-            hint="drop --block-layout: a torch_dist source's layout is kept",
-        )
+    if (detection.fmt, opts.to_format) != (FSDP_DTENSOR, TORCH_DIST):
+        _refuse_torch_dist_layouts(opts)
     if detection.fmt == opts.to_format == TORCH_DIST:
         if opts.optimizer != "drop":
             raise UsageError(
@@ -309,6 +306,19 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
             hint="convert to torch_dist",
         )
     return _plan_cross_format(store, detection, opts, dry_run=dry_run)
+
+
+def _refuse_torch_dist_layouts(opts: PlanOptions) -> None:
+    """The layout flags only apply to torch_dist targets of fsdp_dtensor sources."""
+    flags = ["--block-layout"] if opts.block_layouts else []
+    if opts.torch_dist_layout == PER_LAYER_LAYOUT:
+        flags.append("--torch-dist-layout per-layer")
+    if flags:
+        raise UsageError(
+            f"only fsdp_dtensor to torch_dist conversions take {' and '.join(flags)} (they "
+            "decide how torch_dist stores the blocks)",
+            hint="drop them: a torch_dist source's layout is kept",
+        )
 
 
 def _plan_rewrite(
@@ -389,6 +399,7 @@ def _plan_cross_format(
         manifest_ignored=opts.ignore_manifest,
         block_layouts=dict(opts.block_layouts),
         drop_content_metadata=CONTENT_METADATA in opts.drop_common_keys,
+        per_layer=opts.torch_dist_layout == PER_LAYER_LAYOUT,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:

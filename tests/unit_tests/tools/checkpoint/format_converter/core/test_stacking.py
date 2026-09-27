@@ -55,7 +55,7 @@ def per_layer_gpt(indices, prefix: str = "decoder") -> dict[str, tuple[int, ...]
 
 
 def classify(
-    shapes, *, source=TORCH_DIST, content_metadata=None, layouts=None, **args
+    shapes, *, source=TORCH_DIST, content_metadata=None, layouts=None, per_layer=False, **args
 ) -> tuple[BlockLayout, ...]:
     facts = BlockFacts(
         ArgsView(argparse.Namespace(**args)),
@@ -63,6 +63,7 @@ def classify(
         _model(shapes),
         content_metadata,
         dict(layouts or {}),
+        per_layer,
     )
     return classify_blocks(facts, default=transformer_block)
 
@@ -243,7 +244,8 @@ def test_a_block_layout_megatron_does_not_build_is_warned_about():
     assert warnings_of(layouts={"decoder": "per_layer"}) == [
         "--block-layout decoder=per_layer: a job built from these arguments and this "
         "content_metadata builds decoder stacked (no per-layer setting), so it cannot load "
-        "this store strictly"
+        "this store strictly; --torch-dist-layout per-layer marks the per-layer blocks in "
+        "content_metadata, so that Megatron loads them per layer"
     ]
     (warning,) = warnings_of(layouts={"decoder": "stacked"}, moe_layer_freq=2)
     assert warning.startswith("--block-layout decoder=stacked: ")
@@ -290,3 +292,16 @@ def test_an_fsdp_store_holds_one_layer_per_key():
         "args.num_layers=2"
         in refusal(per_layer_gpt(range(3)), source=FSDP_DTENSOR, num_layers=2).message
     )
+
+
+def test_torch_dist_layout_per_layer_makes_every_block_per_layer():
+    shapes = {**per_layer_gpt(range(3)), **per_layer_gpt(range(2), prefix="encoder")}
+    decoder, encoder = classify(shapes, source=FSDP_DTENSOR, per_layer=True)
+    assert [(b.td_layout, b.evidence) for b in (decoder, encoder)] == [
+        ("per_layer", "--torch-dist-layout per-layer")
+    ] * 2
+    shapes["decoder.layers.2.self_attention.linear_qkv.weight"] = (2 * H, H)  # layers differ
+    decoder, _ = classify(shapes, source=FSDP_DTENSOR, per_layer=True)
+    assert decoder.td_layout == "per_layer"
+    blocks = classify(shapes, source=FSDP_DTENSOR, per_layer=True, layouts={"encoder": "stacked"})
+    assert [b.td_layout for b in blocks] == ["per_layer", "stacked"]

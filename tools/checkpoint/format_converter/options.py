@@ -12,7 +12,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .core.names import FORMATS, TD_LAYOUTS, TORCH_DIST
+from .core.names import (
+    FORMATS,
+    NATIVE_LAYOUT,
+    PER_LAYER_LAYOUT,
+    STACKED,
+    TD_LAYOUTS,
+    TORCH_DIST,
+    TORCH_DIST_LAYOUTS,
+)
 from .engine.memory import available_memory_bytes
 from .errors import UsageError
 from .verify.contract import CONTRACTS
@@ -245,6 +253,9 @@ class PlanOptions:
         block_layouts: ``(prefix, layout)`` pairs, sorted: how a torch_dist
             target stores the block with that prefix (``stacked`` or
             ``per_layer``; fsdp_dtensor sources).
+        torch_dist_layout: ``native`` (each block as Megatron would store it)
+            or ``per-layer`` (every TransformerBlock per layer, marked in
+            ``content_metadata``) for a torch_dist target of an fsdp_dtensor source.
     """
 
     to_format: str = TORCH_DIST
@@ -262,11 +273,13 @@ class PlanOptions:
     allow_missing_fp8_extra_state: bool = False
     ignore_manifest: bool = False
     block_layouts: tuple[tuple[str, str], ...] = ()
+    torch_dist_layout: str = NATIVE_LAYOUT
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
             raise UsageError(f"--to must be one of {', '.join(FORMATS)}, got {self.to_format!r}")
         object.__setattr__(self, "block_layouts", _block_layouts(self.block_layouts))
+        self._check_torch_dist_layout()
         if self.optimizer not in OPTIMIZER_CHOICES:
             raise UsageError(f"--optimizer must be one of {', '.join(OPTIMIZER_CHOICES)}")
         roots = tuple(sorted({root.rstrip(".") for root in self.allow_roots}))
@@ -309,7 +322,25 @@ class PlanOptions:
             "allow_missing_fp8_extra_state": self.allow_missing_fp8_extra_state,
             "ignore_manifest": self.ignore_manifest,
             "block_layouts": dict(self.block_layouts),
+            "torch_dist_layout": self.torch_dist_layout,
         }
+
+    def _check_torch_dist_layout(self) -> None:
+        if self.torch_dist_layout not in TORCH_DIST_LAYOUTS:
+            raise UsageError(f"--torch-dist-layout must be one of {', '.join(TORCH_DIST_LAYOUTS)}")
+        if self.torch_dist_layout != PER_LAYER_LAYOUT:
+            return
+        if "content_metadata" in self.drop_common_keys:
+            raise UsageError(
+                "--torch-dist-layout per-layer marks the layout in content_metadata, which "
+                "--drop-common-key content_metadata drops"
+            )
+        stacked = [prefix for prefix, layout in self.block_layouts if layout == STACKED]
+        if stacked:
+            raise UsageError(
+                f"--torch-dist-layout per-layer stores every TransformerBlock per layer, but "
+                f"--block-layout asks for {', '.join(stacked)} stacked"
+            )
 
 
 def _block_layouts(pairs: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:

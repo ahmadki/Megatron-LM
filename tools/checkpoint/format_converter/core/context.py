@@ -49,6 +49,15 @@ DIRECTIONS = {(TORCH_DIST, FSDP_DTENSOR): TD_TO_FSDP, (FSDP_DTENSOR, TORCH_DIST)
 BLOCK_FIELD = "blocks."
 """Prefix of the derivation fields of the blocks (``blocks.<prefix>``)."""
 
+NON_HOMOGENEOUS = "non_homogeneous_layers"
+PER_LAYER_CONTENT_METADATA: Mapping[str, Any] = {
+    NON_HOMOGENEOUS: True,
+    "singleton_local_shards": False,
+    "chained_optim_avoid_prefix": True,
+}
+"""The ``content_metadata`` of a per-layer torch_dist target without a recorded one: what
+Megatron writes (``_build_sharded_state_dict_metadata``) plus ``non_homogeneous_layers``."""
+
 _MODULE_LEVELS = re.compile(r"(?:module\.)+")
 
 
@@ -139,6 +148,7 @@ def build_arch_context(
     manifest_ignored: bool = False,
     block_layouts: Mapping[str, str] | None = None,
     drop_content_metadata: bool = False,
+    per_layer: bool = False,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -156,6 +166,9 @@ def build_arch_context(
             (``--block-layout``).
         drop_content_metadata: A torch_dist target gets no ``content_metadata``
             (``--drop-common-key content_metadata``).
+        per_layer: A torch_dist target stores every TransformerBlock per layer
+            and marks it in its ``content_metadata`` (``--torch-dist-layout
+            per-layer``).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
@@ -185,16 +198,18 @@ def build_arch_context(
     pp = _parallel_size(args, "pipeline_model_parallel_size", 1, log, field="pp")
     vpp = args.get("virtual_pipeline_model_parallel_size", None)
     log.append(Derivation("vpp", vpp, f"args.virtual_pipeline_model_parallel_size={vpp}"))
-    content_metadata = _td_content_metadata(direction, manifest, drop_content_metadata, log)
+    content_metadata = _td_content_metadata(
+        direction, manifest, log, dropped=drop_content_metadata, per_layer=per_layer
+    )
     requested = dict(block_layouts or {})
-    facts = BlockFacts(args, source, model, content_metadata, requested)
+    facts = BlockFacts(args, source, model, content_metadata, requested, per_layer)
     blocks = classify_blocks(facts, default=transformer_block)
     log.extend(
         Derivation(f"{BLOCK_FIELD}{block.prefix}", _block_summary(block), block.evidence)
         for block in blocks
     )
     if direction == FSDP_TO_TD:
-        _check_recorded_layouts(blocks, manifest, requested)
+        _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
     warnings = requested_layout_warnings(facts, blocks)
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
@@ -251,9 +266,17 @@ def _check_manifest(
 
 
 def _td_content_metadata(
-    direction: str, manifest: Manifest | None, dropped: bool, log: list[Derivation]
+    direction: str,
+    manifest: Manifest | None,
+    log: list[Derivation],
+    *,
+    dropped: bool,
+    per_layer: bool,
 ) -> Mapping[str, Any] | None:
     """The ``content_metadata`` a torch_dist target gets: what the source's manifest records.
+
+    ``--torch-dist-layout per-layer`` sets ``non_homogeneous_layers`` in it
+    (starting from :data:`PER_LAYER_CONTENT_METADATA` when nothing is recorded).
 
     Raises:
         IntegrityError: The recorded value is not a mapping.
@@ -273,23 +296,32 @@ def _td_content_metadata(
                 f"the source's {MANIFEST_FILE} records a content_metadata that is not a mapping",
                 hint="pass --ignore-manifest to convert without restoring what it records",
             )
+    if per_layer:
+        value = {**(PER_LAYER_CONTENT_METADATA if value is None else value), NON_HOMOGENEOUS: True}
+        evidence += f"; {NON_HOMOGENEOUS} set by --torch-dist-layout per-layer"
     log.append(Derivation("td_content_metadata", value, evidence))
     return value
 
 
 def _check_recorded_layouts(
-    blocks: tuple[BlockLayout, ...], manifest: Manifest | None, requested: Mapping[str, str]
+    blocks: tuple[BlockLayout, ...],
+    manifest: Manifest | None,
+    requested: Mapping[str, str],
+    *,
+    per_layer: bool,
 ) -> None:
     """A torch_dist target gets the block layouts the source's manifest records (FC-A06).
 
-    Blocks named with ``--block-layout`` are exempt.
+    Blocks whose layout was asked for (``--block-layout``, or every
+    TransformerBlock with ``--torch-dist-layout per-layer``) are exempt.
     """
     if manifest is None:
         return
     recorded = _recorded_layouts(manifest)
     for block in blocks:
         layout = recorded.get(block.prefix)
-        if layout is None or layout == block.td_layout or block.prefix in requested:
+        asked = block.prefix in requested or (per_layer and block.kind == TRANSFORMER_BLOCK)
+        if layout is None or layout == block.td_layout or asked:
             continue
         raise Refusal(
             errors.FC_A06,
@@ -307,8 +339,9 @@ def _restore_hint(block: BlockLayout, layout: str) -> str:
         return "pass --ignore-manifest to store it as the arguments build it"
     if layout == PER_LAYER:
         return (
-            "keep the content_metadata the manifest records (no --drop-common-key "
-            f"content_metadata) if it makes Megatron load {block.prefix} per layer, {ignore}"
+            "keep the content_metadata the manifest records or pass --torch-dist-layout "
+            "per-layer (neither with --drop-common-key content_metadata) so that Megatron loads "
+            f"{block.prefix} per layer, {ignore}"
         )
     return (
         f"pass --block-layout {block.prefix}={layout} if the job that loads the store builds "

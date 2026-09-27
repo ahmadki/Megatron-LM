@@ -230,6 +230,19 @@ def test_a_torch_dist_target_gets_the_content_metadata_the_manifest_records():
     assert derived(_manifest())[0] is None and derived(None)[0] is None
     with pytest.raises(IntegrityError, match="not a mapping"):
         derived(dataclasses.replace(recorded, content_metadata={"present": True, "value": [1]}))
+    assert derived(recorded, per_layer=True) == (
+        {"non_homogeneous_layers": True},
+        "restored from the source's conversion_manifest.json; non_homogeneous_layers set by "
+        "--torch-dist-layout per-layer",
+    )
+    kept = {"distrib_optim_sharding_type": "fully_reshardable", "non_homogeneous_layers": False}
+    restored = dataclasses.replace(recorded, content_metadata={"present": True, "value": kept})
+    assert derived(restored, per_layer=True)[0] == {**kept, "non_homogeneous_layers": True}
+    assert derived(None, per_layer=True)[0] == {
+        "non_homogeneous_layers": True,
+        "singleton_local_shards": False,
+        "chained_optim_avoid_prefix": True,
+    }
     ctx = build_arch_context(source=TORCH_DIST, target=FSDP_DTENSOR, args=_args(), model={})
     assert ctx.td_content_metadata is None
     assert all(d.field != "td_content_metadata" for d in ctx.derivations)
