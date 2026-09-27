@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""The package README documents every flag, exit code and refusal code, and its example runs."""
+"""The package README documents every flag, exit code and refusal code, and its example runs;
+the user guide documents every exit code and refusal code too."""
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from tools.checkpoint.format_converter.errors import ExitCode
 from ._harness import REPO_ROOT
 
 README = REPO_ROOT / "tools" / "checkpoint" / "format_converter" / "README.md"
+USER_GUIDE = REPO_ROOT / "docs" / "user-guide" / "features" / "checkpoint-conversion.md"
 
 
 @pytest.fixture(name="readme", scope="module")
@@ -60,3 +62,13 @@ def test_key_map_example_runs(readme):
 
 def test_readme_has_no_local_paths(readme):
     assert re.search(r"/(home|datasets|Users)/", readme) is None
+
+
+def test_the_user_guide_documents_every_exit_code_and_refusal_code():
+    guide = USER_GUIDE.read_text()
+    for code in ExitCode:
+        assert re.search(rf"^\| {int(code)} \| ", guide, re.MULTILINE), code
+    codes = {value for name, value in vars(errors).items() if re.fullmatch(r"FC_[RPAE]\d{2}", name)}
+    missing = sorted(code for code in codes if f"`{code}`" not in guide)
+    assert missing == []
+    assert re.search(r"/(home|datasets|Users)/", guide) is None

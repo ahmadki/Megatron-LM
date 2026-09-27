@@ -20,6 +20,7 @@ moe
 megatron_fsdp
 dist_optimizer
 checkpoint-merge
+checkpoint-conversion
 optimizer_cpu_offload
 paged_stash
 tokenizers

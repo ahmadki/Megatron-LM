@@ -23,7 +23,8 @@ layer in `torch_dist`) in both directions, and vision-language models in the
 LLaVA layout whose language model is one of those. Every other model family is
 refused, before anything is read, with a pending-family code until the change
 that supports it lands (see [Roadmap](#roadmap)). This file is the living
-design document of the package.
+design document of the package; the user guide is
+`docs/user-guide/features/checkpoint-conversion.md`.
 
 ## Commands
 
@@ -825,9 +826,9 @@ unsupported input refused with a stable code.
    (done).
 3. Cross-format core: logical key space, rule registry, refusal fence, the
    Megatron-FSDP v1 adapter, per-layer hybrid models, expected-difference
-   contracts and `verify --map convert` (this version).
+   contracts and `verify --map convert` (done).
 4. Stacked `TransformerBlock` layers and multi-root vision-language models,
-   with the user guide.
+   with the user guide (this version).
 5. MoE experts (grouped and sequential naming, router buffers).
 6. GLU `linear_fc1`: SwiGLU split and unsplit, rank-major packs.
 7. Shortcut-MoE layer numbering and hybrid multi-token prediction.
