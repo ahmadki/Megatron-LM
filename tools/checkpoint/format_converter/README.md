@@ -18,8 +18,8 @@ host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 This version inspects and verifies stores, rewrites `torch_dist` stores with
 model weights only, converts the model weights of per-layer hybrid models
 (attention `*` and MLP `-` layers) between `torch_dist` and `fsdp_dtensor` in
-both directions, and converts GPT models (`TransformerBlock` decoders, stacked
-or per layer) from `torch_dist` to `fsdp_dtensor`. Every other model family is
+both directions, and GPT models (`TransformerBlock` decoders, stacked or per
+layer in `torch_dist`) in both directions. Every other model family is
 refused, before anything is read, with a pending-family code until the change
 that supports it lands (see [Roadmap](#roadmap)). This file is the living
 design document of the package.
@@ -116,7 +116,7 @@ and every other difference as a finding (exit 5):
 | `A` | a `torch_dist` -> `fsdp_dtensor` conversion vs a real `fsdp_dtensor` save | optimizer, scheduler, RNG, rerun and extra state only in `B`; `A`'s narrower floats equal `B`'s after the exact upcast; any chunk grid; the common state is not compared |
 | `B` | an `fsdp_dtensor` -> `torch_dist` conversion vs a real `torch_dist` save | that state only in `B`; `A`'s wider floats round (RNE) to `B`'s; any chunk grid; the common state is not compared |
 | `C` | two model-only saves of one step of a conversion chain in one format (real vs converted, or real vs real) | floats equal after the exact upcast; any chunk grid; the sanitized argument fields |
-| `D` | `torch_dist` -> `fsdp_dtensor` -> `torch_dist` vs the model-only source | only `args.no_save_optim` and `args.no_save_rng`, and rerun state only in `B`; `A`'s chunk grid must merge whole chunks of `B`'s (tensor-parallel splits merged); dtypes exact |
+| `D` | `torch_dist` -> `fsdp_dtensor` -> `torch_dist` vs the model-only source | only `args.no_save_optim` and `args.no_save_rng`, and rerun state only in `B`; `A`'s chunk grid must merge whole chunks of `B`'s (tensor-parallel splits merged), and never layers of a tensor stacked over layers; dtypes exact |
 | `E` | `fsdp_dtensor` -> `torch_dist` -> `fsdp_dtensor` vs the source | that state only in `B`; any chunk grid; the sanitized argument fields |
 
 Keys, shapes, values and every other argument or common-state field must
@@ -197,11 +197,10 @@ refusal fence: a model part no rule is verified for is refused with an `FC-R`
 (never supported) or `FC-P` (pending family) code, and every refusal found is
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
 from attention (`*`) and MLP (`-`) layers with a single model root
-(`embedding`, `decoder`, `output_layer`) in both directions, and GPT models
-(no hybrid pattern; attention and MLP `TransformerBlock` layers) from
-`torch_dist` to `fsdp_dtensor`; stage separators (`|`) in the pattern are
-fine, and a `torch_dist` source may have been saved with pipeline parallelism
-(its keys are global).
+(`embedding`, `decoder`, `output_layer`), and GPT models (no hybrid pattern;
+attention and MLP `TransformerBlock` layers), in both directions; stage
+separators (`|`) in the pattern are fine, and a `torch_dist` source may have
+been saved with pipeline parallelism (its keys are global).
 
 * **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
   `module.` level; the store's planner data records `('model', 'module.<name>')`);
@@ -217,6 +216,28 @@ fine, and a `torch_dist` source may have been saved with pipeline parallelism
   stored chunk. Stacked tensors must agree on the number of layers, a
   per-layer block must hold layers `0..L-1`, a block holds one form only, and
   the decoder must have `args.num_layers` layers (`FC-R12` otherwise).
+  Converting to `torch_dist`, each block gets the layout the loading job will
+  ask for, since Megatron's loader requests the layout its own model builds:
+  the decoder is per layer iff `TransformerBlock.sharded_state_dict` builds it
+  so (the `content_metadata` the store gets has `non_homogeneous_layers` or
+  `singleton_local_shards`, or the arguments set `moe_layer_freq` or
+  `linear_attention_freq` to an int above 1 or a list), and stacked
+  otherwise, written as one chunk per layer (Megatron's own grid). Megatron
+  also builds it per layer for heterogeneous layer specs and `dsv4_hybrid`
+  attention, whose arguments are refused (`FC-R03`, `FC-R20`). Arguments
+  that make it stacked while its layers differ in names, shapes or dtypes are
+  refused (`FC-R12`); the layout is never switched silently. A layer list of
+  an unknown kind needs `--block-layout` (`FC-A02`).
+  `--block-layout PREFIX=stacked|per_layer` (repeatable) decides for the
+  `TransformerBlock` with that prefix (stacking needs layers that are alike).
+  It does not change the `content_metadata`, so the job that loads the store
+  must build the block that way: a layout of the decoder other than the one
+  Megatron builds from the arguments and the `content_metadata` is written
+  with a warning, since a job built from them cannot load it strictly.
+  When the source's manifest records another `torch_dist` layout of a block
+  than the one decided, the conversion is refused (`FC-A06`) unless
+  `--block-layout` names the block or `--ignore-manifest` is given, so a round
+  trip restores the source's layout or fails.
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
@@ -224,8 +245,10 @@ fine, and a `torch_dist` source may have been saved with pipeline parallelism
   training step would.
 * **Chunk grids.** `fsdp_dtensor` tensors are written as one chunk split along
   dimension 0 into chunks of at most `--max-output-chunk-bytes` (1 GiB);
-  `torch_dist` tensors as one chunk (larger than half a unit: split along
-  dimension 0). Both loaders read any grid.
+  `torch_dist` tensors stacked over layers as one chunk per layer and other
+  tensors as one chunk. A chunk that reads several stored chunks and is larger
+  than half a unit is split along its first axis longer than 1. Both loaders
+  read any grid.
 * **Common state.** `fsdp_dtensor` stores get the byte items `args`,
   `iteration`, `checkpoint_version` and `num_floating_point_operations_so_far`
   (`content_metadata`, which they cannot hold, is recorded in the manifest; a
@@ -387,14 +410,13 @@ arguments and the model keys before any tensor is read.
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers` for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, or a hybrid decoder holds stacked tensors |
+| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers` for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder, or `--block-layout PREFIX=stacked`) |
 | `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`), model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones |
-| `FC-P01` | pending: `TransformerBlock` layers (GPT decoders, stacked keys, other layer lists) of an `fsdp_dtensor` source, whose `torch_dist` stacking must be decided |
 | `FC-P02` | pending: models with several roots (`language_model.`, `vision_model.`, `vision_projection.`) |
 | `FC-P03` | pending: mixture-of-experts layers (`num_experts`, symbol `E`, expert or router keys) |
 | `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
@@ -406,8 +428,9 @@ arguments and the model keys before any tensor is read.
 | `FC-P10` | pending: GPT multi-token prediction and multi-latent attention (symbol `+`) |
 | `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
 | `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
+| `FC-A02` | converting to `torch_dist`, a layer list of an unknown kind (not the decoder), whose layout depends on its module: pass `--block-layout PREFIX=stacked` or `=per_layer` |
 | `FC-A05` | `--from` disagrees with the detected format |
-| `FC-A06` | the source's `conversion_manifest.json` describes another store (its `.metadata` digest differs); `--ignore-manifest` converts without restoring what it records |
+| `FC-A06` | the source's `conversion_manifest.json` describes another store (its `.metadata` digest differs), or records another `torch_dist` layout of a block than the one decided (the hint names the flag that restores it); `--ignore-manifest` converts without restoring what it records |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |
 | `FC-E02` | the staging directory is not on the destination's filesystem (part files are hard-linked into the output) |
 

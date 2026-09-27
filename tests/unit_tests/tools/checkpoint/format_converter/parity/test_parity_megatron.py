@@ -17,6 +17,7 @@ from tools.checkpoint.format_converter.core.refusals import (
     grouped_tensor_parallel,
 )
 from tools.checkpoint.format_converter.core.registry import REGISTRY, Allowlist
+from tools.checkpoint.format_converter.core.stacking import per_layer_reasons
 from tools.checkpoint.format_converter.mcore_state.common_state import megatron_available
 
 if not megatron_available():
@@ -25,9 +26,12 @@ if not megatron_available():
 # pylint: disable=wrong-import-position
 import argparse
 import importlib
+import types
 
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.hybrid import hybrid_layer_allocation
+from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import add_megatron_arguments
 
 
@@ -52,6 +56,79 @@ def test_the_gated_deltaproduct_spec_names_exist():
     specs = importlib.import_module(HYBRID_SPEC_MODULES[0])
     (spec,) = {id(getattr(specs, name)) for name in GDP_SPEC_NAMES}
     assert spec != id(specs.hybrid_stack_spec)
+
+
+class _RecordingLayer:
+    """Stands in for a TransformerLayer: records the sharded offsets its block passes it."""
+
+    layer_number = 1
+
+    def __init__(self) -> None:
+        self.offsets = None
+
+    def sharded_state_dict(self, prefix, sharded_offsets, metadata):
+        del prefix, metadata
+        self.offsets = sharded_offsets
+        return {}
+
+
+def _megatron_stacks(config: TransformerConfig, metadata) -> bool:
+    """Whether ``TransformerBlock.sharded_state_dict`` stacks a block of ``config``.
+
+    A stacked block hands each layer its offset along the stacked axis; a
+    per-layer block hands none.
+    """
+    layer = _RecordingLayer()
+    block = types.SimpleNamespace(
+        config=config,
+        layers=[layer],
+        vp_stage=None,
+        pg_collection=types.SimpleNamespace(pp=None),
+        tp_group=None,
+        named_children=lambda: iter(()),
+    )
+    TransformerBlock.sharded_state_dict(block, prefix="decoder.", metadata=metadata)
+    return bool(layer.offsets)
+
+
+def _argument_names() -> set[str]:
+    """The names of Megatron's training arguments."""
+    parser = add_megatron_arguments(argparse.ArgumentParser())
+    return set(vars(parser.parse_known_args([])[0]))
+
+
+@pytest.mark.parametrize(
+    ("fields", "metadata"),
+    [
+        ({}, None),
+        ({}, {"non_homogeneous_layers": True}),
+        ({}, {"non_homogeneous_layers": False, "singleton_local_shards": False}),
+        ({}, {"singleton_local_shards": True}),
+        ({"moe_layer_freq": 1}, None),
+        ({"moe_layer_freq": 2}, None),
+        ({"moe_layer_freq": [1, 0, 1, 0]}, None),
+        ({"moe_layer_freq": [1, 1, 1, 1]}, None),
+        ({"linear_attention_freq": 1}, None),
+        ({"linear_attention_freq": 4}, None),
+        ({"linear_attention_freq": [0, 1, 0, 1]}, None),
+    ],
+)
+def test_the_stacking_predicate_mirrors_transformer_block(fields, metadata):
+    """Each field is an argument that Megatron copies into the configuration under its name."""
+    assert set(fields) <= _argument_names()
+    config = TransformerConfig(num_layers=4, hidden_size=8, num_attention_heads=2, **fields)
+    args = ArgsView(argparse.Namespace(**fields))
+    assert (not per_layer_reasons(args, metadata)) == _megatron_stacks(config, metadata)
+
+
+@pytest.mark.parametrize("flag", ["heterogeneous_block_specs", "hetereogenous_dist_checkpoint"])
+def test_the_configuration_only_per_layer_flags_are_no_arguments(flag):
+    """Megatron builds a block per layer for these configuration fields, but no argument has
+    their name: the predicate cannot read them from the arguments, and the arguments that set
+    them are refused (``core/test_stacking.py``)."""
+    config = TransformerConfig(num_layers=4, hidden_size=8, num_attention_heads=2, **{flag: True})
+    assert not _megatron_stacks(config, None)
+    assert flag not in _argument_names()
 
 
 def _validated_args(argv: list[str]) -> argparse.Namespace:

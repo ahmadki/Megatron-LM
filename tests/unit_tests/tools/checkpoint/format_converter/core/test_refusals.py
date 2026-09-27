@@ -163,32 +163,6 @@ CASES = {
     "R20 symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*D"})),
     "R20 unknown symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*Z"})),
     "R20 variant": (errors.FC_R20, facts(args={"experimental_attention_variant": "dsa"})),
-    "P01 gpt": (errors.FC_P01, facts(args=GPT_ARGS, source=FSDP_DTENSOR, target=TORCH_DIST)),
-    "P01 stacked": (
-        errors.FC_P01,
-        facts(
-            keys={"decoder.layers.self_attention.linear_qkv.weight": (4, 3 * H, H)},
-            source=FSDP_DTENSOR,
-            target=TORCH_DIST,
-        ),
-    ),
-    "P01 other block": (
-        errors.FC_P01,
-        facts(
-            keys={"encoder.layers.0.linear.weight": (H, H)},
-            allowed_roots=("encoder",),
-            source=FSDP_DTENSOR,
-            target=TORCH_DIST,
-        ),
-    ),
-    "P01 nested block": (
-        errors.FC_P01,
-        facts(
-            keys={"decoder.layers.1.mlp.layers.0.linear.weight": (H, H)},
-            source=FSDP_DTENSOR,
-            target=TORCH_DIST,
-        ),
-    ),
     "P02 roots": (
         errors.FC_P02,
         facts(keys={"language_model.decoder.layers.0.self_attention.linear_proj.weight": (H, H)}),
@@ -295,10 +269,11 @@ def test_escape_hatches_and_harmless_values_pass():
         codes(facts(args={"pipeline_model_parallel_size": 4})) == []
     )  # torch_dist keys are global
     assert codes(facts(args={"hybrid_layer_pattern": "*-|*-"})) == []
-    # torch_dist stores its TransformerBlock layout, which conversion observes
-    assert codes(facts(args=GPT_ARGS)) == []
+    # TransformerBlocks are classified with the blocks (core/stacking.py), in both directions
     stacked = {"decoder.layers.self_attention.linear_qkv.weight": (4, 3 * H, H)}
-    assert codes(facts(keys=stacked)) == []  # refused when the blocks are classified
+    for source, target in ((TORCH_DIST, FSDP_DTENSOR), (FSDP_DTENSOR, TORCH_DIST)):
+        assert codes(facts(args=GPT_ARGS, source=source, target=target)) == []
+        assert codes(facts(keys=stacked, source=source, target=target)) == []
     hybrid_spec = ["megatron.core.models.mamba.mamba_layer_specs", "hybrid_stack_spec"]
     assert codes(facts(args={"spec": hybrid_spec})) == []
     assert (

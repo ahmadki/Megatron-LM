@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 
 import pytest
 import torch
@@ -19,7 +20,12 @@ from tools.checkpoint.format_converter.core.context import (
 from tools.checkpoint.format_converter.core.manifest import Manifest
 from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
-from tools.checkpoint.format_converter.errors import AmbiguousError, RefusedError, UsageError
+from tools.checkpoint.format_converter.errors import (
+    AmbiguousError,
+    IntegrityError,
+    RefusedError,
+    UsageError,
+)
 
 
 def _model(**dtypes: torch.dtype) -> dict[str, TensorEntry]:
@@ -193,3 +199,37 @@ def test_an_ignored_manifest_is_logged_as_ignored():
         None,
         "conversion_manifest.json ignored (--ignore-manifest)",
     )
+
+
+def test_a_torch_dist_target_gets_the_content_metadata_the_manifest_records():
+    def derived(manifest, **options):
+        ctx = build_arch_context(
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+            args=_args(),
+            model={},
+            manifest=manifest,
+            metadata_sha256="abc",
+            **options,
+        )
+        (logged,) = [d for d in ctx.derivations if d.field == "td_content_metadata"]
+        assert logged.value == ctx.td_content_metadata
+        return ctx.td_content_metadata, logged.evidence
+
+    recorded = dataclasses.replace(
+        _manifest(), content_metadata={"present": True, "value": {"non_homogeneous_layers": True}}
+    )
+    assert derived(recorded) == (
+        {"non_homogeneous_layers": True},
+        "restored from the source's conversion_manifest.json",
+    )
+    assert derived(recorded, drop_content_metadata=True) == (
+        None,
+        "--drop-common-key content_metadata",
+    )
+    assert derived(_manifest())[0] is None and derived(None)[0] is None
+    with pytest.raises(IntegrityError, match="not a mapping"):
+        derived(dataclasses.replace(recorded, content_metadata={"present": True, "value": [1]}))
+    ctx = build_arch_context(source=TORCH_DIST, target=FSDP_DTENSOR, args=_args(), model={})
+    assert ctx.td_content_metadata is None
+    assert all(d.field != "td_content_metadata" for d in ctx.derivations)

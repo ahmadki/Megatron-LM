@@ -45,16 +45,13 @@ from .keys import (
     MIXER_PARAM,
     MLA_PARAM,
     TE_OP_FUSER_MLP,
-    KeyGrammarError,
     fc2_weight_of,
-    innermost_layer_key,
     root_of,
 )
 from .names import FSDP_DTENSOR, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P01: "TransformerBlock layers converted to torch_dist (deciding how it stacks them)",
     errors.FC_P02: "models with several roots (language_model., vision_model., vision_projection.)",
     errors.FC_P03: "mixture-of-experts layers",
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
@@ -68,9 +65,6 @@ PENDING_FAMILIES: Mapping[str, str] = {
     errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
 }
 """Every pending-family code and the family it stands for."""
-
-HYBRID_DECODERS = ("decoder", "language_model.decoder")
-"""Block prefixes of a hybrid model's main decoder (its ``HybridStack``)."""
 
 MTP_BLOCKS = ("mtp", "language_model.mtp")
 """Block prefixes of multi-token prediction."""
@@ -390,47 +384,6 @@ def _block_heads(blocks: tuple[str, ...]) -> tuple[str, ...]:
 def _mtp_keys(facts: Facts) -> tuple[str, ...]:
     """Keys of multi-token prediction layers."""
     return tuple(key for key in sorted(facts.model) if key.startswith(_block_heads(MTP_BLOCKS)))
-
-
-def _block_keys(facts: Facts, hybrid: bool) -> tuple[str, ...]:
-    """Keys whose innermost layer list is not the hybrid decoder's or multi-token prediction's.
-
-    Layer lists nested in a multi-token prediction depth (its inner model)
-    count as multi-token prediction's; stacked keys (``layers.`` without an
-    index) count wherever they are. Keys with a malformed layer segment are
-    left to the planner, which refuses them with the grammar error.
-    """
-    decoders = HYBRID_DECODERS if hybrid else ()
-    return tuple(key for key in sorted(facts.model) if _in_other_block(key, decoders))
-
-
-def _in_other_block(key: str, decoders: tuple[str, ...]) -> bool:
-    try:
-        layer_key = innermost_layer_key(key)
-    except KeyGrammarError:
-        return False
-    if layer_key is None:
-        return False
-    if layer_key.stacked:
-        return True
-    block = layer_key.block
-    if block in decoders or block in MTP_BLOCKS:
-        return False
-    return not block.startswith(_block_heads(MTP_BLOCKS))
-
-
-@REGISTRY.detector
-def pending_transformer_blocks(facts: Facts) -> Iterator[Refusal]:
-    """FC-P01: TransformerBlock layers of an fsdp_dtensor source (a stacking decision).
-
-    A non-hybrid model's decoder, stacked keys and other layer lists; a
-    torch_dist source stores its layout, which conversion observes.
-    """
-    if facts.source != FSDP_DTENSOR:
-        return
-    hybrid = hybrid_pattern_of(facts.args) is not None
-    evidence = [] if hybrid else ["no hybrid layer pattern in the arguments"]
-    yield from _pending(errors.FC_P01, evidence, _block_keys(facts, hybrid))
 
 
 @REGISTRY.detector

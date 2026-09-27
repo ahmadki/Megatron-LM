@@ -9,10 +9,11 @@ key envelope and ``core/structure.py`` maps the model-relative key to an id
 (key grammar and the blocks' layer numbering). Rules turn slices into
 :class:`LogicalOutput` objects (what each output tensor holds, as
 :class:`LogicalCopy` boxes of source slices). Every output id is then
-*composed* back: ``core/structure.py`` gives its model-relative key in the
-target format, and the target format's adapter adds the envelope and supplies
-the planner path and the chunk grid. Rules therefore see only logical ids and
-serve both directions.
+*composed* back: ``core/structure.py`` gives its :class:`OutputSlice` in the
+target format (the model-relative key and the box of that tensor it fills),
+and the target format's adapter adds the envelope and supplies the planner
+path and the chunk grid. Rules therefore see only logical ids and serve both
+directions.
 
 A :class:`LogicalId` names one model tensor as the live model does: the block
 it belongs to, its *dense* layer index in that block (the ``nn.ModuleList``
@@ -114,6 +115,52 @@ class LogicalSlice:
     def stored_box(self, box: Region) -> Region:
         """The box of ``key`` that holds ``box`` of the logical tensor."""
         return corresponding(box, Region.full(self.shape), self.region)
+
+
+@dataclass(frozen=True, slots=True)
+class OutputSlice:
+    """Where one output logical tensor is stored: a box of one target tensor.
+
+    Several outputs may tile one target tensor: each layer of a block that
+    torch_dist stores stacked is the box ``[l:l+1, ...]`` of the stacked
+    tensor. The logical tensor has the box's shape without its first
+    ``squeezed`` axes, which have size 1.
+
+    Attributes:
+        key: The target key (model-relative, or with the format envelope).
+        global_shape: Shape of the whole target tensor.
+        region: The box of the target tensor that holds the logical tensor.
+        squeezed: Leading size-1 axes of ``region`` the logical tensor does not have.
+
+    Raises:
+        InternalError: ``region`` is outside ``global_shape`` or does not have
+            ``squeezed`` leading size-1 axes.
+    """
+
+    key: str
+    global_shape: tuple[int, ...]
+    region: Region
+    squeezed: int = 0
+
+    def __post_init__(self) -> None:
+        full = Region.full(self.global_shape)
+        if self.region.ndim != full.ndim or not full.contains(self.region):
+            raise InternalError(f"{self.key}: {self.region} is outside shape {self.global_shape}")
+        if not 0 <= self.squeezed <= self.region.ndim or any(
+            size != 1 for size in self.region.sizes[: self.squeezed]
+        ):
+            raise InternalError(
+                f"{self.key}: {self.region} has no {self.squeezed} leading size-1 axes to squeeze"
+            )
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        """Shape of the logical tensor."""
+        return self.region.sizes[self.squeezed :]
+
+    def logical_box(self, box: Region) -> Region:
+        """The box of the logical tensor that ``box`` (inside ``region``) holds."""
+        return corresponding(box, self.region, Region.full(self.shape))
 
 
 @dataclass(frozen=True, slots=True)

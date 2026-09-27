@@ -75,9 +75,6 @@ FC_R19 = "FC-R19"
 FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant)."""
 
-FC_P01 = "FC-P01"
-"""Pending: non-hybrid ``TransformerBlock`` layers (stacked keys or a stacking decision)."""
-
 FC_P02 = "FC-P02"
 """Pending: several model roots (``language_model.``, ``vision_model.``, ``vision_projection.``)."""
 
@@ -110,6 +107,9 @@ FC_P11 = "FC-P11"
 
 FC_P12 = "FC-P12"
 """Pending: converting optimizer state from torch_dist to fsdp_dtensor."""
+
+FC_A02 = "FC-A02"
+"""How torch_dist stores a block of an unknown kind cannot be decided (``--block-layout``)."""
 
 FC_A05 = "FC-A05"
 """``--from`` names a different format than the one detected from the store."""

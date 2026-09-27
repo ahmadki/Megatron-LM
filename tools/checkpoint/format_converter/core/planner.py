@@ -12,17 +12,21 @@ engine pieces:
    every slice is claimed and consumed exactly once. Slices left over
    (including those a sentinel reserves) are refused with FC-R13 and the
    rules' reasons.
-3. **Compose** every output's target key and chunk grid (the target adapter).
+3. **Compose** every output's target slice (``core/structure.py``: the key
+   and the box of that tensor it fills, e.g. one layer of a stacked tensor)
+   and chunk grid (the target adapter; chunks never span two outputs).
 4. **Compile** each output chunk into a :class:`~..engine.pieces.Piece` whose
    copy operations read boxes of the source's stored chunks.
 5. **Coverage**: the copies must read every element of every consumed source
    tensor exactly once, every piece must be tiled by its copies and every
-   output tensor by its pieces, and no two outputs may share a key. Any
-   violation is a bug in a rule (exit 1), never silently written.
+   output tensor by its pieces (outputs that share a key must tile it
+   without overlapping). Any violation is a bug in a rule (exit 1), never
+   silently written.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -36,7 +40,7 @@ from ..engine.regions import Region, corresponding, find_tiling_defect
 from ..errors import InternalError, Refusal
 from .context import ArchContext
 from .keys import KeyGrammarError
-from .logical import LogicalId, LogicalOutput, LogicalSlice
+from .logical import LogicalId, LogicalOutput, LogicalSlice, OutputSlice
 from .rule import FamilyInstance, LeafRule, LogicalPool
 from .structure import compose, decompose
 
@@ -53,9 +57,9 @@ class TargetLayout(Protocol):
         """The planner path of an output model key (``None``: not recorded)."""
 
     def output_grid(
-        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+        self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
     ) -> tuple[Region, ...]:
-        """The chunk grid an output tensor is written with."""
+        """The chunks ``placed.region`` is written as (they tile it)."""
 
 
 @dataclass(frozen=True)
@@ -159,18 +163,14 @@ def _compile(
 ) -> list[Piece]:
     entries = {entry.key: entry for entry in source.values()}
     pieces: list[Piece] = []
-    owners: dict[str, LogicalId] = {}
     for output in outputs:
-        key = target.stored_key(compose(output.lid, ctx.blocks, target.fmt))
-        owner = owners.setdefault(key, output.lid)
-        if owner != output.lid:
-            raise InternalError(f"{owner} and {output.lid} would both be written as {key}")
-        for chunk in target.output_grid(
-            output.shape, output.dtype, max_chunk_bytes=max_chunk_bytes
-        ):
-            ops = tuple(_chunk_ops(output, chunk, slices, entries))
+        relative = compose(output.lid, output.shape, ctx.blocks, target.fmt)
+        placed = dataclasses.replace(relative, key=target.stored_key(relative.key))
+        planner_path = target.planner_path(placed.key)
+        for chunk in target.output_grid(placed, output.dtype, max_chunk_bytes=max_chunk_bytes):
+            ops = tuple(_chunk_ops(output, placed, chunk, slices, entries))
             pieces.append(
-                Piece(key, output.shape, output.dtype, chunk, ops, target.planner_path(key))
+                Piece(placed.key, placed.global_shape, output.dtype, chunk, ops, planner_path)
             )
     pieces.sort(key=lambda piece: (piece.key, piece.chunk.offsets))
     return pieces
@@ -178,25 +178,29 @@ def _compile(
 
 def _chunk_ops(
     output: LogicalOutput,
+    placed: OutputSlice,
     chunk: Region,
     slices: Mapping[LogicalId, LogicalSlice],
     entries: Mapping[str, TensorEntry],
 ) -> list[CopyOp]:
-    """The copies of stored source boxes that fill output chunk ``chunk``.
+    """The copies of stored source boxes that fill output chunk ``chunk`` of ``placed``.
 
-    Each copy's destination box is cut to the chunk, mapped to the box of the
-    stored source tensor that holds it (through the source slice, which may
-    be one layer of a stacked tensor) and split along the source's stored
-    chunks; every piece of it becomes a copy into the chunk's buffer.
+    Each copy's destination box is cut to the chunk (in the output's logical
+    coordinates), mapped to the box of the stored source tensor that holds it
+    (through the source slice, which may be one layer of a stacked tensor)
+    and split along the source's stored chunks; every piece of it becomes a
+    copy into the chunk's buffer, whose rank is the target tensor's.
     """
+    logical_chunk = placed.logical_box(chunk)
+    buffer = Region.full(chunk.sizes)
     ops = []
     for copy in output.copies:
-        part = copy.dst_region.intersect(chunk)
+        part = copy.dst_region.intersect(logical_chunk)
         if part is None:
             continue
         source = slices[copy.src]
         src_box = source.stored_box(corresponding(part, copy.dst_region, copy.src_region))
-        dst_box = part.relative_to(chunk)
+        dst_box = corresponding(part, logical_chunk, buffer)
         for stored in entries[source.key].chunks:
             read = src_box.intersect(stored.region)
             if read is not None:

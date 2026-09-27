@@ -34,6 +34,10 @@ FC1 = "decoder.layers.1.mlp.linear_fc1.weight"
 NORM = "decoder.final_norm.weight"
 
 
+def dim0_regions(shape: tuple[int, ...], rows: int) -> list[Region]:
+    return Region.full(shape).split_dim0(rows)
+
+
 def entry(key: str, shape: tuple[int, ...], grid: list[Region] | None = None) -> TensorEntry:
     """A float32 tensor entry stored as ``grid`` (default: one chunk)."""
     chunks = tuple(
@@ -143,6 +147,35 @@ def test_a_stacked_decoder_is_written_one_layer_per_key():
     ]
 
 
+def test_layers_of_an_fsdp_store_are_stacked_one_chunk_per_layer():
+    """Each layer of the stacked target is its own chunk, filled from that layer's stored rows."""
+    prefix = "model.module.decoder.layers"
+    model = {}
+    for layer in (0, 1):
+        key = f"{prefix}.{layer}.mlp.linear_fc1.weight"
+        model[key.removeprefix("model.module.")] = entry(key, (4, 4), dim0_regions((4, 4), 2))
+    args = ArgsView(argparse.Namespace(num_layers=2))
+    ctx = build_arch_context(source=FSDP_DTENSOR, target=TORCH_DIST, args=args, model=model)
+    assert [(b.prefix, b.td_layout) for b in ctx.blocks] == [("decoder", "stacked")]
+    plan = plan_model(ctx, model, TorchDistAdapter(), rules=[IdentityRule()], max_chunk_bytes=8)
+    stacked = "decoder.layers.mlp.linear_fc1.weight"
+    expected = []
+    for layer in (0, 1):
+        top, bottom = model[f"decoder.layers.{layer}.mlp.linear_fc1.weight"].chunks
+        expected.append(
+            (
+                Region((layer, 0, 0), (1, 4, 4)),
+                (
+                    CopyOp(top, Region((0, 0), (2, 4)), Region((0, 0, 0), (1, 2, 4))),
+                    CopyOp(bottom, Region((2, 0), (2, 4)), Region((0, 2, 0), (1, 2, 4))),
+                ),
+            )
+        )
+    assert [(p.key, p.global_shape) for p in plan.pieces] == [(stacked, (2, 4, 4))] * 2
+    assert [(p.chunk, p.ops) for p in plan.pieces] == expected
+    assert all(p.planner_path is None for p in plan.pieces)
+
+
 def test_unclaimed_slices_are_refused_with_the_reasons():
     model = source()
     ctx = context(TORCH_DIST, FSDP_DTENSOR, model)
@@ -192,16 +225,19 @@ class _Rule(LeafRule):
                 piece.lid, (3, 4), piece.dtype, (LogicalCopy(piece.lid, half, half),)
             )
             yield FamilyInstance(self.name, (piece,), (output,))
-        elif self.bug == "same key":
-            full = Region.full((6, 4))
-            copy = (LogicalCopy(piece.lid, full, full),)
+        elif self.bug == "same key":  # both halves written over one another under one key
+            other = Region((3, 0), (3, 4))
             twin = LogicalId(None, None, "decoder.layers.0.self_attention.linear_qkv", "weight")
             yield FamilyInstance(
                 self.name,
                 (piece,),
                 (
-                    LogicalOutput(piece.lid, (6, 4), piece.dtype, copy),
-                    LogicalOutput(twin, (6, 4), piece.dtype, copy),
+                    LogicalOutput(
+                        piece.lid, (3, 4), piece.dtype, (LogicalCopy(piece.lid, half, half),)
+                    ),
+                    LogicalOutput(
+                        twin, (3, 4), piece.dtype, (LogicalCopy(piece.lid, other, half),)
+                    ),
                 ),
             )
         elif self.bug == "misnamed":
@@ -216,7 +252,7 @@ class _Rule(LeafRule):
             "drops rows",
             "does not read decoder.layers.0.self_attention.linear_qkv.weight exactly once",
         ),
-        ("same key", "would both be written as"),
+        ("same key", "the planned chunks of .*linear_qkv.weight do not tile it"),
         ("misnamed", "returned an instance of someone else"),
     ],
 )

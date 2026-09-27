@@ -93,12 +93,21 @@ class Region:
         """Split along dimension 0 into consecutive slabs of at most ``max_rows`` rows."""
         if max_rows < 1:
             raise ValueError(f"max_rows must be positive, got {max_rows}")
-        if self.ndim == 0 or self.sizes[0] <= max_rows:
+        return self.split_along(0, max_rows) if self.ndim else [self]
+
+    def split_along(self, axis: int, max_size: int) -> list[Region]:
+        """Split along ``axis`` into consecutive slabs of at most ``max_size`` indices."""
+        if max_size < 1:
+            raise ValueError(f"max_size must be positive, got {max_size}")
+        if not 0 <= axis < self.ndim:
+            raise ValueError(f"axis {axis} is not an axis of a rank-{self.ndim} region")
+        if self.sizes[axis] <= max_size:
             return [self]
         slabs = []
-        for start in range(self.offsets[0], self.ends[0], max_rows):
-            rows = min(max_rows, self.ends[0] - start)
-            slabs.append(Region((start, *self.offsets[1:]), (rows, *self.sizes[1:])))
+        for start in range(self.offsets[axis], self.ends[axis], max_size):
+            size = min(max_size, self.ends[axis] - start)
+            offsets = self.offsets[:axis] + (start,) + self.offsets[axis + 1 :]
+            slabs.append(Region(offsets, self.sizes[:axis] + (size,) + self.sizes[axis + 1 :]))
         return slabs
 
     def slices(self) -> tuple[slice, ...]:

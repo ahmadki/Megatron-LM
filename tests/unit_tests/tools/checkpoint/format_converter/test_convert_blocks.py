@@ -31,7 +31,7 @@ from ._synthetic import (
     write_store,
     write_tracker,
 )
-from .test_convert_cross import bitwise_equal, read_tensors
+from .test_convert_cross import bitwise_equal, read_items, read_tensors
 
 pytestmark = pytest.mark.covers("identity", "ground_truth")
 ITER = "iter_0000007"
@@ -152,9 +152,118 @@ def test_the_decoder_length_must_match_the_arguments(tmp_path, capsys):
     )
 
 
-def test_converting_a_gpt_store_to_torch_dist_is_pending(tmp_path, capsys):
-    fp32 = {key: tensor.float() for key, tensor in PER_LAYER.items()}
+def read_common(store) -> dict:
+    (common,) = read_items(store)["common_state/shard_0_1"]
+    return common
+
+
+def grid_of(store, key) -> list:
+    return [(c.offsets, c.sizes) for c in MetadataView.load(store).tensors[key].chunks]
+
+
+def test_a_stacked_gpt_store_round_trips_bit_for_bit(tmp_path):
+    src = write_gpt_source(tmp_path / "src", STACKED, grids=stacked_grids())
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    report = convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(STACKED)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, STACKED[key]), key
+    # Megatron's own grid: one chunk per layer (the row split of the source merged)
+    assert grid_of(out, QKV) == [((layer, 0, 0), (1, 24, 8)) for layer in range(LAYERS)]
+    fc2 = "decoder.layers.mlp.linear_fc2.bias"
+    assert grid_of(out, fc2) == [((layer, 0), (1, 8)) for layer in range(LAYERS)]
+    (block,) = [d for d in report.plan["derivations"] if d["field"] == "blocks.decoder"]
+    assert block["value"]["td_layout"] == "stacked"
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D")).ok
+
+
+def test_a_per_layer_gpt_store_round_trips_per_layer(tmp_path):
+    content = {"non_homogeneous_layers": True, "singleton_local_shards": False}
+    src = write_gpt_source(tmp_path / "src", PER_LAYER, content_metadata=content)
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    report = convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(PER_LAYER)
+    assert read_common(out)["content_metadata"] == content
+    derived = {d["field"]: d for d in report.plan["derivations"]}
+    assert derived["td_content_metadata"]["value"] == content
+    assert derived["blocks.decoder"]["evidence"] == (
+        "Megatron builds it per layer (content_metadata.non_homogeneous_layers=True)"
+    )
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D")).ok
+
+
+def test_an_fsdp_dtensor_training_save_converts_to_a_stacked_store(tmp_path):
+    fp32 = {key: tensor.float() for key, tensor in PER_LAYER.items()}  # Megatron-FSDP main weights
     args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
     store = write_fsdp_store(tmp_path / "fsdp" / ITER, fp32, args=args)
+    convert_checkpoint(store, tmp_path / "td" / ITER, ConvertOptions(workers=0))
+    out = tmp_path / "td" / ITER
+    expected = stack_layers(fp32, "decoder")
+    assert set(MetadataView.load(out).tensors) == set(expected)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, expected[key]), key
+    assert grid_of(out, QKV) == [((layer, 0, 0), (1, 24, 8)) for layer in range(LAYERS)]
+    assert "content_metadata" not in read_common(out)
+
+
+UNLOADABLE = (
+    "--block-layout decoder=per_layer: a job built from these arguments and this "
+    "content_metadata builds decoder stacked (no per-layer setting), so it cannot load this "
+    "store strictly"
+)
+
+
+def test_block_layout_asks_for_another_layout(tmp_path, capsys, caplog):
+    args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, PER_LAYER, args=args)
+    argv = ["convert", store, tmp_path / "td", "--to", "torch_dist", "--workers", "0"]
+    assert run(*argv, "--block-layout", "decoder=per_layer") == 0
+    assert set(MetadataView.load(tmp_path / "td" / ITER).tensors) == set(PER_LAYER)
+    assert "content_metadata" not in read_common(tmp_path / "td" / ITER)  # it stays as it was
+    assert UNLOADABLE in caplog.text
+    assert run("plan", store, "--to", "torch_dist", "--block-layout", "encoder=stacked") == 2
+    assert "encoder is no layer list of this model" in capsys.readouterr().err
+    src = write_gpt_source(tmp_path / "src", STACKED)
+    assert run("plan", src, "--to", "fsdp_dtensor", "--block-layout", "decoder=stacked") == 2
+    assert "--block-layout decides how torch_dist stores" in capsys.readouterr().err
+
+
+def test_layers_that_differ_are_not_stacked(tmp_path, capsys, caplog):
+    model = {k: v for k, v in PER_LAYER.items() if k != "decoder.layers.2.mlp.linear_fc1.bias"}
+    args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, model, args=args)
     assert run("plan", store, "--to", "torch_dist") == 3
-    assert "error: FC-P01: not supported yet" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert (
+        "FC-R12: the arguments make Megatron stack decoder, but its layers differ: layer 0 " in err
+    )
+    assert run("plan", store, "--to", "torch_dist", "--block-layout", "decoder=per_layer") == 0
+    assert UNLOADABLE in caplog.text
+
+
+def test_the_layout_the_manifest_records_is_restored_or_refused(tmp_path, capsys, caplog):
+    content = {"non_homogeneous_layers": True}
+    src = write_gpt_source(tmp_path / "src", PER_LAYER, content_metadata=content)
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    fsdp = tmp_path / "fsdp"
+    dropped = ["--drop-common-key", "content_metadata"]
+    assert run("plan", fsdp, "--to", "torch_dist", *dropped) == 4
+    err = capsys.readouterr().err
+    assert (
+        "FC-A06: the source's conversion_manifest.json records that torch_dist stored decoder "
+        "per_layer, but this conversion would store it stacked"
+    ) in err
+    assert (
+        "hint: keep the content_metadata the manifest records (no --drop-common-key "
+        "content_metadata) if it makes Megatron load decoder per layer, or --ignore-manifest"
+    ) in err
+    assert run("plan", fsdp, "--to", "torch_dist", *dropped, "--ignore-manifest") == 0
+    assert run("plan", fsdp, "--to", "torch_dist") == 0
+    assert "cannot load this store strictly" not in caplog.text
+    assert (
+        run("plan", fsdp, "--to", "torch_dist", *dropped, "--block-layout", "decoder=per_layer")
+        == 0
+    )
+    assert UNLOADABLE in caplog.text  # without the content_metadata, Megatron stacks it

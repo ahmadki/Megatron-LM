@@ -28,16 +28,26 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
-from .blocks import BlockFacts, BlockLayout, classify_blocks
+from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .manifest import MANIFEST_FILE, Manifest
-from .names import DIALECTS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, FSDP_OPTIMIZER_STATE, TORCH_DIST
-from .stacking import transformer_block
+from .names import (
+    DIALECTS,
+    FSDP_DTENSOR,
+    FSDP_MODEL_PREFIX,
+    FSDP_OPTIMIZER_STATE,
+    PER_LAYER,
+    TORCH_DIST,
+)
+from .stacking import requested_layout_warnings, transformer_block
 
 TD_TO_FSDP = "td_to_fsdp"
 FSDP_TO_TD = "fsdp_to_td"
 DIRECTIONS = {(TORCH_DIST, FSDP_DTENSOR): TD_TO_FSDP, (FSDP_DTENSOR, TORCH_DIST): FSDP_TO_TD}
 """The cross-format directions by (source, target) format."""
+
+BLOCK_FIELD = "blocks."
+"""Prefix of the derivation fields of the blocks (``blocks.<prefix>``)."""
 
 _MODULE_LEVELS = re.compile(r"(?:module\.)+")
 
@@ -76,7 +86,10 @@ class ArchContext:
         ep: Expert-parallel size the source was saved with.
         pp: Pipeline-parallel size the source was saved with.
         vpp: Virtual-pipeline size the source was saved with (``None`` if unused).
-        blocks: The model's layered blocks and how each format numbers their layers.
+        td_content_metadata: The ``content_metadata`` a torch_dist target gets
+            (``fsdp_to_td``; ``None`` when it gets none or the target is fsdp_dtensor).
+        blocks: The model's layered blocks and how each format numbers and
+            stacks their layers.
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -85,6 +98,9 @@ class ArchContext:
             it has one that describes it (used to restore what that
             conversion changed).
         derivations: How each field was derived, in derivation order.
+        warnings: What the conversion does that a job built from the
+            arguments may not load (``--block-layout`` against Megatron's
+            layout).
     """
 
     direction: str
@@ -97,12 +113,14 @@ class ArchContext:
     ep: int
     pp: int
     vpp: int | None
+    td_content_metadata: Mapping[str, Any] | None
     blocks: tuple[BlockLayout, ...]
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     dtype_policy: DtypePolicy
     manifest: Manifest | None
     derivations: tuple[Derivation, ...]
+    warnings: tuple[str, ...] = ()
 
     def derivation_log(self) -> list[dict[str, Any]]:
         """The derivations as JSON records."""
@@ -119,6 +137,8 @@ def build_arch_context(
     manifest: Manifest | None = None,
     metadata_sha256: str = "",
     manifest_ignored: bool = False,
+    block_layouts: Mapping[str, str] | None = None,
+    drop_content_metadata: bool = False,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -132,17 +152,29 @@ def build_arch_context(
         metadata_sha256: SHA-256 of the source's ``.metadata`` (a manifest
             must name it to describe the source).
         manifest_ignored: The source's manifest was not read (``--ignore-manifest``).
+        block_layouts: How a torch_dist target stores a block, by prefix
+            (``--block-layout``).
+        drop_content_metadata: A torch_dist target gets no ``content_metadata``
+            (``--drop-common-key content_metadata``).
 
     Raises:
-        UsageError: ``source`` to ``target`` is not a cross-format direction.
+        UsageError: ``source`` to ``target`` is not a cross-format direction,
+            or ``block_layouts`` names a block that is not a TransformerBlock.
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
             and ``fp16``; FC-R11 for layer indices the blocks do not explain;
-            FC-R12 for inconsistently stacked layers).
-        AmbiguousError: The source holds a manifest of another store (FC-A06).
+            FC-R12 for inconsistently stacked layers or layers that cannot be
+            stacked as asked).
+        AmbiguousError: The source holds a manifest of another store, or one
+            that records another torch_dist layout of a block (FC-A06); a
+            block's torch_dist layout cannot be decided (FC-A02).
+        IntegrityError: The manifest's ``content_metadata`` is not a mapping.
     """
     direction = DIRECTIONS.get((source, target))
     if direction is None:
         raise errors.UsageError(f"{source} to {target} is not a cross-format conversion")
+    if manifest_ignored:
+        manifest = None
+    manifest_log = _check_manifest(manifest, source, metadata_sha256, ignored=manifest_ignored)
     log: list[Derivation] = [
         Derivation("direction", direction, f"source {source}, target {target}")
     ]
@@ -153,19 +185,23 @@ def build_arch_context(
     pp = _parallel_size(args, "pipeline_model_parallel_size", 1, log, field="pp")
     vpp = args.get("virtual_pipeline_model_parallel_size", None)
     log.append(Derivation("vpp", vpp, f"args.virtual_pipeline_model_parallel_size={vpp}"))
-    blocks = classify_blocks(BlockFacts(args, source, model), default=transformer_block)
+    content_metadata = _td_content_metadata(direction, manifest, drop_content_metadata, log)
+    requested = dict(block_layouts or {})
+    facts = BlockFacts(args, source, model, content_metadata, requested)
+    blocks = classify_blocks(facts, default=transformer_block)
     log.extend(
-        Derivation(f"blocks.{block.prefix}", _block_summary(block), block.evidence)
+        Derivation(f"{BLOCK_FIELD}{block.prefix}", _block_summary(block), block.evidence)
         for block in blocks
     )
+    if direction == FSDP_TO_TD:
+        _check_recorded_layouts(blocks, manifest, requested)
+    warnings = requested_layout_warnings(facts, blocks)
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
     depth = _fsdp_optim_depth(params_dtype, source, optimizer_keys, log)
     log.append(Derivation("dtype_policy", DtypePolicy.PRESERVE.value, "weights-only conversion"))
-    if manifest_ignored:
-        manifest = None
-    _check_manifest(manifest, source, metadata_sha256, log, ignored=manifest_ignored)
+    log.append(manifest_log)
     return ArchContext(
         direction=direction,
         source=(source, DIALECTS[source]),
@@ -177,30 +213,25 @@ def build_arch_context(
         ep=ep,
         pp=pp,
         vpp=vpp,
+        td_content_metadata=content_metadata,
         blocks=blocks,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         dtype_policy=DtypePolicy.PRESERVE,
         manifest=manifest,
         derivations=tuple(log),
+        warnings=tuple(warnings),
     )
 
 
 def _check_manifest(
-    manifest: Manifest | None,
-    source: str,
-    metadata_sha256: str,
-    log: list[Derivation],
-    *,
-    ignored: bool,
-) -> None:
-    """A source's manifest must describe the source store itself."""
+    manifest: Manifest | None, source: str, metadata_sha256: str, *, ignored: bool
+) -> Derivation:
+    """A source's manifest must describe the source store itself; its derivation record."""
     if ignored:
-        log.append(Derivation("manifest", None, f"{MANIFEST_FILE} ignored (--ignore-manifest)"))
-        return
+        return Derivation("manifest", None, f"{MANIFEST_FILE} ignored (--ignore-manifest)")
     if manifest is None:
-        log.append(Derivation("manifest", None, f"the source has no {MANIFEST_FILE}"))
-        return
+        return Derivation("manifest", None, f"the source has no {MANIFEST_FILE}")
     written = manifest.target.get("format")
     if written != source or manifest.output_metadata_sha256 != metadata_sha256:
         raise Refusal(
@@ -211,14 +242,89 @@ def _check_manifest(
             keys=(MANIFEST_FILE,),
             hint="pass --ignore-manifest to convert without restoring what it records",
         ).to_error()
-    log.append(
-        Derivation(
-            "manifest",
-            manifest.source.get("format"),
-            f"{MANIFEST_FILE} of the conversion from {manifest.source.get('iter_dir')} "
-            "(restores its sanitized arguments and content_metadata)",
-        )
+    return Derivation(
+        "manifest",
+        manifest.source.get("format"),
+        f"{MANIFEST_FILE} of the conversion from {manifest.source.get('iter_dir')} "
+        "(restores its sanitized arguments and content_metadata)",
     )
+
+
+def _td_content_metadata(
+    direction: str, manifest: Manifest | None, dropped: bool, log: list[Derivation]
+) -> Mapping[str, Any] | None:
+    """The ``content_metadata`` a torch_dist target gets: what the source's manifest records.
+
+    Raises:
+        IntegrityError: The recorded value is not a mapping.
+    """
+    if direction != FSDP_TO_TD:
+        return None
+    value = None
+    if manifest is None or not manifest.content_metadata["present"]:
+        evidence = f"none recorded (no {MANIFEST_FILE}, or it records none)"
+    elif dropped:
+        evidence = "--drop-common-key content_metadata"
+    else:
+        value = manifest.source_content_metadata
+        evidence = f"restored from the source's {MANIFEST_FILE}"
+        if not isinstance(value, Mapping):
+            raise errors.IntegrityError(
+                f"the source's {MANIFEST_FILE} records a content_metadata that is not a mapping",
+                hint="pass --ignore-manifest to convert without restoring what it records",
+            )
+    log.append(Derivation("td_content_metadata", value, evidence))
+    return value
+
+
+def _check_recorded_layouts(
+    blocks: tuple[BlockLayout, ...], manifest: Manifest | None, requested: Mapping[str, str]
+) -> None:
+    """A torch_dist target gets the block layouts the source's manifest records (FC-A06).
+
+    Blocks named with ``--block-layout`` are exempt.
+    """
+    if manifest is None:
+        return
+    recorded = _recorded_layouts(manifest)
+    for block in blocks:
+        layout = recorded.get(block.prefix)
+        if layout is None or layout == block.td_layout or block.prefix in requested:
+            continue
+        raise Refusal(
+            errors.FC_A06,
+            f"the source's {MANIFEST_FILE} records that torch_dist stored {block.prefix} "
+            f"{layout}, but this conversion would store it {block.td_layout} ({block.evidence})",
+            keys=(MANIFEST_FILE,),
+            hint=_restore_hint(block, layout),
+        ).to_error()
+
+
+def _restore_hint(block: BlockLayout, layout: str) -> str:
+    """How to convert a block whose recorded torch_dist layout is ``layout``."""
+    ignore = "or --ignore-manifest to store it as the arguments build it"
+    if block.kind != TRANSFORMER_BLOCK:
+        return "pass --ignore-manifest to store it as the arguments build it"
+    if layout == PER_LAYER:
+        return (
+            "keep the content_metadata the manifest records (no --drop-common-key "
+            f"content_metadata) if it makes Megatron load {block.prefix} per layer, {ignore}"
+        )
+    return (
+        f"pass --block-layout {block.prefix}={layout} if the job that loads the store builds "
+        f"{block.prefix} {layout}, {ignore}"
+    )
+
+
+def _recorded_layouts(manifest: Manifest) -> dict[str, str]:
+    """The torch_dist layout of each block, by prefix, as the manifest's derivations record."""
+    layouts = {}
+    for derivation in manifest.derivations:
+        name, value = derivation.get("field"), derivation.get("value")
+        if isinstance(name, str) and name.startswith(BLOCK_FIELD) and isinstance(value, Mapping):
+            if isinstance(value.get("td_layout"), str):
+                layouts[name[len(BLOCK_FIELD) :]] = value["td_layout"]
+    return layouts
 
 
 def _block_summary(block: BlockLayout) -> dict[str, Any]:

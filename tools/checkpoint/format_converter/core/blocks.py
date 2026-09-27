@@ -33,24 +33,20 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .. import errors
 from ..engine.metadata import TensorEntry
-from ..errors import InternalError, Refusal
+from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
 from .hybrid_pattern import hybrid_pattern_of
 from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, split_layer_key
-from .names import FSDP_DTENSOR, TORCH_DIST
+from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
 from .registry import REGISTRY
 
 HYBRID_STACK = "hybrid_stack"
 TRANSFORMER_BLOCK = "transformer_block"
-PER_LAYER = "per_layer"
-STACKED = "stacked"
-TD_LAYOUTS = (STACKED, PER_LAYER)
-"""How torch_dist stores a block's layers."""
 
 LM_DECODER = "decoder"
 """Prefix of a single-root model's language-model decoder."""
@@ -198,11 +194,17 @@ class BlockFacts:
         args: The checkpoint's training arguments.
         source: The source format.
         model: The source's model tensors by model-relative key.
+        content_metadata: The ``content_metadata`` a torch_dist target gets
+            (fsdp_dtensor sources; ``None`` when it gets none).
+        layouts: How torch_dist stores a block, by prefix, as requested with
+            ``--block-layout`` (fsdp_dtensor sources).
     """
 
     args: ArgsView
     source: str
     model: Mapping[str, TensorEntry]
+    content_metadata: Mapping[str, Any] | None = None
+    layouts: Mapping[str, str] = field(default_factory=dict)
 
     @functools.cached_property
     def census(self) -> dict[str, BlockCensus]:
@@ -260,6 +262,9 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
         RefusedError: A block's stored layer indices or ``args.num_layers``
             disagree with its layout (FC-R11), or its stacking is
             inconsistent (FC-R12).
+        AmbiguousError: A block's torch_dist layout cannot be decided (FC-A02).
+        UsageError: ``facts.layouts`` names a block that is not a
+            ``TransformerBlock`` of the model.
         InternalError: Two classifiers claim one block.
     """
     blocks = [block for classifier in REGISTRY.classifiers.values() for block in classifier(facts)]
@@ -269,11 +274,24 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
     blocks.extend(
         default(facts, census) for prefix, census in facts.census.items() if prefix not in known
     )
+    _check_requested_layouts(blocks, facts.layouts)
     for block in blocks:
         _check_num_layers(block, facts.args)
         if facts.source == FSDP_DTENSOR or not block.stacked:
             _check_stored_indices(block, facts.model, facts.source)
     return tuple(sorted(blocks, key=lambda block: block.prefix))
+
+
+def _check_requested_layouts(blocks: list[BlockLayout], layouts: Mapping[str, str]) -> None:
+    """``--block-layout`` may only name the model's TransformerBlocks."""
+    kinds = {block.prefix: block.kind for block in blocks}
+    for prefix in sorted(layouts):
+        if kinds.get(prefix) != TRANSFORMER_BLOCK:
+            what = f"a {kinds[prefix]} block" if prefix in kinds else "no layer list of this model"
+            raise UsageError(
+                f"--block-layout {prefix}={layouts[prefix]}: {prefix} is {what}",
+                hint="name TransformerBlock layer lists (the blocks plan lists)",
+            )
 
 
 def _check_num_layers(block: BlockLayout, args: ArgsView) -> None:

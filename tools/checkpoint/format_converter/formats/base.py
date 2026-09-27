@@ -25,6 +25,7 @@ from ..errors import IntegrityError, InternalError
 if TYPE_CHECKING:
     import torch
 
+    from ..core.logical import OutputSlice
     from ..engine.metadata import MetadataView, TensorEntry
     from ..engine.reader import SourceReader
     from ..engine.regions import Region
@@ -156,9 +157,9 @@ class FormatAdapter(Protocol):
         """``Metadata.planner_data`` entry of an output model key (``None``: not recorded)."""
 
     def output_grid(
-        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+        self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
     ) -> tuple[Region, ...]:
-        """The chunk grid a converted model tensor is written with."""
+        """The chunks the box ``placed.region`` of a converted model tensor is written as."""
 
     def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
         """The undecoded common state of ``reader``'s store, if it has one."""

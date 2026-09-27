@@ -36,6 +36,7 @@ import torch
 
 from .. import errors
 from ..core.keys import EXTRA_STATE
+from ..core.logical import OutputSlice
 from ..core.names import DIALECTS, FSDP_DTENSOR, FSDP_MODEL_PREFIX, FSDP_OPTIMIZER_STATE
 from ..engine.metadata import MetadataView
 from ..engine.reader import SourceReader
@@ -160,19 +161,20 @@ class FsdpMfsdpV1Adapter:
         return (MODEL_SECTION, key[len(MODEL_SECTION) + 1 :])
 
     def output_grid(
-        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+        self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
     ) -> tuple[Region, ...]:
-        """One chunk per tensor, split along dimension 0 into chunks of at most ``max_chunk_bytes``.
+        """The box split along dimension 0 into chunks of at most ``max_chunk_bytes``.
 
-        A single row larger than ``max_chunk_bytes`` is a chunk of its own.
-        Megatron-FSDP reads any chunk grid.
+        fsdp_dtensor tensors are never stacked, so the box is the whole
+        tensor. A single row larger than ``max_chunk_bytes`` is a chunk of its
+        own. Megatron-FSDP reads any chunk grid.
         """
-        full = Region.full(shape)
-        if not shape or shape[0] == 0:
-            return (full,)
-        row_bytes = full.numel() // shape[0] * dtype.itemsize
+        box = placed.region
+        if not box.sizes or box.sizes[0] == 0:
+            return (box,)
+        row_bytes = box.numel() // box.sizes[0] * dtype.itemsize
         rows = max(1, max_chunk_bytes // max(row_bytes, 1))
-        return tuple(full.split_dim0(rows))
+        return tuple(box.split_dim0(rows))
 
     def marker_files(self) -> dict[str, bytes]:
         """No marker files: a ``metadata.json`` would make Megatron read the store as torch_dist."""

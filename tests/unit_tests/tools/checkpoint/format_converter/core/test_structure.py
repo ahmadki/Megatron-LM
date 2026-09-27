@@ -9,7 +9,7 @@ import torch
 
 from tools.checkpoint.format_converter.core.blocks import BlockLayout
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
-from tools.checkpoint.format_converter.core.logical import LogicalId, LogicalSlice
+from tools.checkpoint.format_converter.core.logical import LogicalId, LogicalSlice, OutputSlice
 from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
 from tools.checkpoint.format_converter.core.structure import compose, decompose
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
@@ -50,14 +50,16 @@ def decompose_one(key: str, blocks, fmt: str) -> LogicalId:
 @pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
 def test_round_trip(key, lid, fmt):
     assert decompose_one(key, [HYBRID], fmt) == lid
-    assert compose(lid, [HYBRID], fmt) == key
+    assert compose(lid, (4,), [HYBRID], fmt) == OutputSlice(key, (4,), Region.full((4,)))
 
 
 def test_formats_number_the_layers_of_a_block_independently():
     lid = decompose_one("decoder.layers.3.mlp.linear_fc1.weight", [SPARSE], TORCH_DIST)
     assert lid == LogicalId("decoder", 2, "mlp.linear_fc1", "weight")
-    assert compose(lid, [SPARSE], FSDP_DTENSOR) == "decoder.layers.2.mlp.linear_fc1.weight"
-    assert compose(lid, [SPARSE], TORCH_DIST) == "decoder.layers.3.mlp.linear_fc1.weight"
+    assert (
+        compose(lid, (4,), [SPARSE], FSDP_DTENSOR).key == "decoder.layers.2.mlp.linear_fc1.weight"
+    )
+    assert compose(lid, (4,), [SPARSE], TORCH_DIST).key == "decoder.layers.3.mlp.linear_fc1.weight"
 
 
 def test_the_longest_block_prefix_wins():
@@ -92,10 +94,10 @@ def test_blocks_of_other_namespaces_keep_their_own_numbering():
         ),
     ]:
         assert decompose_one(key, blocks, TORCH_DIST) == lid
-        assert compose(lid, blocks, TORCH_DIST) == key
+        assert compose(lid, (4,), blocks, TORCH_DIST).key == key
     dense = LogicalId("language_model.decoder", 2, "mlp.linear_fc1", "weight")
     expected = "language_model.decoder.layers.2.mlp.linear_fc1.weight"
-    assert compose(dense, blocks, FSDP_DTENSOR) == expected
+    assert compose(dense, (4,), blocks, FSDP_DTENSOR).key == expected
 
 
 @pytest.mark.parametrize(
@@ -149,9 +151,35 @@ def test_a_stacked_block_is_one_layer_per_key_in_fsdp_dtensor():
     key = "decoder.layers.2.mlp.linear_fc1.weight"
     lid = decompose_one(key, [STACKED], FSDP_DTENSOR)
     assert lid == LogicalId("decoder", 2, "mlp.linear_fc1", "weight")
-    assert compose(lid, [STACKED], FSDP_DTENSOR) == key
+    assert compose(lid, (8, 4), [STACKED], FSDP_DTENSOR) == OutputSlice(
+        key, (8, 4), Region.full((8, 4))
+    )
+
+
+def test_a_layer_of_a_stacked_block_is_placed_in_its_stacked_tensor():
+    lid = LogicalId("decoder", 2, "mlp.linear_fc1", "weight")
+    placed = compose(lid, (8, 4), [STACKED], TORCH_DIST)
+    assert placed == OutputSlice(
+        "decoder.layers.mlp.linear_fc1.weight", (3, 8, 4), Region((2, 0, 0), (1, 8, 4)), 1
+    )
+    assert placed.shape == (8, 4)
+    assert placed.logical_box(Region((2, 4, 0), (1, 4, 4))) == Region((4, 0), (4, 4))
+    scalar = compose(LogicalId("decoder", 0, "", "scale"), (), [STACKED], TORCH_DIST)
+    assert (scalar.key, scalar.global_shape, scalar.region) == (
+        "decoder.layers.scale",
+        (3,),
+        Region((0,), (1,)),
+    )
+    (piece,) = [
+        s
+        for s in decompose(
+            placed.key, TensorEntry(placed.key, (3, 8, 4), torch.float32, ()), [STACKED], TORCH_DIST
+        )
+        if s.lid == lid
+    ]
+    assert piece.region == placed.region  # decompose is the inverse
 
 
 def test_composing_an_unknown_block_is_a_bug():
     with pytest.raises(InternalError):
-        compose(LogicalId("encoder", 0, "x", "weight"), [HYBRID], TORCH_DIST)
+        compose(LogicalId("encoder", 0, "x", "weight"), (4,), [HYBRID], TORCH_DIST)

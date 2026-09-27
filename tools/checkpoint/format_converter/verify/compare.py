@@ -31,6 +31,7 @@ from typing import TypeVar
 
 import torch
 
+from ..core.keys import KeyGrammarError, innermost_layer_key
 from ..engine.metadata import TensorEntry
 from ..engine.reader import ReadReq, ReadStats, SourceReader
 from ..engine.regions import Region, bounding_box
@@ -292,18 +293,36 @@ def castable(a: torch.dtype, b: torch.dtype, cast: str) -> bool:
 
 
 def _coarsening_findings(key: str, a_grid: list[Region], b_grid: list[Region]) -> list[Finding]:
-    """A finding unless every chunk of A is exactly tiled by chunks of B."""
+    """A finding unless every chunk of A is exactly tiled by chunks of B.
+
+    A tensor stacked over the layers of a layer list (a key without a layer
+    index) keeps B's chunk boundaries along its first (layer) axis: Megatron
+    saves each layer as its own chunk, and A may merge B's chunks along the
+    other axes only.
+    """
+    stacked = _stacked_over_layers(key)
     for i, j in _overlapping_pairs(a_grid, b_grid):
-        if not a_grid[i].contains(b_grid[j]):
-            return [
-                Finding(
-                    FindingKind.LAYOUT,
-                    key,
-                    f"A's chunk {a_grid[i]} cuts B's chunk {b_grid[j]} (A's grid must merge "
-                    "whole chunks of B)",
-                )
-            ]
+        a, b = a_grid[i], b_grid[j]
+        if not a.contains(b):
+            detail = f"A's chunk {a} cuts B's chunk {b} (A's grid must merge whole chunks of B)"
+        elif stacked and a.ndim and (a.offsets[0], a.sizes[0]) != (b.offsets[0], b.sizes[0]):
+            detail = (
+                f"A's chunk {a} merges B's chunk {b} with other layers (a tensor stacked over "
+                "layers keeps B's chunks along its layer axis)"
+            )
+        else:
+            continue
+        return [Finding(FindingKind.LAYOUT, key, detail)]
     return []
+
+
+def _stacked_over_layers(key: str) -> bool:
+    """Whether ``key`` names a tensor stacked over the layers of a layer list."""
+    try:
+        layer_key = innermost_layer_key(key)
+    except KeyGrammarError:
+        return False
+    return layer_key is not None and layer_key.index is None
 
 
 def _check_unit_budget(unit: CompareUnit, max_item_bytes: int) -> None:

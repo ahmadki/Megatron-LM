@@ -1,6 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""TransformerBlock layouts observed in torch_dist stores, checked against hand-built keys."""
+"""TransformerBlock layouts: observed in torch_dist stores and decided for fsdp_dtensor ones.
+
+Every case is a hand-built key set; the expected layouts follow Megatron's
+``TransformerBlock.sharded_state_dict`` (the parity pin in
+``parity/test_parity_megatron.py`` checks the predicate against it).
+"""
 
 from __future__ import annotations
 
@@ -12,10 +17,16 @@ import torch
 from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.blocks import BlockFacts, BlockLayout, classify_blocks
-from tools.checkpoint.format_converter.core.names import TORCH_DIST
-from tools.checkpoint.format_converter.core.stacking import transformer_block
+from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
+from tools.checkpoint.format_converter.core.stacking import (
+    per_layer_reasons,
+    requested_layout_warnings,
+    transformer_block,
+)
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
-from tools.checkpoint.format_converter.errors import RefusedError
+from tools.checkpoint.format_converter.errors import AmbiguousError, RefusedError, UsageError
+
+from .test_refusals import codes, facts
 
 H = 4
 
@@ -43,16 +54,32 @@ def per_layer_gpt(indices, prefix: str = "decoder") -> dict[str, tuple[int, ...]
     return shapes
 
 
-def classify(shapes, **args) -> tuple[BlockLayout, ...]:
-    facts = BlockFacts(ArgsView(argparse.Namespace(**args)), TORCH_DIST, _model(shapes))
+def classify(
+    shapes, *, source=TORCH_DIST, content_metadata=None, layouts=None, **args
+) -> tuple[BlockLayout, ...]:
+    facts = BlockFacts(
+        ArgsView(argparse.Namespace(**args)),
+        source,
+        _model(shapes),
+        content_metadata,
+        dict(layouts or {}),
+    )
     return classify_blocks(facts, default=transformer_block)
 
 
-def refusal(shapes, **args):
+def refusal(shapes, **kwargs):
     with pytest.raises(RefusedError) as excinfo:
-        classify(shapes, **args)
+        classify(shapes, **kwargs)
     assert excinfo.value.refusal.code == errors.FC_R12
     return excinfo.value.refusal
+
+
+def decided(shapes=None, **kwargs) -> BlockLayout:
+    """The one block of an fsdp_dtensor store of the GPT decoder (3 layers by default)."""
+    (block,) = classify(
+        per_layer_gpt(range(3)) if shapes is None else shapes, source=FSDP_DTENSOR, **kwargs
+    )
+    return block
 
 
 def test_a_stacked_decoder_is_observed_with_its_layer_count():
@@ -114,3 +141,152 @@ def test_per_layer_indices_must_be_contiguous_from_zero(indices, message):
 def test_the_decoder_has_num_layers_layers(shapes):
     found = refusal(shapes, num_layers=4)
     assert found.message == "args.num_layers=4 but the store holds 3 layers of decoder"
+
+
+def test_the_decoder_of_an_fsdp_store_is_stacked_when_megatron_stacks_it():
+    block = decided(num_layers=3, moe_layer_freq=1, linear_attention_freq=None)
+    assert (block.td_layout, block.num_modules, block.dense_to_td) == ("stacked", 3, (0, 1, 2))
+    assert block.evidence == "Megatron stacks it (no per-layer setting) and its layers are alike"
+
+
+@pytest.mark.parametrize(
+    ("content_metadata", "args", "reason"),
+    [
+        ({"non_homogeneous_layers": True}, {}, "content_metadata.non_homogeneous_layers=True"),
+        ({"singleton_local_shards": True}, {}, "content_metadata.singleton_local_shards=True"),
+        (None, {"moe_layer_freq": 2}, "args.moe_layer_freq=2"),
+        (None, {"moe_layer_freq": [1, 0, 1]}, "args.moe_layer_freq=[1, 0, 1]"),
+        (None, {"linear_attention_freq": 4}, "args.linear_attention_freq=4"),
+        (None, {"linear_attention_freq": [0, 1, 1]}, "args.linear_attention_freq=[0, 1, 1]"),
+    ],
+)
+def test_the_decoder_is_per_layer_when_megatron_builds_it_per_layer(content_metadata, args, reason):
+    block = decided(content_metadata=content_metadata, **args)
+    assert block.td_layout == "per_layer"
+    assert block.evidence == f"Megatron builds it per layer ({reason})"
+
+
+@pytest.mark.parametrize(
+    ("content_metadata", "args"),
+    [
+        ({"non_homogeneous_layers": False, "singleton_local_shards": False}, {}),
+        (None, {"moe_layer_freq": 1, "linear_attention_freq": 1}),
+    ],
+)
+def test_settings_that_keep_the_decoder_stacked(content_metadata, args):
+    assert decided(content_metadata=content_metadata, **args).td_layout == "stacked"
+    assert per_layer_reasons(ArgsView(argparse.Namespace(**args)), content_metadata) == []
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"heterogeneous_layers_config_path": "layers.json"}, errors.FC_R03),
+        ({"heterogeneous_layers_config_encoded_json": "{}"}, errors.FC_R03),
+        ({"experimental_attention_variant": "dsv4_hybrid"}, errors.FC_R20),
+    ],
+)
+def test_the_arguments_behind_megatrons_configuration_only_flags_are_refused(args, code):
+    """Megatron builds a block per layer for ``heterogeneous_block_specs`` (set by a
+    heterogeneous layers configuration) and ``hetereogenous_dist_checkpoint`` (set for
+    ``dsv4_hybrid`` attention), which :func:`per_layer_reasons` does not read: the refusal
+    fence must keep these models out (lifting either code needs them in the predicate)."""
+    assert per_layer_reasons(ArgsView(argparse.Namespace(**args)), None) == []
+    assert code in codes(facts(args=args))
+
+
+def test_layers_that_differ_are_not_stacked_silently():
+    shapes = per_layer_gpt(range(3))
+    shapes["decoder.layers.2.self_attention.linear_qkv.weight"] = (2 * H, H)
+    found = refusal(shapes, source=FSDP_DTENSOR)
+    assert found.message == (
+        "the arguments make Megatron stack decoder, but its layers differ: "
+        "self_attention.linear_qkv.weight is [12, 4] torch.bfloat16 in layer 0 and "
+        "[8, 4] torch.bfloat16 in layer 2"
+    )
+    del shapes["decoder.layers.2.self_attention.linear_qkv.weight"]
+    assert "layer 0 has self_attention.linear_qkv.weight, layer 2 does not" in (
+        refusal(shapes, source=FSDP_DTENSOR).message
+    )
+    per_layer = {"non_homogeneous_layers": True}
+    assert decided(shapes, content_metadata=per_layer).td_layout == "per_layer"
+
+
+def test_block_layout_overrides_the_decision():
+    block = decided(layouts={"decoder": "per_layer"})
+    assert (block.td_layout, block.evidence) == ("per_layer", "--block-layout decoder=per_layer")
+    stacked = decided(
+        content_metadata={"non_homogeneous_layers": True}, layouts={"decoder": "stacked"}
+    )
+    assert stacked.td_layout == "stacked"
+    shapes = per_layer_gpt(range(3))
+    del shapes["decoder.layers.1.mlp.linear_fc2.weight"]
+    found = refusal(shapes, source=FSDP_DTENSOR, layouts={"decoder": "stacked"})
+    assert found.message.startswith(
+        "--block-layout decoder=stacked cannot stack layers that differ"
+    )
+    assert found.hint == "pass --block-layout decoder=per_layer"
+
+
+def warnings_of(shapes=None, *, content_metadata=None, layouts=None, **args) -> list[str]:
+    facts_ = BlockFacts(
+        ArgsView(argparse.Namespace(**args)),
+        FSDP_DTENSOR,
+        _model(per_layer_gpt(range(3)) if shapes is None else shapes),
+        content_metadata,
+        dict(layouts or {}),
+    )
+    return requested_layout_warnings(facts_, classify_blocks(facts_, default=transformer_block))
+
+
+def test_a_block_layout_megatron_does_not_build_is_warned_about():
+    assert warnings_of(layouts={"decoder": "per_layer"}) == [
+        "--block-layout decoder=per_layer: a job built from these arguments and this "
+        "content_metadata builds decoder stacked (no per-layer setting), so it cannot load "
+        "this store strictly"
+    ]
+    (warning,) = warnings_of(layouts={"decoder": "stacked"}, moe_layer_freq=2)
+    assert warning.startswith("--block-layout decoder=stacked: ")
+    assert "builds decoder per_layer (args.moe_layer_freq=2)" in warning
+    assert warnings_of() == []
+    assert warnings_of(layouts={"decoder": "stacked"}) == []
+    per_layer = {"non_homogeneous_layers": True}
+    assert warnings_of(layouts={"decoder": "per_layer"}, content_metadata=per_layer) == []
+    shapes = {**per_layer_gpt(range(3)), **per_layer_gpt(range(2), prefix="encoder")}
+    assert warnings_of(shapes, layouts={"encoder": "per_layer"}) == []  # its kind is unknown
+
+
+def test_a_layer_list_of_unknown_kind_needs_a_layout():
+    shapes = {**per_layer_gpt(range(3)), **per_layer_gpt(range(2), prefix="encoder")}
+    with pytest.raises(AmbiguousError) as excinfo:
+        classify(shapes, source=FSDP_DTENSOR)
+    assert excinfo.value.refusal.code == errors.FC_A02
+    assert "--block-layout encoder=stacked" in excinfo.value.refusal.hint
+    blocks = classify(shapes, source=FSDP_DTENSOR, layouts={"encoder": "per_layer"})
+    assert [(b.prefix, b.td_layout) for b in blocks] == [
+        ("decoder", "stacked"),
+        ("encoder", "per_layer"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("layouts", "message"),
+    [
+        ({"decoder.layers.0": "stacked"}, "no layer list of this model"),
+        ({"decoder": "stacked"}, "a hybrid_stack block"),
+    ],
+)
+def test_block_layout_names_transformer_blocks_only(layouts, message):
+    hybrid = {"hybrid_layer_pattern": "*-*"} if "hybrid" in message else {}
+    with pytest.raises(UsageError, match=message):
+        classify(per_layer_gpt(range(3)), source=FSDP_DTENSOR, layouts=layouts, **hybrid)
+
+
+def test_an_fsdp_store_holds_one_layer_per_key():
+    found = refusal(stacked_gpt(), source=FSDP_DTENSOR)
+    assert found.message.startswith("decoder: fsdp_dtensor stores one key per layer")
+    assert "not 0-1" in refusal(per_layer_gpt((0, 2)), source=FSDP_DTENSOR).message
+    assert (
+        "args.num_layers=2"
+        in refusal(per_layer_gpt(range(3)), source=FSDP_DTENSOR, num_layers=2).message
+    )

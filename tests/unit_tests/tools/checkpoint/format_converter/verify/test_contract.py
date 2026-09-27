@@ -20,6 +20,7 @@ from tools.checkpoint.format_converter.verify.report import FindingKind
 from .._synthetic import (
     dim0_grid,
     hybrid_args,
+    product_grid,
     torch_save_bytes,
     write_fsdp_store,
     write_torch_dist_store,
@@ -123,6 +124,26 @@ def test_contract_d_accepts_merged_tensor_parallel_splits_only(tmp_path):
     assert finding.kind is FindingKind.LAYOUT and "cuts B's chunk" in finding.detail
     wider = _td(tmp_path / "wider", dim0_grid((12, 4), 12), dtype=torch.float32)
     assert _kinds(_verify(wider, source, "D")) == [("dtype", W)]
+
+
+def test_contract_d_keeps_one_chunk_per_layer_of_a_stacked_tensor(tmp_path):
+    """Megatron saves each layer of a tensor stacked over layers as its own chunk (split by
+    tensor parallelism): a round trip may merge the splits of a layer, never layers."""
+    stacked = "decoder.layers.self_attention.linear_qkv.weight"
+    tensor = torch.arange(96, dtype=torch.float32).reshape(3, 8, 4).to(torch.bfloat16)
+
+    def store(name, grid):
+        return write_torch_dist_store(tmp_path / name, {stacked: tensor}, grids={stacked: grid})
+
+    source = store("source", product_grid((3, 8, 4), [[1, 2], [4], []]))
+    assert _verify(store("per_layer", dim0_grid((3, 8, 4), 1)), source, "D").ok
+    (finding,) = _verify(store("whole", dim0_grid((3, 8, 4), 3)), source, "D").findings
+    assert finding.kind is FindingKind.LAYOUT and finding.key == stacked
+    assert "merges B's chunk" in finding.detail and "with other layers" in finding.detail
+    pairs = store("pairs", product_grid((3, 8, 4), [[2], [], []]))
+    assert _kinds(_verify(pairs, source, "D")) == [("layout", stacked)]
+    whole_source = store("whole_source", dim0_grid((3, 8, 4), 3))  # a single chunk stays one
+    assert _verify(store("whole_again", dim0_grid((3, 8, 4), 3)), whole_source, "D").ok
 
 
 def test_contract_d_allows_only_the_weights_only_flags(tmp_path):

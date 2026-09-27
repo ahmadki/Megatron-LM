@@ -100,6 +100,13 @@ def _size(text: str) -> int:
         raise argparse.ArgumentTypeError(str(err)) from err
 
 
+def _block_layout(text: str) -> tuple[str, str]:
+    prefix, equals, layout = text.rpartition("=")
+    if not equals:
+        raise argparse.ArgumentTypeError(f"expected PREFIX=LAYOUT, got {text!r}")
+    return prefix, layout
+
+
 def _mode(text: str) -> Any:
     from .options import CompareMode  # pylint: disable=import-outside-toplevel
 
@@ -340,6 +347,16 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "conversion_manifest.json records",
     )
     parser.add_argument(
+        "--block-layout",
+        type=_block_layout,
+        action="append",
+        default=[],
+        metavar="PREFIX=LAYOUT",
+        help="fsdp_dtensor to torch_dist: store the TransformerBlock layer list PREFIX stacked "
+        "or per_layer instead of deciding it from the arguments (repeatable); content_metadata "
+        "is unchanged, so the job that loads the store must build PREFIX that way",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         metavar="N",
@@ -384,6 +401,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "allow_roots": tuple(args.allow_root),
         "allow_missing_fp8_extra_state": args.allow_missing_fp8_extra_state,
         "ignore_manifest": args.ignore_manifest,
+        "block_layouts": tuple(args.block_layout),
     }
     for name in (
         "workers",

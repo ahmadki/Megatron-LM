@@ -230,6 +230,10 @@ def _replay(source: Store, converted: Store, opts: VerifyOptions) -> VerifyRepor
     return replay_conversion(source, converted, pieces, byte_keys, opts)
 
 
+def _pairs(mapping: dict[str, str]) -> tuple[tuple[str, str], ...]:
+    return tuple(mapping.items())
+
+
 _REPLAYED_OPTIONS = {
     "drop_common_keys": frozenset,
     "unit_bytes": int,
@@ -238,8 +242,9 @@ _REPLAYED_OPTIONS = {
     "max_output_chunk_bytes": int,
     "allow_missing_fp8_extra_state": bool,
     "ignore_manifest": bool,
+    "block_layouts": _pairs,
 }
-"""Options a conversion manifest records that shape the replayed plan, and their types."""
+"""Options a conversion manifest records that shape the replayed plan, and their parsers."""
 
 
 def _replay_options(converted: Store) -> PlanOptions:

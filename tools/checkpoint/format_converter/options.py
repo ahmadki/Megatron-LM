@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .core.names import FORMATS, TORCH_DIST
+from .core.names import FORMATS, TD_LAYOUTS, TORCH_DIST
 from .engine.memory import available_memory_bytes
 from .errors import UsageError
 from .verify.contract import CONTRACTS
@@ -242,6 +242,9 @@ class PlanOptions:
         allow_missing_fp8_extra_state: Write a torch_dist store for an FP8
             delayed-scaling model without its scaling state.
         ignore_manifest: Do not restore what the source's conversion manifest records.
+        block_layouts: ``(prefix, layout)`` pairs, sorted: how a torch_dist
+            target stores the block with that prefix (``stacked`` or
+            ``per_layer``; fsdp_dtensor sources).
     """
 
     to_format: str = TORCH_DIST
@@ -258,10 +261,12 @@ class PlanOptions:
     max_output_chunk_bytes: int = DEFAULT_MAX_OUTPUT_CHUNK_BYTES
     allow_missing_fp8_extra_state: bool = False
     ignore_manifest: bool = False
+    block_layouts: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
             raise UsageError(f"--to must be one of {', '.join(FORMATS)}, got {self.to_format!r}")
+        object.__setattr__(self, "block_layouts", _block_layouts(self.block_layouts))
         if self.optimizer not in OPTIMIZER_CHOICES:
             raise UsageError(f"--optimizer must be one of {', '.join(OPTIMIZER_CHOICES)}")
         roots = tuple(sorted({root.rstrip(".") for root in self.allow_roots}))
@@ -303,7 +308,28 @@ class PlanOptions:
             "max_output_chunk_bytes": self.max_output_chunk_bytes,
             "allow_missing_fp8_extra_state": self.allow_missing_fp8_extra_state,
             "ignore_manifest": self.ignore_manifest,
+            "block_layouts": dict(self.block_layouts),
         }
+
+
+def _block_layouts(pairs: Sequence[tuple[str, str]]) -> tuple[tuple[str, str], ...]:
+    """``--block-layout`` pairs with trailing dots stripped from the prefixes, sorted.
+
+    Raises:
+        UsageError: A layout is unknown, a prefix is empty, or one prefix is
+            given two layouts.
+    """
+    layouts: dict[str, str] = {}
+    for prefix, layout in pairs:
+        prefix = prefix.rstrip(".")
+        if not prefix or layout not in TD_LAYOUTS:
+            raise UsageError(
+                f"--block-layout {prefix}={layout}: expected PREFIX=LAYOUT with LAYOUT one of "
+                f"{', '.join(TD_LAYOUTS)}"
+            )
+        if layouts.setdefault(prefix, layout) != layout:
+            raise UsageError(f"--block-layout gives {prefix} two layouts")
+    return tuple(sorted(layouts.items()))
 
 
 @dataclass(frozen=True, slots=True)

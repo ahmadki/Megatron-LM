@@ -170,6 +170,22 @@ def test_layer_copies_of_a_stacked_tensor_are_split_and_run(tmp_path):
     assert torch.equal(buffer, stacked[1])
 
 
+def test_a_layer_chunk_of_a_stacked_tensor_is_split_after_its_unit_axis(view):
+    """A chunk [l:l+1, ...] reading several items is cut along its second axis."""
+    ops = tuple(
+        CopyOp(c, c.region, Region((0, *c.offsets), (1, *c.sizes)))
+        for c in view.tensors["w"].chunks
+    )
+    piece = Piece("stacked", (3, 8, 4), torch.float32, Region((1, 0, 0), (1, 8, 4)), ops)
+    slabs = split_piece(piece, 64)
+    assert [s.chunk for s in slabs] == [Region((1, 0, 0), (1, 4, 4)), Region((1, 4, 0), (1, 4, 4))]
+    assert [(op.src_region, op.dst_region) for op in slabs[1].ops] == [
+        (Region((rows, 0), (2, 4)), Region((0, r, 0), (1, 2, 4))) for r, rows in ((0, 4), (2, 6))
+    ]
+    with pytest.raises(BudgetExceeded, match=r"one row of stacked .* is 16 B"):
+        split_piece(piece, 8)
+
+
 def test_piece_reading_one_item_is_never_split(view):
     (big,) = copy_pieces(view.tensors["big"])
     assert split_piece(big, 64) == (big,)

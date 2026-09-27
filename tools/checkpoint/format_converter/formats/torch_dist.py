@@ -37,6 +37,7 @@ import torch
 
 from .. import errors
 from ..core.keys import EXTRA_STATE
+from ..core.logical import OutputSlice
 from ..core.names import DIALECTS, TORCH_DIST
 from ..engine.metadata import MetadataView
 from ..engine.reader import SourceReader
@@ -115,15 +116,16 @@ class TorchDistAdapter:
         del key
 
     def output_grid(
-        self, shape: tuple[int, ...], dtype: torch.dtype, *, max_chunk_bytes: int
+        self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
     ) -> tuple[Region, ...]:
-        """One chunk per converted tensor; Megatron's loader reads any chunk grid.
+        """One chunk per output: a whole tensor, or one layer of a stacked tensor.
 
-        Pieces larger than half the unit budget are split along dimension 0 by
+        This is the grid Megatron saves stacked layers with (its loader reads
+        any grid). Pieces larger than half the unit budget are split further by
         the scheduler; ``max_chunk_bytes`` only applies to fsdp_dtensor.
         """
         del dtype, max_chunk_bytes
-        return (Region.full(shape),)
+        return (placed.region,)
 
     def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
         """The common state: ``common.pt`` if the store has one (as Megatron reads it), else

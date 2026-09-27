@@ -278,14 +278,24 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
 
     Raises:
         UsageError: The conversion is not supported (fsdp_dtensor to
-            fsdp_dtensor, or ``--optimizer convert`` in a rewrite).
-        RefusedError: A refusal (FC-R, FC-P; FC-E01 unless ``dry_run``).
-        AmbiguousError: The source holds another store's manifest (FC-A06).
+            fsdp_dtensor, or ``--optimizer convert`` in a rewrite), or
+            ``--block-layout`` is given without an fsdp_dtensor source and a
+            torch_dist target.
+        RefusedError: A refusal (FC-R, FC-P; FC-E01 unless ``dry_run``),
+            including layer lists the layouts cannot explain (FC-R11, FC-R12).
+        AmbiguousError: The source holds another store's manifest, or one
+            that records another layout of a block (FC-A06), or a block's
+            torch_dist layout cannot be decided (FC-A02).
         IntegrityError: The store is unreadable or has no common state.
         BudgetExceeded: A unit or the whole conversion exceeds its memory budget.
     """
     store = open_store(src, iteration=opts.iteration)
     detection = detect_format(store, from_format=opts.from_format)
+    if opts.block_layouts and (detection.fmt, opts.to_format) != (FSDP_DTENSOR, TORCH_DIST):
+        raise UsageError(
+            "--block-layout decides how torch_dist stores the blocks of an fsdp_dtensor source",
+            hint="drop --block-layout: a torch_dist source's layout is kept",
+        )
     if detection.fmt == opts.to_format == TORCH_DIST:
         if opts.optimizer != "drop":
             raise UsageError(
@@ -377,8 +387,12 @@ def _plan_cross_format(
         manifest=None if opts.ignore_manifest else _source_manifest(store, source.fmt),
         metadata_sha256=view.metadata_sha256,
         manifest_ignored=opts.ignore_manifest,
+        block_layouts=dict(opts.block_layouts),
+        drop_content_metadata=CONTENT_METADATA in opts.drop_common_keys,
     )
     _warn_lost_fp8_state(ctx, sections)
+    for warning in ctx.warnings:
+        _LOGGER.warning("%s", warning)
     model_plan = plan_model(
         ctx,
         model,
@@ -470,8 +484,9 @@ def _cross_format_common(
     torch_dist to fsdp_dtensor keeps what a weights-only rewrite keeps and fsdp
     stores (``content_metadata`` goes to the manifest), and every item the
     fsdp_dtensor loader requires must be there; fsdp_dtensor to torch_dist
-    keeps its items and restores ``content_metadata`` from the source's
-    manifest. ``--drop-common-key`` applies in both directions.
+    keeps its items and gets the context's ``content_metadata`` (restored
+    from the source's manifest). ``--drop-common-key`` applies in both
+    directions.
 
     Raises:
         UsageError: ``--drop-common-key`` names a key the loader requires.
@@ -494,12 +509,10 @@ def _cross_format_common(
         dropped = tuple(sorted(set(common) - set(kept)))
         return kept, dropped, _content_metadata_record(rewrite.kept)
     kept, dropped = dict(rewrite.kept), set(rewrite.dropped)
-    manifest = ctx.manifest
-    if manifest is not None and manifest.content_metadata["present"]:
-        if CONTENT_METADATA in opts.drop_common_keys:
-            dropped.add(CONTENT_METADATA)
-        else:
-            kept[CONTENT_METADATA] = manifest.source_content_metadata
+    if ctx.td_content_metadata is not None:
+        kept[CONTENT_METADATA] = dict(ctx.td_content_metadata)
+    elif ctx.manifest is not None and ctx.manifest.content_metadata["present"]:
+        dropped.add(CONTENT_METADATA)  # --drop-common-key content_metadata
     return kept, tuple(sorted(dropped)), {"present": False}
 
 

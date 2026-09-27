@@ -20,7 +20,8 @@ reported as expected, not as a finding; anything else is a finding (exit 5).
   sets them), and the source's rerun state may be absent in A (Megatron's
   default ``--rerun-mode validate_results`` writes it into model-only saves
   too); A's chunk grid must be a coarsening of B's (tensor-parallel splits
-  merged).
+  merged) that keeps B's boundaries along the layer axis of a tensor stacked
+  over layers (one chunk per layer).
 * ``E``: fsdp_dtensor -> torch_dist -> fsdp_dtensor vs its source. Dropped
   state may be absent in A; any chunk grid; the sanitized argument fields may
   differ.
@@ -48,7 +49,8 @@ EXACT, UPCAST, DOWNCAST = "exact", "upcast", "downcast"
 """Float casts a contract allows: none, narrower-to-wider exactly, wider-to-narrower (RNE)."""
 
 ANY_GRID, COARSENING = "any", "coarsening"
-"""Chunk-grid rules: anything, or each of A's chunks exactly tiled by B's chunks."""
+"""Chunk-grid rules: anything, or each of A's chunks exactly tiled by B's chunks (never merged
+along the layer axis of a tensor stacked over layers)."""
 
 RERUN_STATE = re.compile(r"^rerun_state_machine")
 """Rerun state-machine state: the ``rerun_state_machine_state/shard_*`` items and the

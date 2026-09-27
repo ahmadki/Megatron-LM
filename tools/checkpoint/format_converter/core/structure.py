@@ -8,7 +8,9 @@ block prefix; the layer segments of enclosing blocks stay in that prefix) and
 maps the stored layer index to the dense index; a torch_dist key stacked over
 the layers of a block becomes one slice per layer (``[l:l+1, ...]``, whose
 logical tensor has the layer's shape). Keys outside every block keep their
-path. :func:`compose` is the inverse for the target format.
+path. :func:`compose` is the inverse for the target format: it places each
+layer of a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the
+stacked tensor ``<block>.layers.<name>``.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from ..engine.regions import Region
 from ..errors import InternalError
 from .blocks import BlockLayout
 from .keys import KeyGrammarError, attribute_layer_key, join_layer_key, split_leaf
-from .logical import LogicalId, LogicalSlice
+from .logical import LogicalId, LogicalSlice, OutputSlice
 from .names import TORCH_DIST
 
 STACKED_AXES = 1
@@ -83,16 +85,32 @@ def decompose(
     ]
 
 
-def compose(lid: LogicalId, blocks: Sequence[BlockLayout], fmt: str) -> str:
-    """The model-relative key of ``lid`` in a store of format ``fmt``.
+def compose(
+    lid: LogicalId, shape: tuple[int, ...], blocks: Sequence[BlockLayout], fmt: str
+) -> OutputSlice:
+    """Where the logical tensor ``lid`` of shape ``shape`` goes in a store of format ``fmt``.
+
+    Returns:
+        The slice with the model-relative key: the whole tensor, or its layer
+        ``[l:l+1, ...]`` of a tensor stacked over the layers of a block that
+        torch_dist stores stacked (``l`` its torch_dist index).
 
     Raises:
         InternalError: ``lid`` names a block that is not in ``blocks``.
     """
+    whole = Region.full(shape)
     if lid.block is None or lid.layer is None:
-        return lid.name
+        return OutputSlice(lid.name, shape, whole)
     by_prefix = {block.prefix: block for block in blocks}
     if lid.block not in by_prefix:
         raise InternalError(f"{lid} names an unknown block")
     block = by_prefix[lid.block]
-    return join_layer_key(block.prefix, block.stored_index(lid.layer, fmt), lid.name)
+    stored = block.stored_index(lid.layer, fmt)
+    if not (fmt == TORCH_DIST and block.stacked):
+        return OutputSlice(join_layer_key(block.prefix, stored, lid.name), shape, whole)
+    return OutputSlice(
+        join_layer_key(block.prefix, None, lid.name),
+        (block.num_modules, *shape),
+        Region((stored,) + whole.offsets, (1, *shape)),
+        squeezed=STACKED_AXES,
+    )

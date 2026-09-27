@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Names of the supported checkpoint formats, their dialects and the fsdp_dtensor key envelope.
+"""Names of the supported checkpoint formats, their dialects, the fsdp_dtensor key envelope
+and the torch_dist block layouts.
 
 This module imports nothing, so the command line can validate format flags
 without importing torch.
@@ -19,3 +20,12 @@ FSDP_MODEL_PREFIX = "model.module."
 
 FSDP_OPTIMIZER_STATE = "optimizer.state."
 """Prefix of optimizer-state keys in Megatron-FSDP v1 stores (``module.`` levels follow)."""
+
+STACKED = "stacked"
+"""torch_dist block layout: one key per tensor, the layers along a new first axis."""
+
+PER_LAYER = "per_layer"
+"""torch_dist block layout: one key per layer (``<block>.layers.<index>.<name>``)."""
+
+TD_LAYOUTS = (STACKED, PER_LAYER)
+"""How torch_dist stores a block's layers."""

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tools.checkpoint.format_converter import errors
+from tools.checkpoint.format_converter.core.logical import OutputSlice
 from tools.checkpoint.format_converter.engine.metadata import MetadataView
 from tools.checkpoint.format_converter.engine.reader import SourceReader
 from tools.checkpoint.format_converter.engine.regions import Region
@@ -72,7 +73,10 @@ def test_torch_dist_keys_are_bare():
     assert adapter.stored_key("decoder.final_norm.weight") == "decoder.final_norm.weight"
     assert adapter.relative_key("output_layer.weight") == "output_layer.weight"
     assert adapter.planner_path("output_layer.weight") is None
-    assert adapter.output_grid((6, 4), torch.float32, max_chunk_bytes=8) == (Region.full((6, 4)),)
+    whole = OutputSlice("w", (6, 4), Region.full((6, 4)))
+    assert adapter.output_grid(whole, torch.float32, max_chunk_bytes=8) == (Region.full((6, 4)),)
+    layer = OutputSlice("s", (3, 6, 4), Region((1, 0, 0), (1, 6, 4)), squeezed=1)
+    assert adapter.output_grid(layer, torch.float32, max_chunk_bytes=8) == (layer.region,)
 
 
 @pytest.mark.parametrize(
@@ -85,13 +89,15 @@ def test_torch_dist_keys_are_bare():
     ],
 )
 def test_output_grid_splits_dimension_zero(shape, limit, grid):
-    regions = ADAPTER.output_grid(shape, torch.float32, max_chunk_bytes=limit)
+    placed = OutputSlice("w", shape, Region.full(shape))
+    regions = ADAPTER.output_grid(placed, torch.float32, max_chunk_bytes=limit)
     assert [(r.offsets[0], r.sizes[0]) for r in regions] == grid
     assert all(r.offsets[1:] == (0,) and r.sizes[1:] == shape[1:] for r in regions)
 
 
 def test_zero_dimensional_tensors_are_one_chunk():
-    assert ADAPTER.output_grid((), torch.bfloat16, max_chunk_bytes=1) == (Region((), ()),)
+    placed = OutputSlice("s", (), Region((), ()))
+    assert ADAPTER.output_grid(placed, torch.bfloat16, max_chunk_bytes=1) == (Region((), ()),)
 
 
 @pytest.fixture(name="store")

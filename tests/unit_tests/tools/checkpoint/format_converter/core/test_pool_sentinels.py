@@ -127,18 +127,18 @@ def test_rules_run_in_stage_then_name_order_when_enabled():
 
 def test_sentinels_are_named_owned_and_per_format():
     registry = RuleRegistry()
-    stacked = Sentinel(
-        "stacked", "torch_dist", re.compile(r"\.layers\.[a-z]"), ("FC-P01",), "stacked layers"
+    parts = Sentinel(
+        "parts", "torch_dist", re.compile(r"\.weight\.[a-z]"), ("FC-P05",), "parameter parts"
     )
-    registry.sentinel(stacked)
+    registry.sentinel(parts)
     registry.sentinel(
         Sentinel("halves", "fsdp_dtensor", re.compile(r"_[wv]$"), ("glu",), "GLU halves")
     )
-    assert registry.sentinels_for("torch_dist") == (stacked,)
-    assert stacked.matches("decoder.layers.mlp.linear_fc1.weight")
-    assert not stacked.matches("decoder.layers.0.mlp.linear_fc1.weight")
+    assert registry.sentinels_for("torch_dist") == (parts,)
+    assert parts.matches("decoder.layers.0.mixer.in_proj.weight.z")
+    assert not parts.matches("decoder.layers.0.mixer.in_proj.weight")
     with pytest.raises(InternalError, match="registered twice"):
-        registry.sentinel(stacked)
+        registry.sentinel(parts)
     with pytest.raises(InternalError, match="no owner"):
         registry.sentinel(Sentinel("orphan", "torch_dist", re.compile("x"), (), "none"))
 

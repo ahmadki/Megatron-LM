@@ -3,11 +3,13 @@
 """Packing pieces into units under a memory budget, and the order units run in.
 
 1. **Split.** A piece larger than half the unit budget ``U`` that reads several
-   stored items is cut along dimension 0 into row slabs of at most ``U/2``, so
-   the slabs can run in different units. A single row above ``U/2`` cannot be
-   bounded (exit 8). A piece that reads one stored item is never split: the DCP
-   reader decodes that item whole in any case, so splitting could only add
-   staging (and it keeps a copied chunk grid identical to its source).
+   stored items is cut along its first axis longer than 1 (dimension 0, or
+   the next one for a layer ``[l:l+1, ...]`` of a stacked tensor) into slabs
+   of at most ``U/2``, so the slabs can run in different units. A single
+   slice along that axis above ``U/2`` cannot be bounded (exit 8). A piece
+   that reads one stored item is never split: the DCP reader decodes that
+   item whole in any case, so splitting could only add staging (and it keeps
+   a copied chunk grid identical to its source).
 2. **Cluster.** Pieces that read the same stored item are grouped (union-find)
    so every stored item is read by one unit, once. A cluster costs its piece
    buffers, its staging boxes and the largest item it decodes; a cluster above
@@ -129,15 +131,19 @@ def dispatch_order(units: Sequence[Unit]) -> tuple[int, ...]:
 
 
 def split_piece(piece: Piece, max_bytes: int) -> tuple[Piece, ...]:
-    """Cut a piece that reads several stored items into dim-0 slabs of at most ``max_bytes``.
+    """Cut a piece that reads several stored items into slabs of at most ``max_bytes``.
+
+    The slabs are cut along the piece's first axis longer than 1.
 
     Raises:
-        BudgetExceeded: One row of the piece is larger than ``max_bytes``.
+        BudgetExceeded: One row (index along that axis) of the piece is larger
+            than ``max_bytes``.
     """
     items = {(op.src.relative_path, op.src.offset) for op in piece.ops}
-    if piece.nbytes <= max_bytes or piece.chunk.ndim == 0 or len(items) <= 1:
+    axis = next((i for i, size in enumerate(piece.chunk.sizes) if size > 1), None)
+    if piece.nbytes <= max_bytes or axis is None or len(items) <= 1:
         return (piece,)
-    row_bytes = piece.nbytes // piece.chunk.sizes[0]
+    row_bytes = piece.nbytes // piece.chunk.sizes[axis]
     if row_bytes > max_bytes:
         raise BudgetExceeded(
             f"one row of {piece.key} {piece.chunk} is {format_bytes(row_bytes)}, above half "
@@ -145,7 +151,8 @@ def split_piece(piece: Piece, max_bytes: int) -> tuple[Piece, ...]:
             hint=f"pass --unit-bytes {2 * row_bytes} or more",
         )
     rows = max(1, max_bytes // row_bytes)
-    return tuple(_slab(piece, local) for local in Region.full(piece.chunk.sizes).split_dim0(rows))
+    local = Region.full(piece.chunk.sizes)
+    return tuple(_slab(piece, slab) for slab in local.split_along(axis, rows))
 
 
 def _slab(piece: Piece, local: Region) -> Piece:

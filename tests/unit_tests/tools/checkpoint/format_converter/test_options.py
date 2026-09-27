@@ -102,8 +102,22 @@ def test_output_fields_cover_what_shapes_the_output():
         "max_output_chunk_bytes": 2**30,
         "allow_missing_fp8_extra_state": False,
         "ignore_manifest": False,
+        "block_layouts": {},
         "copy_sidecars": True,
     }
+
+
+def test_block_layouts_are_normalized_and_validated():
+    opts = options.PlanOptions(block_layouts=(("vision.", "per_layer"), ("decoder", "stacked")))
+    assert opts.block_layouts == (("decoder", "stacked"), ("vision", "per_layer"))
+    assert opts.output_fields()["block_layouts"] == {"decoder": "stacked", "vision": "per_layer"}
+    for bad in (
+        (("decoder", "flat"),),
+        (("", "stacked"),),
+        (("d", "stacked"), ("d.", "per_layer")),
+    ):
+        with pytest.raises(UsageError):
+            options.PlanOptions(block_layouts=bad)
 
 
 def test_allowed_roots_are_normalized():
