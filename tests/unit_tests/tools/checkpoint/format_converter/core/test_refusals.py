@@ -17,7 +17,6 @@ from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
 from tools.checkpoint.format_converter.core.refusals import PENDING_FAMILIES, Facts, detect_refusals
-from tools.checkpoint.format_converter.core.registry import REGISTRY
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 from tools.checkpoint.format_converter.errors import (
     AmbiguousError,
@@ -366,12 +365,6 @@ def test_refusals_carry_the_evidence():
     )
     (refusal,) = detect_refusals(facts(args={"megatron_fsdp_version": 2}))
     assert "args.megatron_fsdp_version=2" in refusal.message
-
-
-def test_sentinels_are_owned_by_pending_families_or_rules():
-    owners = set(PENDING_FAMILIES) | set(REGISTRY.rules)
-    for sentinel in REGISTRY.sentinels:
-        assert set(sentinel.owners) <= owners, sentinel.name
 
 
 def test_several_refusals_form_one_error():

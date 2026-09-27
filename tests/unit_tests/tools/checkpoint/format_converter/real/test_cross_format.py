@@ -63,6 +63,8 @@ from .._real_harness import (
 )
 
 PATTERN = "*-*-"
+
+pytestmark = pytest.mark.covers("identity", "real_save")
 ITERATION = 10
 ITER = f"iter_{ITERATION:07d}"
 EXTENDED = os.environ.get("MCORE_FORMAT_CONVERTER_EXTENDED") == "1"

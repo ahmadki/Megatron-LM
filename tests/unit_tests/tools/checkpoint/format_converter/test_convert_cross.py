@@ -37,6 +37,8 @@ from ._synthetic import (
 )
 
 ITER = "iter_0000007"
+
+pytestmark = pytest.mark.covers("identity", "ground_truth")
 QKV = "decoder.layers.0.self_attention.linear_qkv.weight"
 FC2 = "decoder.layers.3.mlp.linear_fc2.weight"
 MODEL = hybrid_tensors()

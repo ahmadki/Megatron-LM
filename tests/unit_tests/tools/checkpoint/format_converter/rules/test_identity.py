@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
 import torch
 
 from tools.checkpoint.format_converter.core.args_view import ArgsView
@@ -16,6 +17,8 @@ from tools.checkpoint.format_converter.core.registry import REGISTRY
 from tools.checkpoint.format_converter.core.rule import LogicalPool, Stage
 from tools.checkpoint.format_converter.engine.regions import Region
 from tools.checkpoint.format_converter.rules.identity import IdentityRule
+
+pytestmark = pytest.mark.covers("identity", "ground_truth")
 
 
 def _context(source: str, target: str):

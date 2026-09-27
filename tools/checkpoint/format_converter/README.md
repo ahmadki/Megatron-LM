@@ -247,6 +247,13 @@ or `--no-strict-fsdp-dtensor-load` to validate a conversion):
 * `torch_dist`: `--ckpt-format torch_dist --ckpt-drop-redundant-extra-state --no-load-optim --no-load-rng`
   (the store has no TE `_extra_state`).
 
+Megatron-FSDP limitation: on current Megatron a bf16 or fp16 Megatron-FSDP job
+cannot load any store without optimizer state (after loading, `load_checkpoint`
+asks the distributed optimizer to copy the model parameters into its main
+parameters, which Megatron-FSDP does not implement and raises
+`NotImplementedError`). fp32 Megatron-FSDP jobs load converted stores; a test
+pins the limitation so that its fix shows up.
+
 `plan SRC --to FORMAT` prints the derived architecture (every field with its
 evidence) and the number of model tensors each rule claims.
 
@@ -366,7 +373,7 @@ arguments and the model keys before any tensor is read.
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, or model keys under an unknown top-level module |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`), model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, a tensor stacked over layers, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
@@ -480,7 +487,7 @@ records the measured peaks: the driver's `VmHWM`, the largest worker's
 |---|---|---|---|
 | L0 | `engine/` | stdlib, torch, `torch.distributed.checkpoint` | host Python 3.10 with torch 2.8 and newer, containers, CI |
 | L1 | `core/` | L0; pure, no I/O | same |
-| L2 | `formats/`, `verify/`, `rules/` (later) | L0, L1 | same |
+| L2 | `formats/`, `verify/`, `rules/` | L0, L1 | same |
 | L3 | `mcore_state/` | L0 to L2; megatron only inside functions | same; Megatron's codec needs the container |
 | L4 | `cli.py`, `api.py`, `options.py`, `planning.py`, `report.py`, `sidecars.py` | L0 to L3 | same as the layers it uses |
 
@@ -501,7 +508,9 @@ executed by the engine, which knows nothing about formats:
    refusals, decode the common state and encode the output one, and describe
    the output as *pieces*: boxes of output tensors (`engine/pieces.py`), each
    filled by copies from boxes of stored source chunks and backed at run time
-   by one standalone buffer. Byte items are encoded in the driver.
+   by one standalone buffer. Byte items are encoded in the driver. A
+   cross-format plan gets its pieces from the rule pipeline (see
+   [Rule model](#rule-model)).
 2. **Pack** (`engine/scheduler.py`). Group pieces into units under the memory
    budget (see [Memory model](#memory-model)); pieces that read the same stored
    item share a unit.
@@ -527,6 +536,93 @@ executed by the engine, which knows nothing about formats:
    compared with SHA-256 digests the workers recorded.
 6. **Publish**. Add the format's marker files (`metadata.json`) and sidecars,
    rename the merged store into place and write the tracker last.
+
+### Rule model
+
+Cross-format conversion never translates one format's keys into the other's.
+Both formats are mapped onto one **logical key space**, and rules work there
+only (`core/`, `rules/`):
+
+* A **model-relative key** is a model tensor's key without its envelope
+  (`fsdp_dtensor` stores prefix `model.module.`; `torch_dist` keys are bare).
+  `core/keys.py` holds the whole key grammar: `<block>.layers.<index>.<path>.<leaf>`
+  inside a layered block, `<path>.<leaf>` elsewhere, and every regular
+  expression over keys.
+* A **`LogicalId`** (`core/logical.py`) names a tensor as the live model does:
+  its block (e.g. `decoder`), its *dense* layer index (the `nn.ModuleList`
+  position), the module path inside the layer and the leaf name. The two
+  formats may number the layers of a block differently; each block's
+  `BlockLayout` (`core/blocks.py`) maps dense indices to each format's stored
+  indices, and `core/structure.py` decomposes model-relative keys into ids and
+  composes them back. Format adapters (`formats/`) own only the envelope
+  (`relative_key` strips it, `stored_key` adds it), the planner paths and the
+  output chunk grid.
+* **Refusal fence** (`core/refusals.py`). Detectors registered with
+  `@REGISTRY.detector` read the training arguments and the model keys and
+  shapes, before any tensor is read, and report every refusal: permanent
+  `FC-R` codes for configurations no rule will support, and one pending
+  `FC-P` code per model family whose rules have not landed yet. A family's
+  change lifts exactly its code, so no version of the tool converts a family
+  it does not know.
+* **Architecture context** (`core/context.py`). Everything rules may depend on
+  (direction, formats, parameter dtype, the parallel sizes the source was
+  saved with, the blocks, the dtype policy, the source's conversion manifest)
+  is derived from the arguments, cross-checked against the store where the
+  store can tell, and logged as `(field, value, evidence)`; `plan` prints the
+  log and the manifest keeps it.
+* **Rules** (`core/rule.py`, `rules/`). The planner (`core/planner.py`) turns
+  every source tensor into a `LogicalSlice` (a region of a stored key holding
+  one logical tensor), all in one `LogicalPool`. Rules registered with `@REGISTRY.rule`
+  run in `Stage` order (`FUSED`, `GLU`, `OPTIM`, then `IDENTITY`) and take the
+  slices they handle; each returns `FamilyInstance`s naming the slices it
+  consumed and the `LogicalOutput`s (output tensors as `LogicalCopy` boxes of
+  source slices) it builds. Every slice is claimed and consumed exactly once;
+  anything else is an internal error.
+* **Sentinels** (`Sentinel` in `core/registry.py`, registered in
+  `core/refusals.py`, which the identity rule imports so that it never runs
+  without them) name source keys the generic identity rule must never convert
+  (a parameter stored as parts, a tensor stacked over layers, SwiGLU halves,
+  fused mixer projections). Each is owned by the rule, or while it is pending
+  the `FC-P` code, that handles such keys; a reserved slice nobody claims is
+  refused (`FC-R13`) with the sentinel's reason.
+* **Compile** (`core/planner.py`). `core/structure.py` composes every
+  output's model-relative key, and the target adapter adds its envelope,
+  planner path and chunk grid; each output chunk becomes an engine piece whose
+  copies read boxes of the source's stored chunks. The plan must read every element
+  of every consumed source tensor exactly once, tile every piece and every
+  output tensor, and write each key once.
+
+This version has one rule, `identity` (tensors stored the same way in both
+formats), and one block classifier, the `HybridStack` decoder of a hybrid
+model (stored per layer, numbered by pattern position in `torch_dist`, which
+equals the dense index without shortcut-MoE grouping). The verified hybrid
+symbols are `*` and `-`.
+
+### Extension contract
+
+Supporting another model family is one change that:
+
+1. adds one rule module `rules/<family>.py` with a `LeafRule` subclass
+   registered with `@REGISTRY.rule`, declaring its `stage` and `enabled(ctx)`
+   and working on logical ids only (key syntax, including its sentinel
+   patterns, goes into `core/keys.py`), and takes over the sentinels its
+   family owns (their owners in `core/refusals.py`);
+2. derives and cross-checks what it needs in `core/context.py` (a derivation
+   with evidence; a contradiction is a refusal naming the field, the argument
+   value and the observed value), and adds a block classifier to
+   `core/blocks.py` if the family has its own layer list;
+3. removes its `FC-P` code from the fence, or adds its layer symbol, spec or
+   attention variant to the registry's allowlists;
+4. adds tests: hand-built expected values that the rule does not produce
+   (`@pytest.mark.covers("<rule>", "ground_truth")`), a parity pin against
+   Megatron or a real-save chain (`covers(..., "parity")` or `"real_save"`),
+   and a synthetic store of the family;
+5. documents the family here and in the support matrix of the user guide.
+
+`test_registry_contract.py` enforces the checkable parts: every rule module
+registers a rule, every rule has both kinds of evidence, every sentinel has a
+registered owner, every pending code has a triggering test, and rule modules
+neither import `re` nor spell key syntax.
 
 ### Crash safety and resume
 
@@ -624,10 +720,10 @@ the code under test.
 
 | Tier | Content |
 |---|---|
-| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation |
-| T1 | metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on a synthetic training save, CLI exit codes, import boundary |
-| T2 | the common-state codec against Megatron's `load_common_state_dict`, and the rewritten integrity manifest against Megatron's verifier (container) |
-| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2 (container with GPUs) |
+| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation, key grammar, logical ids, pool and sentinels, one case per refusal code, architecture derivations, block layouts, plan compilation against hand-written pieces, manifest schema, the registry contract |
+| T1 | metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, expected-difference contracts and plan replay, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on synthetic training saves in every direction, CLI exit codes, import boundary |
+| T2 | the common-state codec against Megatron's `load_common_state_dict`, the rewritten integrity manifest against Megatron's verifier, the pattern parser and the verified spec names against Megatron's objects, the grouped-tensor-parallel refusal against the weight-shard fields Megatron's `validate_args` stores (container); the `fsdp_dtensor` preprocess handler set, the hybrid layer symbols and the Gated DeltaNet variant names scanned from Megatron's source (`ast`, host) |
+| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2; a hybrid model through `torch_dist` -> `fsdp_dtensor` -> `torch_dist` with Megatron's own saves and strict loads, every store checked against a real save under its contract (TP 1; TP 2 with `MCORE_FORMAT_CONVERTER_EXTENDED=1`) (container with GPUs) |
 
 Host run (skips the megatron-importing root `conftest.py`):
 
@@ -652,9 +748,10 @@ unsupported input refused with a stable code.
 2. Streaming DCP writer engine (partial-chunk save planner, validated metadata
    merge, staging, resume and atomic publish, subprocess workers) with a
    weights-only `torch_dist` rewrite as its first user; `plan` and `convert`
-   (this version).
+   (done).
 3. Cross-format core: logical key space, rule registry, refusal fence, the
-   Megatron-FSDP v1 adapter, per-layer hybrid models, `verify --map convert`.
+   Megatron-FSDP v1 adapter, per-layer hybrid models, expected-difference
+   contracts and `verify --map convert` (this version).
 4. Stacked `TransformerBlock` layers and multi-root vision-language models,
    with the user guide.
 5. MoE experts (grouped and sequential naming, router buffers).

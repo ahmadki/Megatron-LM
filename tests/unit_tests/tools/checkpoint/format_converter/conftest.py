@@ -14,6 +14,16 @@ import pytest
 from . import _harness
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the markers of this package (no pyproject changes)."""
+    config.addinivalue_line(
+        "markers",
+        "covers(rule, evidence): the test is evidence for a conversion rule; evidence is "
+        "ground_truth (hand-built expectations), parity (pinned to Megatron) or real_save "
+        "(Megatron's own saves and loads); test_registry_contract.py requires both kinds",
+    )
+
+
 @pytest.fixture(name="scrubbed_env")
 def fixture_scrubbed_env() -> dict[str, str]:
     """Environment for child processes: no launcher variables and no visible GPU."""
