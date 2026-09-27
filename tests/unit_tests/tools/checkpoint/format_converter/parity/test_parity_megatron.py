@@ -9,7 +9,12 @@ import pytest
 from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.hybrid_pattern import parse_hybrid_pattern
-from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
+from tools.checkpoint.format_converter.core.names import (
+    FSDP_DTENSOR,
+    PER_LAYER,
+    STACKED,
+    TORCH_DIST,
+)
 from tools.checkpoint.format_converter.core.refusals import (
     GDP_SPEC_NAMES,
     HYBRID_SPEC_MODULES,
@@ -25,6 +30,7 @@ if not megatron_available():
 
 # pylint: disable=wrong-import-position
 import argparse
+import copy
 import importlib
 import types
 
@@ -33,6 +39,8 @@ from megatron.core.models.hybrid import hybrid_layer_allocation
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import add_megatron_arguments
+
+from ..core.test_stacking import classify, llava
 
 
 @pytest.mark.parametrize(
@@ -56,6 +64,56 @@ def test_the_gated_deltaproduct_spec_names_exist():
     specs = importlib.import_module(HYBRID_SPEC_MODULES[0])
     (spec,) = {id(getattr(specs, name)) for name in GDP_SPEC_NAMES}
     assert spec != id(specs.hybrid_stack_spec)
+
+
+def _validated_args(argv: list[str]) -> argparse.Namespace:
+    """Megatron's arguments for ``argv`` with the weight-shard fields ``validate_args`` sets."""
+    parser = add_megatron_arguments(argparse.ArgumentParser())
+    args = parser.parse_known_args(argv)[0]
+    if args.expert_tensor_parallel_size is None:  # validate_args defaults it first
+        args.expert_tensor_parallel_size = args.tensor_model_parallel_size
+    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            args.tensor_model_parallel_size,
+            args.tensor_parallel_num_weight_shards,
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            args.expert_tensor_parallel_size,
+            args.expert_tensor_parallel_num_weight_shards,
+            getattr(args, "expert_gtp_weight_remat_size", 1),
+        )
+    )
+    return args
+
+
+def _gtp_codes(args: argparse.Namespace) -> list[str]:
+    facts = Facts(TORCH_DIST, FSDP_DTENSOR, ArgsView(args), {})
+    return [refusal.code for refusal in grouped_tensor_parallel(facts)]
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_the_weight_shards_validate_args_stores_for_plain_tensor_parallelism_pass(tp):
+    """Every job saves ``tensor_parallel_num_weight_shards``, as many as tensor-parallel ranks
+    without grouped tensor parallelism (and the expert pair likewise)."""
+    args = _validated_args(["--tensor-model-parallel-size", str(tp)])
+    assert args.tensor_parallel_num_weight_shards == tp
+    assert args.expert_tensor_parallel_num_weight_shards == tp
+    assert _gtp_codes(args) == []
+    expert = _validated_args(
+        ["--tensor-model-parallel-size", str(tp), "--expert-tensor-parallel-size", "1"]
+    )
+    assert expert.expert_tensor_parallel_num_weight_shards == 1 and _gtp_codes(expert) == []
+
+
+@pytest.mark.parametrize(
+    "flag", ["--tensor-parallel-num-weight-shards", "--expert-tensor-parallel-num-weight-shards"]
+)
+def test_the_weight_shard_flags_of_grouped_tensor_parallelism_are_refused(flag):
+    args = _validated_args(["--tensor-model-parallel-size", "2", flag, "4"])
+    assert _gtp_codes(args) == [errors.FC_R06]
 
 
 class _RecordingLayer:
@@ -131,51 +189,19 @@ def test_the_configuration_only_per_layer_flags_are_no_arguments(flag):
     assert flag not in _argument_names()
 
 
-def _validated_args(argv: list[str]) -> argparse.Namespace:
-    """Megatron's arguments for ``argv`` with the weight-shard fields ``validate_args`` sets."""
-    parser = add_megatron_arguments(argparse.ArgumentParser())
-    args = parser.parse_known_args(argv)[0]
-    if args.expert_tensor_parallel_size is None:  # validate_args defaults it first
-        args.expert_tensor_parallel_size = args.tensor_model_parallel_size
-    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
-        resolve_tensor_parallel_weight_shards(
-            args.tensor_model_parallel_size,
-            args.tensor_parallel_num_weight_shards,
-            getattr(args, "gtp_weight_remat_size", 1),
-        )
-    )
-    args.expert_tensor_parallel_num_weight_shards, args.expert_gtp_weight_remat_size = (
-        resolve_tensor_parallel_weight_shards(
-            args.expert_tensor_parallel_size,
-            args.expert_tensor_parallel_num_weight_shards,
-            getattr(args, "expert_gtp_weight_remat_size", 1),
-        )
-    )
-    return args
-
-
-def _gtp_codes(args: argparse.Namespace) -> list[str]:
-    facts = Facts(TORCH_DIST, FSDP_DTENSOR, ArgsView(args), {})
-    return [refusal.code for refusal in grouped_tensor_parallel(facts)]
-
-
-@pytest.mark.parametrize("tp", [1, 2, 4])
-def test_the_weight_shards_validate_args_stores_for_plain_tensor_parallelism_pass(tp):
-    """Every job saves ``tensor_parallel_num_weight_shards``, as many as tensor-parallel ranks
-    without grouped tensor parallelism (and the expert pair likewise)."""
-    args = _validated_args(["--tensor-model-parallel-size", str(tp)])
-    assert args.tensor_parallel_num_weight_shards == tp
-    assert args.expert_tensor_parallel_num_weight_shards == tp
-    assert _gtp_codes(args) == []
-    expert = _validated_args(
-        ["--tensor-model-parallel-size", str(tp), "--expert-tensor-parallel-size", "1"]
-    )
-    assert expert.expert_tensor_parallel_num_weight_shards == 1 and _gtp_codes(expert) == []
-
-
 @pytest.mark.parametrize(
-    "flag", ["--tensor-parallel-num-weight-shards", "--expert-tensor-parallel-num-weight-shards"]
+    "fields",
+    [{}, {"moe_layer_freq": 2}, {"moe_layer_freq": [1, 0, 1]}, {"linear_attention_freq": 3}],
 )
-def test_the_weight_shard_flags_of_grouped_tensor_parallelism_are_refused(flag):
-    args = _validated_args(["--tensor-model-parallel-size", "2", flag, "4"])
-    assert _gtp_codes(args) == [errors.FC_R06]
+def test_the_vision_encoder_is_laid_out_like_megatrons_copy_of_the_language_config(fields):
+    """``pretrain_vlm.py`` (and ``examples/multimodal``) build the vision encoder's configuration
+    as a deep copy of the language model's with its own number of layers."""
+    language = TransformerConfig(num_layers=3, hidden_size=8, num_attention_heads=2, **fields)
+    vision = copy.deepcopy(language)
+    vision.num_layers = 2
+    blocks = classify(llava(), source=FSDP_DTENSOR, num_layers=3, **fields)
+    layouts = {block.prefix: block.td_layout for block in blocks}
+    assert layouts == {
+        "language_model.decoder": STACKED if _megatron_stacks(language, None) else PER_LAYER,
+        "vision_model.decoder": STACKED if _megatron_stacks(vision, None) else PER_LAYER,
+    }

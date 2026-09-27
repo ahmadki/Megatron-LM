@@ -77,6 +77,7 @@ def test_torch_dist_to_fsdp_context_and_its_log():
             "value": None,
             "evidence": "args.virtual_pipeline_model_parallel_size=None",
         },
+        {"field": "lm_decoder", "value": "decoder", "evidence": "model keys under a, b, c"},
         {"field": "fsdp_model_prefix", "value": "model.module.", "evidence": "dialect mfsdp_v1"},
         {
             "field": "fsdp_optim_depth",

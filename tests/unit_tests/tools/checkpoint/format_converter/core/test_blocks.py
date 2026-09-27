@@ -16,6 +16,7 @@ from tools.checkpoint.format_converter.core.blocks import (
     BlockFacts,
     BlockLayout,
     classify_blocks,
+    language_model_prefix,
     take_census,
 )
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
@@ -143,3 +144,22 @@ def test_a_layout_needs_one_distinct_stored_index_per_module():
     assert block.dense_index(2, TORCH_DIST) == 1 and block.dense_index(1, FSDP_DTENSOR) == 1
     with pytest.raises(KeyGrammarError):
         block.dense_index(1, TORCH_DIST)
+
+
+def test_the_language_model_prefix_follows_the_roots():
+    assert language_model_prefix(["embedding.word_embeddings.weight", "mtp.layers.0.x"]) == ""
+    vlm = ["language_model.decoder.final_norm.weight", "vision_projection.encoder.x.weight"]
+    assert language_model_prefix(vlm) == "language_model."
+    assert language_model_prefix([]) == ""
+    with pytest.raises(RefusedError) as excinfo:
+        language_model_prefix(["decoder.final_norm.weight", "vision_model.conv1.weight"])
+    assert excinfo.value.refusal.code == errors.FC_R13
+    assert "single-model roots (decoder) and vision-language roots (vision_model)" in (
+        excinfo.value.refusal.message
+    )
+
+
+def test_a_vision_language_hybrid_decoder_is_under_the_language_model():
+    model = {f"language_model.{key}": entry for key, entry in _keys(0, 1).items()}
+    (block,) = classify_blocks_of(_args(hybrid_layer_pattern="*-", num_layers=2), model, TORCH_DIST)
+    assert (block.prefix, block.kind) == ("language_model.decoder", "hybrid_stack")

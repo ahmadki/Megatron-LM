@@ -361,9 +361,10 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="PREFIX=LAYOUT",
-        help="fsdp_dtensor to torch_dist: store the TransformerBlock layer list PREFIX stacked "
-        "or per_layer instead of deciding it from the arguments (repeatable); content_metadata "
-        "is unchanged, so the job that loads the store must build PREFIX that way",
+        help="fsdp_dtensor to torch_dist: store the TransformerBlock layer list PREFIX (e.g. "
+        "vision_model.decoder) stacked or per_layer instead of deciding it from the arguments "
+        "(repeatable); content_metadata is unchanged, so the job that loads the store must "
+        "build PREFIX that way",
     )
     parser.add_argument(
         "--workers",

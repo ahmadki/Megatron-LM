@@ -432,3 +432,37 @@ def layer_grids(tensors: Mapping[str, torch.Tensor], block: str) -> dict[str, tu
         for key, tensor in tensors.items()
         if key.startswith(head) and not key[len(head)].isdigit()
     }
+
+
+def vision_language_tensors(
+    language_model: Mapping[str, torch.Tensor], vision_layers: int = 2, vision_hidden: int = 4
+) -> dict[str, torch.Tensor]:
+    """A vision-language (LLaVA-style) model: ``language_model`` under ``language_model.``,
+    a CLIP-like vision encoder (a TransformerBlock of ``vision_layers`` layers, one key per
+    layer, bfloat16 as a frozen encoder is stored) and an MLP projection."""
+    generator = torch.Generator().manual_seed(11)
+    vision = {
+        key: tensor.bfloat16()
+        for key, tensor in transformer_layers(
+            "vision_model.decoder", vision_layers, vision_hidden, 2 * vision_hidden, seed=5
+        ).items()
+    }
+    hidden = language_model["embedding.word_embeddings.weight"].shape[1]
+    shapes = {
+        "vision_model.class_token": (1, 1, vision_hidden),
+        "vision_model.conv1.weight": (vision_hidden, 3, 2, 2),
+        "vision_model.position_embeddings.weight": (5, vision_hidden),
+        "vision_model.ln_pre.weight": (vision_hidden,),
+        "vision_projection.encoder.linear_fc1.weight": (hidden, vision_hidden),
+        "vision_projection.encoder.linear_fc1.bias": (hidden,),
+        "vision_projection.encoder.linear_fc2.weight": (hidden, hidden),
+        "vision_projection.encoder.linear_fc2.bias": (hidden,),
+    }
+    extra = {
+        key: torch.randn(shape, generator=generator).bfloat16() for key, shape in shapes.items()
+    }
+    return {
+        **{f"language_model.{key}": tensor for key, tensor in language_model.items()},
+        **vision,
+        **extra,
+    }

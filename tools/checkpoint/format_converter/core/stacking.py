@@ -19,7 +19,8 @@ Converting a torch_dist store, the layout is observed from the keys: every
 tensor of a stacked block must have the same number of layers along its first
 axis, a per-layer block must hold layers ``0..L-1``, a block holds either form
 but not both, and the language model's decoder must have ``args.num_layers``
-layers; anything else is refused (FC-R12).
+layers (``args.decoder_num_layers`` in a vision-language model that sets it);
+anything else is refused (FC-R12).
 
 Converting an fsdp_dtensor store, the layout is decided the way the loading
 job will ask for it, block by block:
@@ -37,6 +38,10 @@ job will ask for it, block by block:
   flags and the arguments), else stacked. Arguments that make it stacked
   while its layers differ (names, shapes or dtypes) are refused (FC-R12), and
   the layout is never switched silently.
+* The vision encoder of a vision-language model is decided the same way:
+  Megatron's builders (``pretrain_vlm.py``, ``examples/multimodal``) make its
+  configuration a copy of the language model's, and only its number of
+  layers and parallelism differ.
 * A block of an unknown kind needs ``--block-layout`` (FC-A02).
 
 Megatron also builds a block per layer for two configuration fields that no
@@ -55,8 +60,9 @@ from .. import errors
 from ..errors import Refusal, RefusalError
 from .args_view import ArgsView
 from .blocks import (
-    LM_DECODER,
+    DECODER,
     TRANSFORMER_BLOCK,
+    VISION_DECODER,
     BlockCensus,
     BlockFacts,
     BlockLayout,
@@ -70,6 +76,12 @@ PER_LAYER_METADATA = ("non_homogeneous_layers", "singleton_local_shards")
 
 LAYER_FREQUENCIES = ("moe_layer_freq", "linear_attention_freq")
 """Layer-type frequencies that make a TransformerBlock per layer as an int above 1 or a list."""
+
+_VISION_CONFIG = "its configuration is a copy of the language model's"
+_OWN_VISION_CONFIG = (
+    ", or --block-layout {prefix}=per_layer if the job that loads the store builds {prefix} "
+    "per layer from a configuration of its own"
+)
 
 _PER_LAYER_ADVICE = (
     "; --torch-dist-layout per-layer marks the per-layer blocks in content_metadata, so that "
@@ -134,8 +146,15 @@ def requested_layout_warnings(facts: BlockFacts, blocks: Iterable[BlockLayout]) 
         f"this content_metadata builds {block.prefix} {built} ({why}), so it cannot load this "
         "store strictly" + (_PER_LAYER_ADVICE if block.td_layout == PER_LAYER else "")
         for block in blocks
-        if block.prefix in facts.layouts and block.prefix == LM_DECODER and block.td_layout != built
+        if block.prefix in facts.layouts
+        and block.prefix in _megatron_blocks(facts)
+        and block.td_layout != built
     ]
+
+
+def _megatron_blocks(facts: BlockFacts) -> tuple[str, str]:
+    """The blocks laid out by :func:`per_layer_reasons`: the decoder and the vision encoder."""
+    return facts.lm_decoder, VISION_DECODER
 
 
 def metadata_reasons(content_metadata: Mapping[str, Any] | None) -> list[str]:
@@ -189,24 +208,36 @@ def _torch_dist_layout(facts: BlockFacts, census: BlockCensus) -> tuple[str, str
         return requested, f"--block-layout {prefix}={requested}"
     if facts.per_layer:
         return PER_LAYER, "--torch-dist-layout per-layer"
-    if prefix != LM_DECODER:
-        raise Refusal(
-            errors.FC_A02,
-            f"{prefix} is a layer list of an unknown kind: whether torch_dist stacks it depends "
-            "on its module",
-            hint=f"pass --block-layout {prefix}={STACKED} or --block-layout {prefix}={PER_LAYER}",
-        ).to_error()
+    if prefix in _megatron_blocks(facts):
+        return _megatron_layout(facts, prefix, difference)
+    raise Refusal(
+        errors.FC_A02,
+        f"{prefix} is a layer list of an unknown kind: whether torch_dist stacks it depends "
+        "on its module",
+        hint=f"pass --block-layout {prefix}={STACKED} or --block-layout {prefix}={PER_LAYER}",
+    ).to_error()
+
+
+def _megatron_layout(facts: BlockFacts, prefix: str, difference: str | None) -> tuple[str, str]:
+    """The decoder or the vision encoder: as ``TransformerBlock.sharded_state_dict`` builds it.
+
+    The vision encoder's configuration is a copy of the language model's
+    (``pretrain_vlm.py``, ``examples/multimodal/model.py``), so the same
+    arguments decide it.
+    """
+    copy = "" if prefix == facts.lm_decoder else f"{_VISION_CONFIG}: "
     reasons = per_layer_reasons(facts.args, facts.content_metadata)
     if reasons:
-        return PER_LAYER, f"Megatron builds it per layer ({', '.join(reasons)})"
+        return PER_LAYER, f"{copy}Megatron builds it per layer ({', '.join(reasons)})"
     if difference is not None:
+        own = "" if prefix == facts.lm_decoder else _OWN_VISION_CONFIG.format(prefix=prefix)
         raise _refusal(
             f"the arguments make Megatron stack {prefix}, but its layers differ: {difference}",
             (),
             hint="pass --torch-dist-layout per-layer to store every block one layer per key "
-            "(its content_metadata then makes Megatron load them so)",
+            f"(its content_metadata then makes Megatron load them so){own}",
         )
-    return STACKED, "Megatron stacks it (no per-layer setting) and its layers are alike"
+    return STACKED, f"{copy}Megatron stacks it (no per-layer setting) and its layers are alike"
 
 
 def _layer_difference(census: BlockCensus) -> str | None:
@@ -268,13 +299,21 @@ def _contiguous_count(census: BlockCensus) -> int:
 
 
 def _check_decoder_length(facts: BlockFacts, census: BlockCensus, count: int) -> None:
-    """The language model's decoder has ``args.num_layers`` layers."""
-    if census.prefix != LM_DECODER:
+    """The language model's decoder has the number of layers the arguments give it.
+
+    That is ``args.num_layers``, except in a vision-language model built with
+    ``args.decoder_num_layers``, which ``pretrain_vlm.py`` gives its language
+    model (``args.num_layers`` is then the vision encoder's).
+    """
+    if census.prefix != facts.lm_decoder:
         return
-    num_layers = facts.args.get("num_layers", None)
+    name = "num_layers"
+    if facts.lm_decoder != DECODER and facts.args.get("decoder_num_layers", None) is not None:
+        name = "decoder_num_layers"
+    num_layers = facts.args.get(name, None)
     if num_layers is not None and num_layers != count:
         raise _refusal(
-            f"args.num_layers={num_layers} but the store holds {count} layers of {census.prefix}",
+            f"args.{name}={num_layers} but the store holds {count} layers of {census.prefix}",
             census.stacked_keys(),
         )
 

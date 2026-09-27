@@ -163,10 +163,6 @@ CASES = {
     "R20 symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*D"})),
     "R20 unknown symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*Z"})),
     "R20 variant": (errors.FC_R20, facts(args={"experimental_attention_variant": "dsa"})),
-    "P02 roots": (
-        errors.FC_P02,
-        facts(keys={"language_model.decoder.layers.0.self_attention.linear_proj.weight": (H, H)}),
-    ),
     "P03 args": (errors.FC_P03, facts(args={"num_experts": 8})),
     "P03 symbol": (errors.FC_P03, facts(args={"hybrid_layer_pattern": "*E*E"})),
     "P03 keys": (errors.FC_P03, facts(keys={"decoder.layers.1.mlp.router.weight": (8, H)})),
@@ -251,6 +247,8 @@ def test_swiglu_halves_are_pending_whatever_the_arguments_say():
 
 def test_escape_hatches_and_harmless_values_pass():
     assert codes(facts(keys={"frontend.proj.weight": (H, H)}, allowed_roots=("frontend",))) == []
+    vision = {"vision_model.decoder.layers.0.self_attention.linear_proj.weight": (H, H)}
+    assert codes(facts(keys=vision)) == []  # vision-language roots are converted
     fp8 = {"fp8": "e4m3", "fp8_recipe": "delayed"}
     assert (
         codes(
@@ -351,13 +349,7 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     found = facts(args=args, keys=keys)
-    assert codes(found) == [
-        errors.FC_P02,
-        errors.FC_P03,
-        errors.FC_P04,
-        errors.FC_P05,
-        errors.FC_P06,
-    ]
+    assert codes(found) == [errors.FC_P03, errors.FC_P04, errors.FC_P05, errors.FC_P06]
 
 
 def test_refusals_carry_the_evidence():

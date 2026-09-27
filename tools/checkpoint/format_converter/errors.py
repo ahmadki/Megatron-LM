@@ -75,9 +75,6 @@ FC_R19 = "FC-R19"
 FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant)."""
 
-FC_P02 = "FC-P02"
-"""Pending: several model roots (``language_model.``, ``vision_model.``, ``vision_projection.``)."""
-
 FC_P03 = "FC-P03"
 """Pending: mixture-of-experts layers."""
 

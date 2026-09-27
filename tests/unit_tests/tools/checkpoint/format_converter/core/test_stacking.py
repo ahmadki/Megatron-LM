@@ -305,3 +305,100 @@ def test_torch_dist_layout_per_layer_makes_every_block_per_layer():
     assert decoder.td_layout == "per_layer"
     blocks = classify(shapes, source=FSDP_DTENSOR, per_layer=True, layouts={"encoder": "stacked"})
     assert [b.td_layout for b in blocks] == ["per_layer", "stacked"]
+
+
+def llava(vision=None, language=None) -> dict[str, tuple[int, ...]]:
+    """A vision-language model: a GPT language model and a vision encoder (both per layer)."""
+    return {
+        **(language or per_layer_gpt(range(3), prefix="language_model.decoder")),
+        **(vision or per_layer_gpt(range(2), prefix="vision_model.decoder")),
+        "vision_projection.encoder.linear_fc1.weight": (H, H),
+    }
+
+
+def test_the_blocks_of_a_vision_language_model_are_observed():
+    shapes = {
+        **stacked_gpt(3, prefix="language_model.decoder"),
+        **stacked_gpt(2, prefix="vision_model.decoder"),
+    }
+    language, vision = classify(shapes, num_layers=3)
+    assert (language.prefix, language.num_modules, language.stacked) == (
+        "language_model.decoder",
+        3,
+        True,
+    )
+    assert (vision.prefix, vision.num_modules, vision.stacked) == ("vision_model.decoder", 2, True)
+    assert "args.num_layers=2" in refusal(shapes, num_layers=2).message  # the language model's
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+def test_the_language_model_of_a_vision_language_model_may_have_decoder_num_layers(source):
+    """``pretrain_vlm.py`` gives its language model ``args.decoder_num_layers`` layers; with
+    ``--encoder-num-layers 2 --decoder-num-layers 3``, ``validate_args`` sets num_layers=2."""
+    shapes = (
+        llava()
+        if source == FSDP_DTENSOR
+        else {
+            **stacked_gpt(3, prefix="language_model.decoder"),
+            **stacked_gpt(2, prefix="vision_model.decoder"),
+        }
+    )
+    args = {"num_layers": 2, "encoder_num_layers": 2, "decoder_num_layers": 3}
+    language, vision = classify(shapes, source=source, **args)
+    assert (language.num_modules, vision.num_modules) == (3, 2)
+    found = refusal(shapes, source=source, **{**args, "decoder_num_layers": 4})
+    assert found.message == (
+        "args.decoder_num_layers=4 but the store holds 3 layers of language_model.decoder"
+    )
+    single = stacked_gpt(3) if source == TORCH_DIST else per_layer_gpt(range(3))
+    assert "args.num_layers=2" in refusal(single, source=source, **args).message  # not a VLM
+
+
+VISION_COPY = "its configuration is a copy of the language model's: "
+
+
+def test_the_vision_encoder_follows_the_language_models_configuration():
+    """Megatron's builders deep-copy the language model's configuration for the encoder."""
+    language, vision = classify(
+        llava(), source=FSDP_DTENSOR, num_layers=3, moe_layer_freq=[1, 0, 1]
+    )
+    assert (language.td_layout, vision.td_layout) == ("per_layer", "per_layer")
+    assert vision.evidence == (
+        f"{VISION_COPY}Megatron builds it per layer (args.moe_layer_freq=[1, 0, 1])"
+    )
+    _, vision = classify(llava(), source=FSDP_DTENSOR, num_layers=3, moe_layer_freq=1)
+    assert vision.td_layout == "stacked"
+    assert vision.evidence == (
+        f"{VISION_COPY}Megatron stacks it (no per-layer setting) and its layers are alike"
+    )
+    flagged = {"non_homogeneous_layers": True}
+    blocks = classify(llava(), source=FSDP_DTENSOR, content_metadata=flagged)
+    reason = "Megatron builds it per layer (content_metadata.non_homogeneous_layers=True)"
+    assert [(b.td_layout, b.evidence) for b in blocks] == [
+        ("per_layer", reason),
+        ("per_layer", VISION_COPY + reason),
+    ]
+
+
+def test_a_vision_encoder_whose_layers_differ_is_not_stacked_silently():
+    vision = per_layer_gpt(range(2), prefix="vision_model.decoder")
+    del vision["vision_model.decoder.layers.1.mlp.linear_fc2.weight"]
+    found = refusal(llava(vision=vision), source=FSDP_DTENSOR)
+    assert found.message.startswith(
+        "the arguments make Megatron stack vision_model.decoder, but its layers differ: "
+    )
+    assert found.hint.startswith("pass --torch-dist-layout per-layer")
+    assert found.hint.endswith(
+        "or --block-layout vision_model.decoder=per_layer if the job that loads the store "
+        "builds vision_model.decoder per layer from a configuration of its own"
+    )
+    layouts = {"vision_model.decoder": "per_layer"}
+    _, block = classify(llava(vision=vision), source=FSDP_DTENSOR, layouts=layouts)
+    assert block.td_layout == "per_layer"
+    (warning,) = warnings_of(llava(vision=vision), layouts=layouts)
+    assert warning.startswith(
+        "--block-layout vision_model.decoder=per_layer: a job built from these arguments and "
+        "this content_metadata builds vision_model.decoder stacked"
+    )
+    per_layer = {"moe_layer_freq": 2}
+    assert warnings_of(llava(vision=vision), layouts=layouts, **per_layer) == []

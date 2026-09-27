@@ -32,6 +32,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
+from .blocks import SINGLE_ROOTS, VLM_ROOTS
 from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
     EXPERT_PARAM,
@@ -52,7 +53,6 @@ from .names import FSDP_DTENSOR, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P02: "models with several roots (language_model., vision_model., vision_projection.)",
     errors.FC_P03: "mixture-of-experts layers",
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
@@ -68,13 +68,6 @@ PENDING_FAMILIES: Mapping[str, str] = {
 
 MTP_BLOCKS = ("mtp", "language_model.mtp")
 """Block prefixes of multi-token prediction."""
-
-MTP_ROOT = "mtp"
-MODEL_ROOTS = frozenset({"embedding", "decoder", "output_layer"})
-"""Top-level modules of a single-root model that rules cover."""
-
-MULTI_ROOTS = frozenset({"language_model", "vision_model", "vision_projection"})
-"""Top-level modules of a vision-language (LLaVA-style) model."""
 
 HYBRID_SPEC_MODULES = (
     "megatron.core.models.hybrid.hybrid_layer_specs",
@@ -335,7 +328,7 @@ def fp8_delayed_scaling(facts: Facts) -> Iterator[Refusal]:
 @REGISTRY.detector
 def unknown_roots(facts: Facts) -> Iterator[Refusal]:
     """FC-R13: model keys under a top-level module the rules do not know."""
-    known = MODEL_ROOTS | MULTI_ROOTS | {MTP_ROOT}
+    known = SINGLE_ROOTS | VLM_ROOTS
     unknown = tuple(
         key
         for key in sorted(facts.model)
@@ -384,13 +377,6 @@ def _block_heads(blocks: tuple[str, ...]) -> tuple[str, ...]:
 def _mtp_keys(facts: Facts) -> tuple[str, ...]:
     """Keys of multi-token prediction layers."""
     return tuple(key for key in sorted(facts.model) if key.startswith(_block_heads(MTP_BLOCKS)))
-
-
-@REGISTRY.detector
-def pending_multiple_roots(facts: Facts) -> Iterator[Refusal]:
-    """FC-P02: a vision-language model with several roots."""
-    keys = tuple(key for key in sorted(facts.model) if root_of(key) in MULTI_ROOTS)
-    yield from _pending(errors.FC_P02, [], keys)
 
 
 @REGISTRY.detector

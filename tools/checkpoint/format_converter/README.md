@@ -18,8 +18,9 @@ host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 This version inspects and verifies stores, rewrites `torch_dist` stores with
 model weights only, converts the model weights of per-layer hybrid models
 (attention `*` and MLP `-` layers) between `torch_dist` and `fsdp_dtensor` in
-both directions, and GPT models (`TransformerBlock` decoders, stacked or per
-layer in `torch_dist`) in both directions. Every other model family is
+both directions, GPT models (`TransformerBlock` decoders, stacked or per
+layer in `torch_dist`) in both directions, and vision-language models in the
+LLaVA layout whose language model is one of those. Every other model family is
 refused, before anything is read, with a pending-family code until the change
 that supports it lands (see [Roadmap](#roadmap)). This file is the living
 design document of the package.
@@ -196,11 +197,15 @@ training arguments and the model keys (names and shapes) go through the
 refusal fence: a model part no rule is verified for is refused with an `FC-R`
 (never supported) or `FC-P` (pending family) code, and every refusal found is
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
-from attention (`*`) and MLP (`-`) layers with a single model root
-(`embedding`, `decoder`, `output_layer`), and GPT models (no hybrid pattern;
-attention and MLP `TransformerBlock` layers), in both directions; stage
-separators (`|`) in the pattern are fine, and a `torch_dist` source may have
-been saved with pipeline parallelism (its keys are global).
+from attention (`*`) and MLP (`-`) layers, and GPT models (no hybrid pattern;
+attention and MLP `TransformerBlock` layers), in both directions, with a
+single model root (`embedding`, `decoder`, `output_layer`) or as the language
+model of a vision-language model (LLaVA layout: `language_model.`,
+`vision_model.` with a `TransformerBlock` encoder `vision_model.decoder`,
+`vision_projection.`); stage separators (`|`) in the pattern are fine, and a
+`torch_dist` source may have been saved with pipeline parallelism (its keys
+are global). Keys under other top-level modules are refused (`FC-R13`) unless
+`--allow-root PREFIX` converts them unchanged.
 
 * **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
   `module.` level; the store's planner data records `('model', 'module.<name>')`);
@@ -215,7 +220,9 @@ been saved with pipeline parallelism (its keys are global).
   (`[l:l+1, ...]`) is written as its own tensor, read straight from its
   stored chunk. Stacked tensors must agree on the number of layers, a
   per-layer block must hold layers `0..L-1`, a block holds one form only, and
-  the decoder must have `args.num_layers` layers (`FC-R12` otherwise).
+  the decoder must have `args.num_layers` layers (`args.decoder_num_layers` in
+  a vision-language model that sets it, as `pretrain_vlm.py` does; `FC-R12`
+  otherwise).
   Converting to `torch_dist`, each block gets the layout the loading job will
   ask for, since Megatron's loader requests the layout its own model builds:
   the decoder is per layer iff `TransformerBlock.sharded_state_dict` builds it
@@ -226,8 +233,12 @@ been saved with pipeline parallelism (its keys are global).
   also builds it per layer for heterogeneous layer specs and `dsv4_hybrid`
   attention, whose arguments are refused (`FC-R03`, `FC-R20`). Arguments
   that make it stacked while its layers differ in names, shapes or dtypes are
-  refused (`FC-R12`); the layout is never switched silently. A layer list of
-  an unknown kind needs `--block-layout` (`FC-A02`).
+  refused (`FC-R12`); the layout is never switched silently. A vision
+  encoder (`vision_model.decoder`) is decided the same way: Megatron's
+  vision-language builders (`pretrain_vlm.py`, `examples/multimodal`) make its
+  configuration a copy of the language model's. A job that builds it from a
+  configuration of its own needs `--block-layout`. A layer list of an unknown
+  kind needs `--block-layout` (`FC-A02`).
   `--torch-dist-layout per-layer` stores every `TransformerBlock` one layer
   per key and sets `non_homogeneous_layers` in the store's `content_metadata`
   (from the one the manifest records, or Megatron's defaults
@@ -238,11 +249,11 @@ been saved with pipeline parallelism (its keys are global).
   `TransformerBlock` with that prefix (stacking needs layers that are alike);
   it wins over the other rules. It does not change the `content_metadata`, so
   the job that loads the store must build the block that way: a layout of the
-  decoder other than the one Megatron builds from the arguments and the
-  `content_metadata` is written with a warning, since a job built from them
-  cannot load it strictly (`--torch-dist-layout per-layer` is the loadable way
-  to store the decoder per layer). Both flags are refused (exit 2) unless an
-  `fsdp_dtensor` store is converted to `torch_dist`.
+  decoder or the vision encoder other than the one Megatron builds from the
+  arguments and the `content_metadata` is written with a warning, since a job
+  built from them cannot load it strictly (`--torch-dist-layout per-layer` is
+  the loadable way to store the decoder per layer). Both flags are refused
+  (exit 2) unless an `fsdp_dtensor` store is converted to `torch_dist`.
   When the source's manifest records another `torch_dist` layout of a block
   than the one decided, the conversion is refused (`FC-A06`) unless a flag
   asks for the block's layout or `--ignore-manifest` is given, so a round trip
@@ -419,14 +430,13 @@ arguments and the model keys before any tensor is read.
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers` for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder, or `--block-layout PREFIX=stacked`) |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`), model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
+| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`) |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`) or under both single-model and vision-language roots, model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), or a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones |
-| `FC-P02` | pending: models with several roots (`language_model.`, `vision_model.`, `vision_projection.`) |
 | `FC-P03` | pending: mixture-of-experts layers (`num_experts`, symbol `E`, expert or router keys) |
 | `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
 | `FC-P05` | pending: Gated DeltaProduct mixers (its spec or its `in_proj`/`conv1d` parts) |
@@ -437,7 +447,7 @@ arguments and the model keys before any tensor is read.
 | `FC-P10` | pending: GPT multi-token prediction and multi-latent attention (symbol `+`) |
 | `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
 | `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
-| `FC-A02` | converting to `torch_dist`, a layer list of an unknown kind (not the decoder), whose layout depends on its module: pass `--block-layout PREFIX=stacked` or `=per_layer` |
+| `FC-A02` | converting to `torch_dist`, a layer list of an unknown kind (not the language model's decoder or `vision_model.decoder`), whose layout depends on its module: pass `--block-layout PREFIX=stacked` or `=per_layer` |
 | `FC-A05` | `--from` disagrees with the detected format |
 | `FC-A06` | the source's `conversion_manifest.json` describes another store (its `.metadata` digest differs), or records another `torch_dist` layout of a block than the one decided (the hint names the flag that restores it); `--ignore-manifest` converts without restoring what it records |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |
@@ -647,12 +657,15 @@ only (`core/`, `rules/`):
 
 This version has one rule, `identity` (tensors stored the same way in both
 formats), and two kinds of blocks. The blocks a store holds are found from its
-keys (each key's innermost layer list); the registered block classifier
-recognizes the `HybridStack` decoder of a hybrid model (stored per layer,
-numbered by pattern position in `torch_dist`, which equals the dense index
-without shortcut-MoE grouping), and every other block is a `TransformerBlock`
-(`core/stacking.py`), numbered identically in both formats and stored stacked
-or per layer in `torch_dist`. A stacked `torch_dist` tensor decomposes into
+keys (each key's innermost layer list), and the model's roots from the keys'
+top-level modules: the language model's decoder is `decoder`, or
+`language_model.decoder` in a vision-language model. The registered block
+classifier recognizes the `HybridStack` decoder of a hybrid model (stored per
+layer, numbered by pattern position in `torch_dist`, which equals the dense
+index without shortcut-MoE grouping), and every other block is a
+`TransformerBlock` (`core/stacking.py`: the language model's decoder, a
+vision encoder, or a layer list of unknown kind), numbered identically in both
+formats and stored stacked or per layer in `torch_dist`. A stacked `torch_dist` tensor decomposes into
 one logical slice per layer: the box `[l:l+1, ...]` holding a logical tensor
 of the layer's shape (the slice records the squeezed leading axis), so rules
 never see the stacking; engine copies may add or drop leading size-1 axes

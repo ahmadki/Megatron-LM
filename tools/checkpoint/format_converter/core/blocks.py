@@ -27,12 +27,19 @@ Kinds of blocks:
 * ``transformer_block``: a ``TransformerBlock`` (a GPT decoder, a vision
   encoder), numbered identically in both formats and stored stacked or per
   layer in torch_dist (``core/stacking.py``).
+
+A model has a single root (``embedding``, ``decoder``, ``output_layer``,
+``mtp``), or is a vision-language model in the LLaVA layout: its language
+model under ``language_model.`` (``language_model.decoder`` and so on), a
+vision encoder under ``vision_model.`` (``vision_model.decoder`` is a
+``TransformerBlock``) and a projection under ``vision_projection.``
+(:func:`language_model_prefix`).
 """
 
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,15 +48,25 @@ from ..engine.metadata import TensorEntry
 from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
 from .hybrid_pattern import hybrid_pattern_of
-from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, split_layer_key
+from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, root_of, split_layer_key
 from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
 from .registry import REGISTRY
 
 HYBRID_STACK = "hybrid_stack"
 TRANSFORMER_BLOCK = "transformer_block"
 
-LM_DECODER = "decoder"
-"""Prefix of a single-root model's language-model decoder."""
+DECODER = "decoder"
+"""The language model's decoder, under the language model's prefix."""
+
+LANGUAGE_MODEL = "language_model"
+SINGLE_ROOTS = frozenset({"embedding", DECODER, "output_layer", "mtp"})
+"""Top-level modules of a single-root (GPT or hybrid) model."""
+
+VLM_ROOTS = frozenset({LANGUAGE_MODEL, "vision_model", "vision_projection"})
+"""Top-level modules of a vision-language (LLaVA-style) model."""
+
+VISION_DECODER = "vision_model.decoder"
+"""The vision encoder's ``TransformerBlock`` in a vision-language model."""
 
 
 @dataclass(frozen=True)
@@ -214,6 +231,33 @@ class BlockFacts:
         """The blocks the source holds, by prefix."""
         return take_census(self.model)
 
+    @functools.cached_property
+    def lm_decoder(self) -> str:
+        """The language model's decoder: ``decoder``, or ``language_model.decoder`` in a VLM."""
+        return language_model_prefix(self.model) + DECODER
+
+
+def language_model_prefix(model: Iterable[str]) -> str:
+    """The prefix of the language model's modules: ``language_model.`` in a vision-language model.
+
+    Args:
+        model: The model-relative keys.
+
+    Raises:
+        RefusedError: Keys are under both single-root and vision-language
+            top-level modules (FC-R13).
+    """
+    roots = {root_of(key) for key in model}
+    single, vlm = sorted(roots & SINGLE_ROOTS), sorted(roots & VLM_ROOTS)
+    if single and vlm:
+        raise Refusal(
+            errors.FC_R13,
+            f"model keys are under single-model roots ({', '.join(single)}) and vision-language "
+            f"roots ({', '.join(vlm)})",
+            hint="check that the store holds one model",
+        ).to_error()
+    return f"{LANGUAGE_MODEL}." if vlm else ""
+
 
 DefaultClassifier = Callable[[BlockFacts, BlockCensus], BlockLayout]
 """Classifies a block of the census that no registered classifier recognized."""
@@ -229,18 +273,19 @@ def hybrid_stack(facts: BlockFacts) -> Iterator[BlockLayout]:
     pattern = hybrid_pattern_of(facts.args)
     if pattern is None:
         return
-    census = facts.census.get(LM_DECODER)
+    prefix = facts.lm_decoder
+    census = facts.census.get(prefix)
     if census is not None and census.stacked:
         raise Refusal(
             errors.FC_R12,
-            f"{LM_DECODER} is a hybrid decoder ({pattern.text!r}), whose layers are stored one "
+            f"{prefix} is a hybrid decoder ({pattern.text!r}), whose layers are stored one "
             "per key, but the store holds tensors stacked over its layers",
             keys=census.stacked_keys(),
             hint="check that the arguments belong to this checkpoint",
         ).to_error()
     count = len(pattern.main)
     yield BlockLayout(
-        prefix=LM_DECODER,
+        prefix=prefix,
         kind=HYBRID_STACK,
         num_modules=count,
         td_layout=PER_LAYER,

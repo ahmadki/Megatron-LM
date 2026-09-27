@@ -30,6 +30,7 @@ from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
+from .keys import root_of
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
     DIALECTS,
@@ -203,6 +204,7 @@ def build_arch_context(
     )
     requested = dict(block_layouts or {})
     facts = BlockFacts(args, source, model, content_metadata, requested, per_layer)
+    log.append(_language_model(facts))
     blocks = classify_blocks(facts, default=transformer_block)
     log.extend(
         Derivation(f"{BLOCK_FIELD}{block.prefix}", _block_summary(block), block.evidence)
@@ -262,6 +264,18 @@ def _check_manifest(
         manifest.source.get("format"),
         f"{MANIFEST_FILE} of the conversion from {manifest.source.get('iter_dir')} "
         "(restores its sanitized arguments and content_metadata)",
+    )
+
+
+def _language_model(facts: BlockFacts) -> Derivation:
+    """Where the language model's decoder is: the model's roots say single or vision-language.
+
+    Raises:
+        RefusedError: The keys mix single-root and vision-language roots (FC-R13).
+    """
+    roots = sorted({root_of(key) for key in facts.model})
+    return Derivation(
+        "lm_decoder", facts.lm_decoder, f"model keys under {', '.join(roots) or 'no module'}"
     )
 
 

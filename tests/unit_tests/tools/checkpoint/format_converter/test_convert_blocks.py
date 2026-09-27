@@ -27,6 +27,7 @@ from ._synthetic import (
     product_grid,
     stack_layers,
     torch_save_bytes,
+    vision_language_tensors,
     write_fsdp_store,
     write_store,
     write_tracker,
@@ -40,6 +41,9 @@ PER_LAYER = gpt_tensors(LAYERS)
 """The GPT model one layer per key (what fsdp_dtensor stores, without the prefix)."""
 STACKED = stack_layers(PER_LAYER, "decoder")
 QKV = "decoder.layers.self_attention.linear_qkv.weight"
+VLM = vision_language_tensors(PER_LAYER)
+"""A vision-language model (the GPT model as its language model), one layer per key."""
+VLM_STACKED = stack_layers(stack_layers(VLM, "language_model.decoder"), "vision_model.decoder")
 
 
 def write_gpt_source(root, model, *, grids=None, args=None, content_metadata=None):
@@ -305,3 +309,86 @@ def test_a_stacked_store_comes_back_per_layer_when_asked(tmp_path):
     for key, tensor in read_tensors(out).items():
         assert bitwise_equal(tensor, PER_LAYER[key]), key
     assert read_common(out)["content_metadata"] == {**content, "non_homogeneous_layers": True}
+
+
+def test_a_vision_language_store_round_trips(tmp_path):
+    grids = {
+        **layer_grids(VLM_STACKED, "language_model.decoder"),
+        **layer_grids(VLM_STACKED, "vision_model.decoder"),
+    }
+    src = write_gpt_source(tmp_path / "src", VLM_STACKED, grids=grids)
+    report = convert_checkpoint(
+        src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0)
+    ).to_json()
+    expect_fsdp_store(tmp_path / "fsdp" / ITER, VLM)
+    derived = {d["field"]: d["value"] for d in report["derivations"]}
+    assert derived["lm_decoder"] == "language_model.decoder"
+    assert derived["blocks.language_model.decoder"]["num_modules"] == LAYERS
+    assert derived["blocks.vision_model.decoder"]["num_modules"] == 2
+    convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(VLM_STACKED)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, VLM_STACKED[key]), key
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
+
+
+def test_a_vision_language_training_save_stacks_each_block_in_its_dtype(tmp_path):
+    """Megatron-FSDP stores trainable weights as fp32 main weights and a frozen encoder as is."""
+    stored = {k: v.float() if k.startswith("language_model.") else v for k, v in VLM.items()}
+    args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, stored, args=args)
+    report = convert_checkpoint(store, tmp_path / "td" / ITER, ConvertOptions(workers=0))
+    out = tmp_path / "td" / ITER
+    expected = stack_layers(stack_layers(stored, "language_model.decoder"), "vision_model.decoder")
+    assert set(MetadataView.load(out).tensors) == set(expected)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, expected[key]), key
+    vision_qkv = "vision_model.decoder.layers.self_attention.linear_qkv.weight"
+    assert grid_of(out, vision_qkv) == [((layer, 0, 0), (1, 12, 4)) for layer in range(2)]
+    evidence = {d["field"]: d["evidence"] for d in report.plan["derivations"]}
+    assert evidence["blocks.vision_model.decoder"] == (
+        "its configuration is a copy of the language model's: Megatron stacks it (no per-layer "
+        "setting) and its layers are alike"
+    )
+
+
+def test_the_vision_encoder_is_laid_out_like_the_language_model(tmp_path, caplog):
+    """Megatron builds the vision encoder from a copy of the language model's configuration, so
+    arguments that make the language model per layer make the encoder per layer too."""
+    args = gpt_args(LAYERS, ckpt_format="fsdp_dtensor", use_megatron_fsdp=True, moe_layer_freq=2)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, VLM, args=args)
+    report = convert_checkpoint(store, tmp_path / "td" / ITER, ConvertOptions(workers=0))
+    out = tmp_path / "td" / ITER
+    assert set(MetadataView.load(out).tensors) == set(VLM)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, VLM[key]), key
+    evidence = {d["field"]: d["evidence"] for d in report.plan["derivations"]}
+    assert evidence["blocks.vision_model.decoder"] == (
+        "its configuration is a copy of the language model's: Megatron builds it per layer "
+        "(args.moe_layer_freq=2)"
+    )
+    assert "cannot load this store strictly" not in caplog.text
+    options = ConvertOptions(workers=0, block_layouts=(("vision_model.decoder", "stacked"),))
+    convert_checkpoint(store, tmp_path / "own" / ITER, options)  # an encoder of its own config
+    assert "vision_model.decoder.layers.mlp.linear_fc1.weight" in read_tensors(
+        tmp_path / "own" / ITER
+    )
+    assert "builds vision_model.decoder per_layer (args.moe_layer_freq=2)" in caplog.text
+
+
+def test_a_vision_language_model_with_decoder_num_layers_round_trips(tmp_path):
+    """``pretrain_vlm.py --encoder-num-layers 2 --decoder-num-layers 3``: ``validate_args`` sets
+    num_layers to 2, and the language model gets decoder_num_layers layers."""
+    args = gpt_args(2, encoder_num_layers=2, decoder_num_layers=LAYERS)
+    grids = {
+        **layer_grids(VLM_STACKED, "language_model.decoder"),
+        **layer_grids(VLM_STACKED, "vision_model.decoder"),
+    }
+    src = write_gpt_source(tmp_path / "src", VLM_STACKED, grids=grids, args=args)
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    expect_fsdp_store(tmp_path / "fsdp" / ITER, VLM)
+    convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(VLM_STACKED)
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
