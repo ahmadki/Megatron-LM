@@ -23,6 +23,8 @@ from ._synthetic import (
     TORCH_DIST_CONFIG,
     gpt_args,
     gpt_tensors,
+    hybrid_args,
+    hybrid_tensors,
     layer_grids,
     product_grid,
     stack_layers,
@@ -391,4 +393,45 @@ def test_a_vision_language_model_with_decoder_num_layers_round_trips(tmp_path):
     convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
     out = tmp_path / "back" / ITER
     assert set(MetadataView.load(out).tensors) == set(VLM_STACKED)
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
+
+
+HYBRID_VLM = vision_language_tensors(hybrid_tensors("*-*-"))
+"""The vision-language archetype: a per-layer hybrid ``*-*-`` language model and a vision
+encoder, one layer per key (what fsdp_dtensor stores)."""
+
+
+def test_a_vision_language_hybrid_converts_both_ways(tmp_path):
+    """torch_dist stores the hybrid decoder per layer and the vision encoder stacked."""
+    source = stack_layers(HYBRID_VLM, "vision_model.decoder")
+    assert "language_model.decoder.layers.1.mlp.linear_fc1.weight" in source
+    assert source["vision_model.decoder.layers.mlp.linear_fc1.weight"].shape == (2, 8, 4)
+    args = hybrid_args("*-|*-")
+    src = write_gpt_source(
+        tmp_path / "src", source, grids=layer_grids(source, "vision_model.decoder"), args=args
+    )
+    report = convert_checkpoint(
+        src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0)
+    ).to_json()
+    expect_fsdp_store(tmp_path / "fsdp" / ITER, HYBRID_VLM)
+    blocks = {
+        d["field"]: (d["value"]["kind"], d["value"]["td_layout"])
+        for d in report["derivations"]
+        if d["field"].startswith("blocks.")
+    }
+    assert blocks == {
+        "blocks.language_model.decoder": ("hybrid_stack", "per_layer"),
+        "blocks.vision_model.decoder": ("transformer_block", "stacked"),
+    }
+    convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(source)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, source[key]), key
+    assert grid_of(out, "language_model.decoder.layers.0.self_attention.linear_qkv.weight") == [
+        ((0, 0), (24, 8))
+    ]
+    assert grid_of(out, "vision_model.decoder.layers.mlp.linear_fc1.weight") == [
+        ((layer, 0, 0), (1, 8, 4)) for layer in range(2)
+    ]
     assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
