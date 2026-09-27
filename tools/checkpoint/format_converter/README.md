@@ -546,8 +546,13 @@ only (`core/`, `rules/`):
 * A **model-relative key** is a model tensor's key without its envelope
   (`fsdp_dtensor` stores prefix `model.module.`; `torch_dist` keys are bare).
   `core/keys.py` holds the whole key grammar: `<block>.layers.<index>.<path>.<leaf>`
-  inside a layered block, `<path>.<leaf>` elsewhere, and every regular
-  expression over keys.
+  inside a layered block (`<block>.layers.<path>.<leaf>` for a tensor stacked
+  over the block's layers), `<path>.<leaf>` elsewhere, and every regular
+  expression over keys. Blocks nest (a multi-token prediction depth holds the
+  layer list of its inner model): a key belongs to the innermost block whose
+  layer list holds it, the longest block prefix, and only that block's layer
+  segment is interpreted, so `vision_model.decoder`, `language_model.decoder`
+  and `mtp` keys never mix.
 * A **`LogicalId`** (`core/logical.py`) names a tensor as the live model does:
   its block (e.g. `decoder`), its *dense* layer index (the `nn.ModuleList`
   position), the module path inside the layer and the leaf name. The two

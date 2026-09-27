@@ -27,7 +27,7 @@ from .. import errors
 from ..errors import InternalError, Refusal
 from .args_view import ArgsView
 from .hybrid_pattern import hybrid_pattern_of
-from .keys import LAYERS, KeyGrammarError, split_layer_key
+from .keys import KeyGrammarError, split_layer_key
 from .names import FSDP_DTENSOR, TORCH_DIST
 from .registry import REGISTRY
 
@@ -165,16 +165,15 @@ def _check_num_layers(block: BlockLayout, args: ArgsView) -> None:
 
 
 def _check_stored_indices(block: BlockLayout, model: Mapping[str, Any], source: str) -> None:
-    head = f"{block.prefix}.{LAYERS}."
+    """The layer indices under the block's own layer segment (nested blocks' keys included)."""
     stored: set[int] = set()
     for key in model:
-        if key.startswith(head):
-            try:
-                layer_key = split_layer_key(key, block.prefix)
-            except KeyGrammarError:
-                continue  # refused with the key by the planner
-            if layer_key is not None:
-                stored.add(layer_key.index)
+        try:
+            layer_key = split_layer_key(key, block.prefix)
+        except KeyGrammarError:
+            continue  # refused with the key by the planner
+        if layer_key is not None and layer_key.index is not None:
+            stored.add(layer_key.index)
     expected = set(block.stored_indices(source))
     if stored != expected:
         missing, unexpected = sorted(expected - stored), sorted(stored - expected)

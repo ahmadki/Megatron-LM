@@ -51,8 +51,46 @@ def test_the_longest_block_prefix_wins():
     assert (lid.block, lid.layer, lid.path, lid.leaf) == ("decoder.layers.0.inner", 0, "", "weight")
 
 
+def test_blocks_of_other_namespaces_keep_their_own_numbering():
+    language = BlockLayout(
+        "language_model.decoder", "hybrid_stack", 3, "per_layer", (0, 2, 3), None, ""
+    )
+    vision = BlockLayout("vision_model.decoder", "hybrid_stack", 2, "per_layer", (0, 1), None, "")
+    mtp = BlockLayout("mtp", "hybrid_stack", 2, "per_layer", (0, 1), None, "")
+    blocks = [language, vision, mtp, SPARSE]
+    for key, lid in [
+        (
+            "language_model.decoder.layers.3.mlp.linear_fc1.weight",
+            LogicalId("language_model.decoder", 2, "mlp.linear_fc1", "weight"),
+        ),
+        (
+            "vision_model.decoder.layers.1.mlp.linear_fc1.weight",
+            LogicalId("vision_model.decoder", 1, "mlp.linear_fc1", "weight"),
+        ),
+        (
+            "mtp.layers.1.transformer_layer.mlp.linear_fc1.weight",
+            LogicalId("mtp", 1, "transformer_layer.mlp.linear_fc1", "weight"),
+        ),
+        (
+            "decoder.layers.2.mlp.linear_fc1.weight",
+            LogicalId("decoder", 1, "mlp.linear_fc1", "weight"),
+        ),
+    ]:
+        assert decompose(key, blocks, TORCH_DIST) == lid
+        assert compose(lid, blocks, TORCH_DIST) == key
+    dense = LogicalId("language_model.decoder", 2, "mlp.linear_fc1", "weight")
+    expected = "language_model.decoder.layers.2.mlp.linear_fc1.weight"
+    assert compose(dense, blocks, FSDP_DTENSOR) == expected
+
+
 @pytest.mark.parametrize(
-    "key", ["decoder.layers.7.mlp.linear_fc1.weight", "decoder.layers.x.weight", "decoder.layers.1"]
+    "key",
+    [
+        "decoder.layers.7.mlp.linear_fc1.weight",  # not a stored index
+        "decoder.layers.x.weight",  # stacked over a per-layer block
+        "decoder.layers.1",
+        "decoder.layers.01.x.weight",
+    ],
 )
 def test_keys_the_layout_cannot_place_are_grammar_errors(key):
     with pytest.raises(KeyGrammarError):

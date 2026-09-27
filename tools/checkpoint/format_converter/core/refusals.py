@@ -41,12 +41,14 @@ from .keys import (
     GDN_PARAM,
     GDP_PART,
     GLU_HALF,
-    LAYERS,
+    LAYER_SEGMENT,
     MIXER_PARAM,
     MLA_PARAM,
     STACKED_LAYERS,
     TE_OP_FUSER_MLP,
+    KeyGrammarError,
     fc2_weight_of,
+    innermost_layer_key,
     root_of,
 )
 from .names import FSDP_DTENSOR, TORCH_DIST
@@ -392,7 +394,7 @@ def unverified_layers(facts: Facts) -> Iterator[Refusal]:
 
 def _block_heads(blocks: tuple[str, ...]) -> tuple[str, ...]:
     """The key prefixes of the layer lists of ``blocks``."""
-    return tuple(f"{block}.{LAYERS}." for block in blocks)
+    return tuple(block + LAYER_SEGMENT for block in blocks)
 
 
 def _mtp_keys(facts: Facts) -> tuple[str, ...]:
@@ -401,16 +403,30 @@ def _mtp_keys(facts: Facts) -> tuple[str, ...]:
 
 
 def _block_keys(facts: Facts, hybrid: bool) -> tuple[str, ...]:
-    """Keys in a layer list other than the hybrid decoder's and multi-token prediction's.
+    """Keys whose innermost layer list is not the hybrid decoder's or multi-token prediction's.
 
-    Stacked keys (``layers.`` without an index) count wherever they are.
+    Layer lists nested in a multi-token prediction depth (its inner model)
+    count as multi-token prediction's; stacked keys (``layers.`` without an
+    index) count wherever they are. Keys with a malformed layer segment are
+    left to the planner, which refuses them with the grammar error.
     """
-    own = _block_heads(MTP_BLOCKS + (HYBRID_DECODERS if hybrid else ()))
-    return tuple(
-        key
-        for key in sorted(facts.model)
-        if STACKED_LAYERS.search(key) or (f".{LAYERS}." in f".{key}" and not key.startswith(own))
-    )
+    decoders = HYBRID_DECODERS if hybrid else ()
+    return tuple(key for key in sorted(facts.model) if _in_other_block(key, decoders))
+
+
+def _in_other_block(key: str, decoders: tuple[str, ...]) -> bool:
+    try:
+        layer_key = innermost_layer_key(key)
+    except KeyGrammarError:
+        return False
+    if layer_key is None:
+        return False
+    if layer_key.stacked:
+        return True
+    block = layer_key.block
+    if block in decoders or block in MTP_BLOCKS:
+        return False
+    return not block.startswith(_block_heads(MTP_BLOCKS))
 
 
 @REGISTRY.detector

@@ -172,6 +172,10 @@ CASES = {
         errors.FC_P01,
         facts(keys={"encoder.layers.0.linear.weight": (H, H)}, allowed_roots=("encoder",)),
     ),
+    "P01 nested block": (
+        errors.FC_P01,
+        facts(keys={"decoder.layers.1.mlp.layers.0.linear.weight": (H, H)}),
+    ),
     "P02 roots": (
         errors.FC_P02,
         facts(keys={"language_model.decoder.layers.0.self_attention.linear_proj.weight": (H, H)}),
@@ -184,6 +188,13 @@ CASES = {
     "P04 legacy mtp": (
         errors.FC_P04,
         facts(args={"mtp_hybrid_override_pattern": "*-", "mtp_num_layers": 2}),
+    ),
+    "P04 hybrid mtp keys": (
+        errors.FC_P04,
+        facts(
+            args={"hybrid_layer_pattern": "*-*-/*-"},
+            keys={"mtp.layers.0.mtp_model_layer.layers.1.mlp.linear_fc2.weight": (H, F)},
+        ),
     ),
     "P05 spec": (
         errors.FC_P05,

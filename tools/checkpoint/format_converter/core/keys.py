@@ -9,8 +9,9 @@ envelope and its section rules.
 
 A *model-relative key* is a model tensor's key without its format envelope
 (torch_dist keys are bare; fsdp_dtensor keys lose their ``model.module.``
-prefix). Inside a layered block it reads ``<block>.layers.<index>.<path>.<leaf>``,
-elsewhere ``<path>.<leaf>``:
+prefix). Inside a layered block it reads ``<block>.layers.<index>.<path>.<leaf>``
+(one layer), or ``<block>.layers.<path>.<leaf>`` for a tensor stacked over all
+the layers of the block (torch_dist only); elsewhere it reads ``<path>.<leaf>``:
 
 * ``block``: the dotted prefix of the block's layer list, e.g. ``decoder``;
 * ``index``: the layer index as the format stores it (the two formats may
@@ -19,17 +20,31 @@ elsewhere ``<path>.<leaf>``:
 * ``path``: the module path inside the layer, or from the model root outside
   blocks, e.g. ``self_attention.linear_qkv``; it may be empty;
 * ``leaf``: the parameter or buffer name, e.g. ``weight`` or ``layer_norm_weight``.
+
+Blocks nest: a layer may hold a layer list of its own (a multi-token
+prediction depth holds the layers of its inner model, e.g.
+``mtp.layers.0.mtp_model_layer.layers.2.<name>``). A key belongs to the
+*innermost* block whose layer list holds it: the longest block prefix, and
+only that block's layer segment is interpreted; the segments of the blocks
+around it are part of the prefix and kept as they are. Blocks of different
+model roots never share keys (``vision_model.decoder`` and
+``language_model.decoder`` are different prefixes).
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 LAYERS = "layers"
 """Name of the layer list of a block (``nn.ModuleList`` attribute)."""
 
+LAYER_SEGMENT = f".{LAYERS}."
+"""The segment that separates a block prefix from what its layer list holds."""
+
 _INDEX_AND_INNER = re.compile(r"(?P<index>0|[1-9][0-9]*)\.(?P<inner>.+)")
+_NAME_START = re.compile(r"[A-Za-z_]")
 
 
 class KeyGrammarError(ValueError):
@@ -42,16 +57,22 @@ class LayerKey:
 
     Attributes:
         block: The block prefix, e.g. ``decoder``.
-        index: The stored layer index.
+        index: The stored layer index, or ``None`` for a tensor stacked over
+            every layer of the block (``<block>.layers.<inner>``).
         inner: The rest of the key inside the layer, ``<path>.<leaf>``.
     """
 
     block: str
-    index: int
+    index: int | None
     inner: str
 
+    @property
+    def stacked(self) -> bool:
+        """Whether the key holds every layer of the block (no layer index)."""
+        return self.index is None
+
     def render(self) -> str:
-        """The key: ``<block>.layers.<index>.<inner>``."""
+        """The key: ``<block>.layers.<index>.<inner>`` (``<block>.layers.<inner>`` if stacked)."""
         return join_layer_key(self.block, self.index, self.inner)
 
 
@@ -63,22 +84,70 @@ def split_layer_key(key: str, block: str) -> LayerKey | None:
 
     Raises:
         KeyGrammarError: ``key`` is under ``<block>.layers.`` but the segment
-            after it is not a canonical layer index followed by a name.
+            after it is neither a canonical layer index followed by a name nor
+            a name (a stacked tensor).
     """
-    head = f"{block}.{LAYERS}."
+    head = block + LAYER_SEGMENT
     if not key.startswith(head):
         return None
-    match = _INDEX_AND_INNER.fullmatch(key[len(head) :])
-    if match is None:
-        raise KeyGrammarError(f"{key}: expected {head}<index>.<name> with a canonical index")
-    return LayerKey(block, int(match.group("index")), match.group("inner"))
+    return _parse_layers(key, block, key[len(head) :])
 
 
-def join_layer_key(block: str, index: int, inner: str) -> str:
-    """The model-relative key ``<block>.layers.<index>.<inner>``."""
+def innermost_layer_key(key: str) -> LayerKey | None:
+    """Parse ``key`` at its last layer segment: the innermost layer list that holds it.
+
+    This finds the blocks a store holds without knowing them in advance.
+
+    Returns:
+        The parsed key, or ``None`` when ``key`` is in no layer list.
+
+    Raises:
+        KeyGrammarError: The segment after the last ``.layers.`` is malformed
+            (see :func:`split_layer_key`).
+    """
+    at = key.rfind(LAYER_SEGMENT)
+    if at <= 0:
+        return None
+    return _parse_layers(key, key[:at], key[at + len(LAYER_SEGMENT) :])
+
+
+def attribute_layer_key(key: str, blocks: Iterable[str]) -> LayerKey | None:
+    """Parse ``key`` inside the innermost of ``blocks`` whose layer list holds it.
+
+    The innermost block is the one with the longest prefix; the layer segments
+    of the blocks around it stay part of that prefix.
+
+    Returns:
+        The parsed key, or ``None`` when no block's layer list holds ``key``.
+
+    Raises:
+        KeyGrammarError: The innermost block's layer segment is malformed.
+    """
+    holders = [block for block in blocks if key.startswith(block + LAYER_SEGMENT)]
+    if not holders:
+        return None
+    return split_layer_key(key, max(holders, key=len))
+
+
+def _parse_layers(key: str, block: str, rest: str) -> LayerKey:
+    match = _INDEX_AND_INNER.fullmatch(rest)
+    if match is not None:
+        return LayerKey(block, int(match.group("index")), match.group("inner"))
+    if _NAME_START.match(rest) is None:
+        raise KeyGrammarError(
+            f"{key}: expected {block}{LAYER_SEGMENT}<index>.<name> with a canonical index, or "
+            f"{block}{LAYER_SEGMENT}<name> for a tensor stacked over the layers"
+        )
+    return LayerKey(block, None, rest)
+
+
+def join_layer_key(block: str, index: int | None, inner: str) -> str:
+    """The model-relative key ``<block>.layers.<index>.<inner>`` (``index`` ``None``: stacked)."""
+    if index is None:
+        return f"{block}{LAYER_SEGMENT}{inner}"
     if index < 0:
         raise KeyGrammarError(f"layer index {index} of {block} is negative")
-    return f"{block}.{LAYERS}.{index}.{inner}"
+    return f"{block}{LAYER_SEGMENT}{index}.{inner}"
 
 
 def split_leaf(name: str) -> tuple[str, str]:
