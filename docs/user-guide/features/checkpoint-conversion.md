@@ -59,8 +59,9 @@ checkpoints (`FC-R13`).
 | Model family | `torch_dist` to `fsdp_dtensor` | `fsdp_dtensor` to `torch_dist` | Optimizer state | Tensor parallelism | Tested by |
 |---|---|---|---|---|---|
 | Hybrid attention and MLP layers (`--hybrid-layer-pattern` with `*` and `-`) | yes | yes | dropped | any source size; the output holds full tensors | synthetic stores; real-save chain at TP 1 and 2 |
-| GPT with dense, non-gated MLP layers (no MoE, SwiGLU, MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
+| GPT with non-gated MLP layers (dense here, mixture-of-experts in the row below; no SwiGLU, MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
 | Vision-language models in the LLaVA layout (a GPT or hybrid language model above, a vision encoder `vision_model.decoder`, a projection) | yes | yes | dropped | as above | synthetic stores; real-save chain of a tiny LLaVA (GPT language model, CLIP encoder) at TP 1 and 2; hybrid language model on synthetic stores only |
+| Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E` without shortcut connections): routed experts that are not gated (no SwiGLU), grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
 
 Model families that later versions add are refused before anything is read,
 with a pending-family code:
@@ -198,6 +199,61 @@ conversion is refused (`FC-A06`) unless a flag chooses that block's layout or
 `--ignore-manifest` is given, so a round trip restores the source's layout or
 fails.
 
+### Mixture-of-experts layers
+
+A mixture-of-experts layer's routed experts (`<...>.mlp.experts`) have one
+`linear_fc1` and one `linear_fc2` weight, and bias, per expert. `torch_dist`
+stores each as one tensor over all experts,
+`<...>.mlp.experts.experts.linear_fc<n>.weight` of shape `[E, ...]` (or
+`[L, E, ...]` in a stacked decoder), expert `e` at index `e` of its expert
+axis and each (layer, expert) as a chunk of its own; `TEGroupedMLP` and
+`SequentialMLP` experts write the same keys. `fsdp_dtensor` stores one
+tensor per expert under its global index, named as the experts module names
+its parameters:
+
+* grouped (`TEGroupedMLP`): `<...>.mlp.experts.linear_fc1.weight<e>`;
+* sequential (`SequentialMLP`): `<...>.mlp.experts.local_experts.<e>.linear_fc1.weight`.
+
+Converting to `fsdp_dtensor`, each expert is read straight from its chunk
+and named as the loading job's experts module names it: grouped for a hybrid
+model (its stack spec always builds `TEGroupedMLP` experts), otherwise
+grouped if the arguments set `--moe-grouped-gemm` and sequential if not.
+For a GPT model, `--expert-naming grouped|sequential` chooses instead, for a
+job built otherwise, and sets `moe_grouped_gemm` in the store's arguments to
+match. A hybrid model's experts cannot be named otherwise (exit 2): no
+argument changes the experts module its stack spec builds.
+Converting to `torch_dist`, each expert is written as its own chunk of the
+expert tensor, which is never assembled whole in memory. An `fsdp_dtensor`
+source must name its experts as its arguments build them (`FC-A04`
+otherwise; `--expert-naming` with the store's naming accepts it).
+`args.num_experts` must be the length of every expert axis, and every
+`fsdp_dtensor` expert tensor must be stored for exactly the experts
+`0..E-1` (`FC-R12` for indices that are not contiguous from 0, `FC-R13` for
+another number of experts).
+
+The router (`router.weight`, the fp32 buffers `expert_bias` and `qb_beta`,
+the int32 hash-routing table `tid2eid`), shared experts and latent
+projections (`fc1_latent_proj`, `fc2_latent_proj`, `fc2_norm`) are stored
+alike in both formats and keep their dtypes.
+
+Megatron-FSDP names the biases of grouped experts by their
+expert-parallel-local index (it renumbers only the weights), so a store with
+grouped expert biases is right only at expert-parallel size 1: converting a
+checkpoint saved with expert parallelism and grouped expert biases is
+refused in both directions (`FC-R05`; for a GPT model,
+`--expert-naming sequential` writes sequential experts, which name their
+biases by global index), and a conversion that writes grouped expert biases
+warns that the store loads correctly only into a job with
+`--expert-model-parallel-size 1`.
+
+Refused as well: single grouped expert parameters
+(`--moe-single-grouped-weight`, `--moe-single-grouped-bias`, which
+Megatron-FSDP does not support; `FC-R04`), the legacy `GroupedMLP`
+(`weight1`/`weight2`; `FC-R13`) and checkpoints saved with
+`singleton_local_shards` (`FC-R17`). Gated experts (SwiGLU) are pending
+(`FC-P06`, `FC-P07`), and so are shortcut-connected mixture-of-experts layers
+(`FC-P04`).
+
 ### Vision-language models
 
 A model whose keys are under `language_model.`, `vision_model.` and
@@ -215,7 +271,8 @@ Every tensor is copied bit for bit with its dtype. Megatron's loaders cast on
 load: bfloat16 weights load exactly into Megatron-FSDP's fp32 main weights,
 and fp32 main weights round to a `torch_dist` job's parameters as a training
 step would. Tensors a job keeps in another dtype (a frozen encoder, fp32
-buffers) keep it.
+buffers such as a router's `expert_bias`, integer buffers such as
+`tid2eid`) keep it.
 
 ### Tensor parallelism
 
@@ -295,7 +352,7 @@ condition of every code.
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
 | `FC-R11` | layer indices that contradict the hybrid layer pattern |
-| `FC-R12` | inconsistently stacked layers, non-contiguous layer indices, or layers that differ where they would be stacked |
+| `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), or layers that differ where they would be stacked |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
 | `FC-R14` | the legacy N-D reformulated layout (load with current Megatron and save again) |
 | `FC-R17` | a store saved with `singleton_local_shards` |
@@ -330,10 +387,14 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** SwiGLU, state-space mixers,
-  Gated DeltaNet, multi-token prediction and multi-latent attention are
-  refused until the versions that add them (see the
-  [Support Matrix](#support-matrix)).
+- **Pending families.** SwiGLU, state-space mixers, Gated DeltaNet,
+  multi-token prediction, multi-latent attention and shortcut-connected
+  mixture-of-experts layers are refused until the versions that add them
+  (see the [Support Matrix](#support-matrix)).
+- **Grouped expert biases.** Megatron-FSDP keeps them under
+  expert-parallel-local indices: an `fsdp_dtensor` store with them loads
+  correctly only at expert-parallel size 1 (see
+  [Mixture-of-experts layers](#mixture-of-experts-layers)).
 - **Megatron-FSDP v1 only.** Megatron-FSDP v2 stores are refused.
 - **bf16 and fp16 Megatron-FSDP jobs.** On current Megatron, a Megatron-FSDP
   job with bf16 or fp16 parameters cannot load any `fsdp_dtensor` store
@@ -358,6 +419,15 @@ python -m tools.checkpoint.format_converter convert \
     /checkpoints/run_a /checkpoints/run_a_fsdp --to fsdp_dtensor
 python -m tools.checkpoint.format_converter convert \
     /checkpoints/run_a_fsdp /checkpoints/run_a_back --to torch_dist
+```
+
+Convert a mixture-of-experts GPT checkpoint trained with grouped experts
+(`--moe-grouped-gemm`) for a Megatron-FSDP job that builds sequential experts
+(a hybrid model's experts are always grouped):
+
+```bash
+python -m tools.checkpoint.format_converter convert \
+    /checkpoints/moe_run /checkpoints/moe_run_fsdp --to fsdp_dtensor --expert-naming sequential
 ```
 
 Convert a Megatron-FSDP save to `torch_dist` with every block per layer, and

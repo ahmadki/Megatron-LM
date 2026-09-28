@@ -118,7 +118,7 @@ and every other difference as a finding (exit 5):
 | `A` | a `torch_dist` -> `fsdp_dtensor` conversion vs a real `fsdp_dtensor` save | optimizer, scheduler, RNG, rerun and extra state only in `B`; `A`'s narrower floats equal `B`'s after the exact upcast; any chunk grid; the common state is not compared |
 | `B` | an `fsdp_dtensor` -> `torch_dist` conversion vs a real `torch_dist` save | that state only in `B`; `A`'s wider floats round (RNE) to `B`'s; any chunk grid; the common state is not compared |
 | `C` | two model-only saves of one step of a conversion chain in one format (real vs converted, or real vs real) | floats equal after the exact upcast; any chunk grid; the sanitized argument fields |
-| `D` | `torch_dist` -> `fsdp_dtensor` -> `torch_dist` vs the model-only source | only `args.no_save_optim` and `args.no_save_rng`, and rerun state only in `B`; `A`'s chunk grid must merge whole chunks of `B`'s (tensor-parallel splits merged), and never layers of a tensor stacked over layers; dtypes exact |
+| `D` | `torch_dist` -> `fsdp_dtensor` -> `torch_dist` vs the model-only source | only `args.no_save_optim` and `args.no_save_rng`, and rerun state only in `B`; `A`'s chunk grid must merge whole chunks of `B`'s (tensor-parallel splits merged), and never layers of a tensor stacked over layers or experts of a routed-expert tensor; dtypes exact |
 | `E` | `fsdp_dtensor` -> `torch_dist` -> `fsdp_dtensor` vs the source | that state only in `B`; any chunk grid; the sanitized argument fields |
 
 Keys, shapes, values and every other argument or common-state field must
@@ -198,15 +198,16 @@ training arguments and the model keys (names and shapes) go through the
 refusal fence: a model part no rule is verified for is refused with an `FC-R`
 (never supported) or `FC-P` (pending family) code, and every refusal found is
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
-from attention (`*`) and MLP (`-`) layers, and GPT models (no hybrid pattern;
-attention and MLP `TransformerBlock` layers), in both directions, with a
-single model root (`embedding`, `decoder`, `output_layer`) or as the language
-model of a vision-language model (LLaVA layout: `language_model.`,
-`vision_model.` with a `TransformerBlock` encoder `vision_model.decoder`,
-`vision_projection.`); stage separators (`|`) in the pattern are fine, and a
-`torch_dist` source may have been saved with pipeline parallelism (its keys
-are global). Keys under other top-level modules are refused (`FC-R13`) unless
-`--allow-root PREFIX` converts them unchanged.
+from attention (`*`), MLP (`-`) and mixture-of-experts (`E`) layers, and GPT
+models (no hybrid pattern; `TransformerBlock` layers of attention and a dense
+MLP or mixture-of-experts layer whose experts are not gated), in both
+directions, with a single model root (`embedding`, `decoder`, `output_layer`)
+or as the language model of a vision-language model (LLaVA layout:
+`language_model.`, `vision_model.` with a `TransformerBlock` encoder
+`vision_model.decoder`, `vision_projection.`); stage separators (`|`) in the
+pattern are fine, and a `torch_dist` source may have been saved with pipeline
+parallelism (its keys are global). Keys under other top-level modules are
+refused (`FC-R13`) unless `--allow-root PREFIX` converts them unchanged.
 
 * **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
   `module.` level; the store's planner data records `('model', 'module.<name>')`);
@@ -295,7 +296,9 @@ are global). Keys under other top-level modules are refused (`FC-R13`) unless
   mixture-of-experts layer are stored alike in both formats).
 * **Chunk grids.** `fsdp_dtensor` tensors are written as one chunk split along
   dimension 0 into chunks of at most `--max-output-chunk-bytes` (1 GiB);
-  `torch_dist` tensors stacked over layers as one chunk per layer and other
+  `torch_dist` tensors as one chunk per index of their leading layer and
+  expert axes (per layer of a tensor stacked over layers, per expert of an
+  expert tensor, per (layer, expert) of a stacked expert tensor) and other
   tensors as one chunk. A chunk that reads several stored chunks and is larger
   than half a unit is split along its first axis longer than 1. Both loaders
   read any grid.
@@ -414,6 +417,9 @@ codec) and still reports everything.
 | `--max-host-bytes SIZE` | host-memory budget of the whole conversion, else exit 8 (default 0.8 x `MemAvailable`) |
 | `--optimizer {drop,convert}` | `drop` optimizer state (default); `convert` is not supported yet (`FC-P11`, `FC-P12`) |
 | `--allow-root PREFIX` | convert model keys under this unknown top-level prefix unchanged (repeatable; cross-format) |
+| `--block-layout PREFIX=stacked\|per_layer` | store the block `PREFIX` of a `torch_dist` target stacked over its layers or one layer per key (repeatable; `fsdp_dtensor` source only) |
+| `--torch-dist-layout {native,per-layer}` | `per-layer` stores every `TransformerBlock` of a `torch_dist` target one layer per key and marks it in the `content_metadata`; `native` as Megatron would (default; `fsdp_dtensor` source only) |
+| `--expert-naming {auto,grouped,sequential}` | how `fsdp_dtensor` names routed experts: `auto` as the model's builder does (default), or as given, for a source or a GPT target (whose `moe_grouped_gemm` is set to match; a hybrid target is always `grouped`) |
 | `--max-output-chunk-bytes SIZE` | largest chunk of an `fsdp_dtensor` output tensor (default `1GiB`) |
 | `--allow-missing-fp8-extra-state` | write a `torch_dist` store for an FP8 delayed-scaling model without its scaling state (`FC-R07` otherwise) |
 | `--ignore-manifest` | do not restore what the source's `conversion_manifest.json` records |
@@ -462,7 +468,7 @@ arguments and the model keys before any tensor is read.
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`) |
+| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`); or an `fsdp_dtensor` expert tensor is stored for expert indices that are not `0..n-1` (such as `0-1, 3`) |
 | `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`) or under both single-model and vision-language roots, model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor`, parameters of the legacy `GroupedMLP` (`<...>.mlp.experts.weight1`/`weight2`: every local expert in one tensor), routed-expert tensors while `args.num_experts` is unset, or expert tensors of another number of experts than `args.num_experts` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
 | `FC-R17` | a store saved with `singleton_local_shards` (its `content_metadata` says so, or its experts are saved one key per expert, `<...>.mlp.experts.experts.<e>.<name>`) |
@@ -701,8 +707,15 @@ formats and stored stacked or per layer in `torch_dist`. A stacked `torch_dist` 
 one logical slice per layer: the box `[l:l+1, ...]` holding a logical tensor
 of the layer's shape (the slice records the squeezed leading axis), so rules
 never see the stacking; engine copies may add or drop leading size-1 axes
-(`CopyOp` boxes are equal up to them). The verified hybrid symbols are `*` and
-`-`.
+(`CopyOp` boxes are equal up to them). A routed-expert tensor of `torch_dist`
+(`<...>.mlp.experts.experts.linear_fc<n>.<leaf>`) has an expert axis after
+the layer axis, and decomposes into one slice per (layer, expert),
+`[l:l+1, e:e+1, ...]`; its `LogicalId` carries the global expert index and
+the module path `<...>.mlp.experts.linear_fc<n>`, which is also what both
+`fsdp_dtensor` namings (grouped `linear_fc<n>.<leaf><e>`, sequential
+`local_experts.<e>.linear_fc<n>.<leaf>`) parse to. The expert layout (number
+of experts and `fsdp_dtensor` naming, `core/experts.py`) is derived with the
+context. The verified hybrid symbols are `*`, `-` and `E`.
 
 ### Extension contract
 
@@ -826,10 +839,10 @@ the code under test.
 
 | Tier | Content |
 |---|---|
-| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation, key grammar, logical ids, pool and sentinels, one case per refusal code, architecture derivations, block layouts, plan compilation against hand-written pieces, manifest schema, the registry contract |
-| T1 | synthetic GPT, vision-language and hybrid vision-language stores (stacked and per-layer blocks, tensor-parallel chunk grids) converted both ways against tensors drawn one layer per key and stacked with `torch.stack`, metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, expected-difference contracts and plan replay, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on synthetic training saves in every direction, CLI exit codes, import boundary |
-| T2 | the common-state codec against Megatron's `load_common_state_dict`, the rewritten integrity manifest against Megatron's verifier, the pattern parser and the verified spec names against Megatron's objects, the grouped-tensor-parallel refusal against the weight-shard fields Megatron's `validate_args` stores, the stacking predicate against `TransformerBlock.sharded_state_dict` itself on int and list layer frequencies and `content_metadata` flags (container); the `fsdp_dtensor` preprocess handler set, the hybrid layer symbols and the Gated DeltaNet variant names scanned from Megatron's source (`ast`, host) |
-| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2; a hybrid model, a dense GPT and a tiny LLaVA (GPT language model, CLIP vision encoder, MLP projection; both `TransformerBlock`s stacked in `torch_dist`) through `torch_dist` -> `fsdp_dtensor` -> `torch_dist` with Megatron's own saves and strict loads, every store checked against a real save under its contract, and the GPT and LLaVA `fsdp_dtensor` saves also converted with `--torch-dist-layout per-layer` and loaded strictly (TP 1; TP 2 with `MCORE_FORMAT_CONVERTER_EXTENDED=1`) (container with GPUs) |
+| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation, key grammar (layers and experts), logical ids, pool and sentinels, one case per refusal code, architecture derivations, block and expert layouts, plan compilation against hand-written pieces, manifest schema, the registry contract |
+| T1 | synthetic GPT, GPT mixture-of-experts (grouped and sequential experts, stacked and per layer, router buffers in fp32 and int32, latent projections), vision-language and hybrid vision-language stores (stacked and per-layer blocks, tensor-parallel chunk grids) converted both ways against tensors drawn one layer per key and stacked with `torch.stack`, metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, expected-difference contracts and plan replay, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on synthetic training saves in every direction, CLI exit codes, import boundary |
+| T2 | the common-state codec against Megatron's `load_common_state_dict`, the rewritten integrity manifest against Megatron's verifier, the pattern parser and the verified spec names against Megatron's objects, the grouped-tensor-parallel refusal against the weight-shard fields Megatron's `validate_args` stores, the stacking predicate against `TransformerBlock.sharded_state_dict` itself on int and list layer frequencies and `content_metadata` flags, the expert naming against `get_expert_index_from_key` and the experts modules Megatron's builders build, and every expert tensor of a live MoE model's torch_dist sharded state dict against the name and value `handle_experts_in_state_dict` gives it at expert-parallel sizes 1 and 2 (container); the `fsdp_dtensor` preprocess handler set, the hybrid layer symbols and the Gated DeltaNet variant names scanned from Megatron's source (`ast`, host) |
+| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2; a GPT mixture-of-experts model (grouped experts at expert-parallel size 1, sequential and grouped at 2; router expert biases compared too) and a hybrid `*E*E` model; a hybrid model, a dense GPT and a tiny LLaVA (GPT language model, CLIP vision encoder, MLP projection; both `TransformerBlock`s stacked in `torch_dist`) through `torch_dist` -> `fsdp_dtensor` -> `torch_dist` with Megatron's own saves and strict loads, every store checked against a real save under its contract, and the GPT and LLaVA `fsdp_dtensor` saves also converted with `--torch-dist-layout per-layer` and loaded strictly (TP 1; TP 2 with `MCORE_FORMAT_CONVERTER_EXTENDED=1`) (container with GPUs) |
 
 Host run (skips the megatron-importing root `conftest.py`):
 
@@ -859,8 +872,9 @@ unsupported input refused with a stable code.
    Megatron-FSDP v1 adapter, per-layer hybrid models, expected-difference
    contracts and `verify --map convert` (done).
 4. Stacked `TransformerBlock` layers and multi-root vision-language models,
-   with the user guide (this version).
-5. MoE experts (grouped and sequential naming, router buffers).
+   with the user guide (done).
+5. Mixture-of-experts layers: routed experts in grouped and sequential
+   naming, router buffers (this version).
 6. GLU `linear_fc1`: SwiGLU split and unsplit, rank-major packs.
 7. Shortcut-MoE layer numbering and hybrid multi-token prediction.
 8. Gated DeltaProduct fused projections.
