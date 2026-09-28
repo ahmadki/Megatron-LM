@@ -8,10 +8,18 @@ import pytest
 
 from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
+from tools.checkpoint.format_converter.core.experts import EXPERT_MODULES, built_expert_form
 from tools.checkpoint.format_converter.core.hybrid_pattern import parse_hybrid_pattern
+from tools.checkpoint.format_converter.core.keys import (
+    join_fsdp_expert,
+    join_torch_dist_expert,
+    split_expert_name,
+)
 from tools.checkpoint.format_converter.core.names import (
     FSDP_DTENSOR,
+    GROUPED,
     PER_LAYER,
+    SEQUENTIAL,
     STACKED,
     TORCH_DIST,
 )
@@ -34,8 +42,12 @@ import copy
 import importlib
 import types
 
+from megatron.core.extensions import transformer_engine_spec_provider
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid import hybrid_layer_allocation
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import add_megatron_arguments
@@ -205,3 +217,62 @@ def test_the_vision_encoder_is_laid_out_like_megatrons_copy_of_the_language_conf
         "language_model.decoder": STACKED if _megatron_stacks(language, None) else PER_LAYER,
         "vision_model.decoder": STACKED if _megatron_stacks(vision, None) else PER_LAYER,
     }
+
+
+EXPERT_PATH = "decoder.layers.3.mlp.experts.linear_fc2"
+
+
+@pytest.mark.parametrize("form", [GROUPED, SEQUENTIAL])
+@pytest.mark.parametrize("leaf", ["weight", "bias"])
+def test_the_expert_grammar_reads_megatrons_expert_index(form, leaf):
+    """``get_expert_index_from_key`` is what Megatron-FSDP renumbers experts by: it reads our
+    global index from every fsdp_dtensor expert name but a grouped bias, whose index it does
+    not renumber (so it stays expert-parallel-local on disk: FC-R05)."""
+    key = join_fsdp_expert(EXPERT_PATH, leaf, 5, form)
+    assert split_expert_name(key, FSDP_DTENSOR).expert == 5
+    expected = None if (form, leaf) == (GROUPED, "bias") else 5
+    assert get_expert_index_from_key(key) == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        join_torch_dist_expert(EXPERT_PATH, "weight"),
+        "decoder.layers.3.mlp.shared_experts.linear_fc1.weight",
+        "decoder.layers.3.mlp.router.expert_bias",
+        "decoder.layers.3.mlp.linear_fc1.weight",
+    ],
+)
+def test_megatron_renumbers_no_other_key(key):
+    """torch_dist expert tensors, shared experts, the router and dense MLPs keep their names."""
+    assert get_expert_index_from_key(key) is None
+
+
+def _experts_module(mlp) -> str:
+    """The experts module class a MoE layer spec builds."""
+    return mlp.keywords["submodules"].experts.func.__name__
+
+
+needs_grouped_linear = pytest.mark.skipif(
+    transformer_engine_spec_provider.TEColumnParallelGroupedLinear is None,
+    reason="needs Transformer Engine's grouped linear layers (without them Megatron's TE specs "
+    "build SequentialMLP experts)",
+)
+
+
+@needs_grouped_linear
+@pytest.mark.parametrize("grouped", [True, False])
+def test_the_gpt_builders_build_the_experts_module_of_moe_grouped_gemm(grouped):
+    spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=grouped)
+    form, _ = built_expert_form(ArgsView(argparse.Namespace(moe_grouped_gemm=grouped)))
+    assert _experts_module(spec.submodules.mlp) == EXPERT_MODULES[form]
+
+
+@needs_grouped_linear
+def test_the_hybrid_stack_spec_always_builds_grouped_experts():
+    args = ArgsView(argparse.Namespace(hybrid_layer_pattern="*E", moe_grouped_gemm=False))
+    form, _ = built_expert_form(args)
+    assert form == GROUPED
+    assert _experts_module(hybrid_stack_spec.submodules.moe_layer.submodules.mlp) == (
+        EXPERT_MODULES[GROUPED]
+    )

@@ -64,22 +64,28 @@ from tools.checkpoint.format_converter.options import ConvertOptions, VerifyOpti
 
 __all__ = [
     "CHAIN_CHECKS",
+    "MOE_CONFIG",
+    "MOE_EXPERTS",
     "Utils",
     "build_gpt",
     "build_hybrid",
     "build_llava",
+    "build_moe_gpt",
     "build_te_gpt",
     "full_params",
     "live_params",
     "load_weights_only",
+    "moe_gpt_provider",
     "nccl_skip_reason",
     "on_rank_zero",
+    "persistent_buffers",
     "randomize_parameters",
     "real_save",
     "resolve_weight_shards",
     "run_chain",
     "save_weights_only",
     "set_format",
+    "set_moe_format",
     "training_args",
 ]
 
@@ -90,6 +96,14 @@ GPT_LAYERS = 3
 """Layers of the tiny GPT (TE spec) and of the language model of the tiny LLaVA."""
 VISION_LAYERS = 2
 VISION_HIDDEN = 16
+MOE_EXPERTS = 4
+MOE_CONFIG = {
+    "num_moe_experts": MOE_EXPERTS,
+    "moe_ffn_hidden_size": 32,
+    "moe_router_score_function": "sigmoid",
+    "moe_router_enable_expert_bias": True,
+}
+"""Mixture-of-experts layers of the tiny MoE models: 4 routed experts and an fp32 expert bias."""
 
 
 def nccl_skip_reason() -> str | None:
@@ -188,8 +202,9 @@ def hybrid_provider(
 
     Linear layers have biases, the MLP is not gated, and the output layer is
     untied from the embedding, so every kind of tensor these layers have is
-    in the checkpoint. Every parameter holds distinct values that depend on
-    ``seed`` (:func:`randomize_parameters`).
+    in the checkpoint. Every parameter (and router expert bias) holds distinct
+    values that depend on ``seed`` (:func:`randomize_parameters`,
+    :func:`randomize_router_buffers`).
     """
     for extra in ("pg_collection", "config", "vp_stage"):
         kwargs.pop(extra, None)
@@ -216,6 +231,7 @@ def hybrid_provider(
         share_embeddings_and_output_weights=False,
     )
     randomize_parameters(model, seed)
+    randomize_router_buffers(model, seed)
     return model
 
 
@@ -226,32 +242,69 @@ def randomize_parameters(model: torch.nn.Module, seed: int) -> None:
     different seeds would agree on them and a converter that wrote them
     under the wrong layer would go unnoticed. Tensor-parallel shards also
     draw from their rank, so replicated parameters stay equal across ranks
-    and the shards of one parameter differ.
+    and the shards of one parameter differ. Routed-expert parameters, whose
+    names hold local expert indices, draw from their expert-parallel rank as
+    well (and shard over expert tensor parallelism), so every expert differs.
     """
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    expert = (
+        parallel_state.get_expert_tensor_parallel_rank(),
+        parallel_state.get_expert_model_parallel_rank(),
+    )
     with torch.no_grad():
         for name, param in model.named_parameters():
-            shard = tp_rank if getattr(param, "tensor_model_parallel", False) else "all"
+            routed = ".mlp.experts." in f".{name}"
+            shard: object = expert[0] if routed else tp_rank
+            if not getattr(param, "tensor_model_parallel", False):
+                shard = "all"
+            if routed:
+                shard = f"{shard}/ep{expert[1]}"
             stream = zlib.crc32(f"{seed}/{name}/{shard}".encode())
             param.copy_(torch.randn(param.shape, generator=torch.Generator().manual_seed(stream)))
 
 
+def randomize_router_buffers(model: torch.nn.Module, seed: int) -> None:
+    """Overwrite each router's ``expert_bias`` (an fp32 buffer) with values drawn from ``(seed, name)``.
+
+    Megatron initializes it to zeros, which would hide a bias written under the
+    wrong layer; routers are replicated, so every rank draws the same values.
+    """
+    with torch.no_grad():
+        for name, buffer in model.named_buffers():
+            if name.endswith("router.expert_bias"):
+                stream = zlib.crc32(f"{seed}/{name}".encode())
+                values = torch.randn(buffer.shape, generator=torch.Generator().manual_seed(stream))
+                buffer.copy_(values)
+
+
 def build_hybrid(
-    seed: int, *, tp: int, pattern: str, use_megatron_fsdp: bool = False, bf16: bool = True
+    seed: int,
+    *,
+    tp: int,
+    pattern: str,
+    use_megatron_fsdp: bool = False,
+    bf16: bool = True,
+    ep: int = 1,
+    **config,
 ):
-    """A tiny hybrid model (classic or Megatron-FSDP v1) with a distributed optimizer."""
+    """A tiny hybrid model (classic or Megatron-FSDP v1) with a distributed optimizer.
+
+    ``config`` adds TransformerConfig fields (e.g. :data:`MOE_CONFIG` for ``E`` layers).
+    """
     return setup_model_and_optimizer(
         seed=seed,
         tp=tp,
         pp=1,
-        initialize_fn=partial(hybrid_provider, pattern=pattern),
+        initialize_fn=partial(hybrid_provider, pattern=pattern, **config),
         use_megatron_fsdp=use_megatron_fsdp,
         bf16=bf16,
+        ep=ep,
     )
 
 
 def _transformer_config(num_layers: int, hidden: int, heads: int, **kwargs) -> TransformerConfig:
-    """A TransformerConfig of linear layers with biases and no gated linear unit."""
+    """A TransformerConfig of linear layers with biases (unless ``kwargs`` says otherwise) and
+    no gated linear unit."""
     for extra in ("pg_collection", "config", "vp_stage"):
         kwargs.pop(extra, None)
     return TransformerConfig(
@@ -259,9 +312,8 @@ def _transformer_config(num_layers: int, hidden: int, heads: int, **kwargs) -> T
         hidden_size=hidden,
         num_attention_heads=heads,
         use_cpu_initialization=True,
-        add_bias_linear=True,
         gated_linear_unit=False,
-        **kwargs,
+        **{"add_bias_linear": True, **kwargs},
     )
 
 
@@ -326,6 +378,59 @@ def llava_provider(
     return model
 
 
+def moe_gpt_provider(
+    pre_process: bool = True, post_process: bool = True, *, seed: int, grouped: bool, **kwargs
+) -> GPTModel:
+    """A tiny GPT whose every layer is a mixture-of-experts layer (TE spec, stacked in torch_dist).
+
+    Its routed experts are ``TEGroupedMLP`` (``grouped``) or ``SequentialMLP``,
+    not gated, with biases unless ``add_bias_linear=False``; the router keeps an
+    fp32 expert bias. Every parameter and expert bias holds distinct values
+    (:func:`randomize_parameters`, :func:`randomize_router_buffers`).
+    """
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    config = _transformer_config(
+        GPT_LAYERS, HYBRID_HIDDEN, HYBRID_HEADS, moe_grouped_gemm=grouped, **MOE_CONFIG, **kwargs
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+            num_experts=MOE_EXPERTS, moe_grouped_gemm=grouped
+        ),
+        vocab_size=HYBRID_VOCAB,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        share_embeddings_and_output_weights=False,
+    )
+    randomize_parameters(model, seed)
+    randomize_router_buffers(model, seed)
+    return model
+
+
+def build_moe_gpt(
+    seed: int,
+    *,
+    tp: int,
+    ep: int,
+    grouped: bool,
+    use_megatron_fsdp: bool = False,
+    bf16: bool = True,
+    **config,
+):
+    """A tiny MoE GPT (classic or Megatron-FSDP v1) with its optimizer, ``ep`` expert-parallel ranks."""
+    return setup_model_and_optimizer(
+        seed=seed,
+        tp=tp,
+        pp=1,
+        initialize_fn=partial(moe_gpt_provider, grouped=grouped, **config),
+        use_megatron_fsdp=use_megatron_fsdp,
+        bf16=bf16,
+        ep=ep,
+    )
+
+
 def build_te_gpt(seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True):
     """A tiny GPT (Transformer Engine spec; classic or Megatron-FSDP v1) with its optimizer."""
     return setup_model_and_optimizer(
@@ -367,6 +472,19 @@ def set_format(args, *, fsdp: bool, pattern: str | None = None, bf16: bool = Tru
     args.num_attention_heads = HYBRID_HEADS
 
 
+def set_moe_format(
+    args, *, fsdp: bool, grouped: bool, ep: int, pattern: str | None = None, bf16: bool = True
+) -> None:
+    """:func:`set_format` for a tiny MoE model: its experts, their module and expert parallelism.
+
+    Megatron-FSDP renumbers experts by ``args.num_experts`` on save and load.
+    """
+    set_format(args, fsdp=fsdp, pattern=pattern, bf16=bf16)
+    args.num_experts = MOE_EXPERTS
+    args.moe_grouped_gemm = grouped
+    args.expert_model_parallel_size = ep
+
+
 def save_weights_only(model, optimizer, args, save_dir: Path, *, iteration: int) -> None:
     """Megatron's ``save_checkpoint`` of the model only.
 
@@ -398,6 +516,26 @@ def full_params(model) -> dict[str, torch.Tensor]:
             value = param
         params[name] = value.detach().cpu().clone()
     return params
+
+
+def persistent_buffers(model) -> dict[str, torch.Tensor]:
+    """Every persistent floating-point buffer of the first model chunk, as fp32 CPU tensors.
+
+    Names are unwrapped as in :func:`full_params`. Buffers are replicated (never
+    sharded), so no rank needs another's.
+    """
+    buffers = {}
+    for module_name, module in model[0].named_modules():
+        for name, buffer in module._buffers.items():  # pylint: disable=protected-access
+            if buffer is None or name in module._non_persistent_buffers_set:
+                continue
+            if not buffer.is_floating_point():
+                continue
+            full = f"{module_name}.{name}" if module_name else name
+            while full.startswith("module."):
+                full = full[len("module.") :]
+            buffers[full] = buffer.detach().float().cpu().clone()
+    return buffers
 
 
 def _gather_tensor_parallel(shard: torch.Tensor, dim: int) -> torch.Tensor:
@@ -455,12 +593,38 @@ def _bits(tensor: torch.Tensor) -> bytes:
     return tensor.contiguous().view(torch.uint8).numpy().tobytes()
 
 
+def _mismatches(actual: dict, expected: dict, dtype: torch.dtype) -> list[str]:
+    """Where ``actual`` differs from ``expected`` after the exact cast to ``dtype``."""
+    found = [f"{name}: missing" for name in sorted(set(expected) - set(actual))]
+    found += [f"{name}: unexpected" for name in sorted(set(actual) - set(expected))]
+    for name in sorted(set(actual) & set(expected)):
+        value = actual[name]
+        if value.dtype != dtype:
+            found.append(f"{name}: {value.dtype}, not {dtype}")
+        elif _bits(value) != _bits(expected[name].to(dtype)):
+            found.append(f"{name}: other values")
+    return found
+
+
 def assert_params(actual: dict, expected: dict, *, dtype: torch.dtype) -> None:
-    """``actual`` holds ``expected``'s parameters bit for bit after the exact cast to ``dtype``."""
-    assert set(actual) == set(expected)
-    for name, value in actual.items():
-        assert value.dtype == dtype, name
-        assert _bits(value) == _bits(expected[name].to(dtype)), name
+    """``actual`` holds ``expected``'s parameters bit for bit after the exact cast to ``dtype``.
+
+    A collective: each rank compares its own tensors (under expert parallelism,
+    its own experts), and every rank fails if any rank finds a difference, so
+    that no rank goes on alone into the next collective and hangs.
+    """
+    mine = _mismatches(actual, expected, dtype)
+    everyone: list = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(everyone, mine)
+    found = [f"rank {rank}: {what}" for rank, theirs in enumerate(everyone) for what in theirs]
+    assert not found, f"{len(found)} differences, such as {found[:5]}"
+
+
+def _assert_buffers(model, expected: dict[str, torch.Tensor]) -> None:
+    """``model``'s persistent floating-point buffers equal ``expected`` bit for bit (if given;
+    a collective, as :func:`assert_params`)."""
+    if expected:
+        assert_params(persistent_buffers(model), expected, dtype=torch.float32)
 
 
 def assert_one_module_level(store: Path) -> None:
@@ -478,6 +642,7 @@ def run_chain(
     build: Callable[..., tuple],
     configure: Callable[..., None],
     per_layer: bool = False,
+    buffers: bool = False,
 ) -> dict[str, list[str]]:
     """The real-save chain through torch_dist -> fsdp_dtensor -> torch_dist, in ``root``.
 
@@ -504,6 +669,8 @@ def run_chain(
         configure: ``configure(args, fsdp=..., bf16=...)`` points the mocked
             arguments at a job of that kind.
         per_layer: Also run step 6.
+        buffers: Also require the persistent floating-point buffers of models
+            B and C (and D) to equal A's, bit for bit in fp32, after their loads.
 
     Returns:
         The findings of each check of :data:`CHAIN_CHECKS` (all empty when the
@@ -516,6 +683,7 @@ def run_chain(
         configure(args, fsdp=False)
         model_a, optimizer_a = build(2)
         expected = full_params(model_a)
+        expected_buffers = persistent_buffers(model_a) if buffers else {}
         save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
         torch.distributed.barrier()
         on_rank_zero(_convert, s1, c1, "fsdp_dtensor")
@@ -524,6 +692,7 @@ def run_chain(
         model_b, optimizer_b = build(3, use_megatron_fsdp=True, bf16=False)
         assert load_weights_only(model_b, optimizer_b, args, c1) == ITERATION
         assert_params(full_params(model_b), expected, dtype=torch.float32)
+        _assert_buffers(model_b, expected_buffers)
         save_weights_only(model_b, optimizer_b, args, s2, iteration=ITERATION)
         torch.distributed.barrier()
         assert_one_module_level(s2)
@@ -533,12 +702,14 @@ def run_chain(
         model_c, optimizer_c = build(4)
         assert load_weights_only(model_c, optimizer_c, args, c2) == ITERATION
         assert_params(full_params(model_c), expected, dtype=torch.bfloat16)
+        _assert_buffers(model_c, expected_buffers)
         save_weights_only(model_c, optimizer_c, args, s3, iteration=ITERATION)
         if per_layer:
             on_rank_zero(_convert, s2, c2_per_layer, "torch_dist", torch_dist_layout="per-layer")
             model_d, optimizer_d = build(5)
             assert load_weights_only(model_d, optimizer_d, args, c2_per_layer) == ITERATION
             assert_params(full_params(model_d), expected, dtype=torch.bfloat16)
+            _assert_buffers(model_d, expected_buffers)
         torch.distributed.barrier()
         on_rank_zero(_convert, c1, back, "torch_dist")
         return on_rank_zero(
