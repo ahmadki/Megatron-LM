@@ -27,11 +27,14 @@ from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
     _layers_are_homogeneous,
     _merge_swiglu,
     _model_param_dtype,
-    _output_group_id,
     _rebuild_param_groups_from_meta,
     _restack_experts,
     _reverse_mtp_keys,
     _reverse_optimizer_state_key,
+    _gdp_heads_from_conv_width,
+    _gdp_split_names,
+    _output_group_id,
+    _split_deltaproduct_projections,
     _split_gdn_projections,
     _split_mamba_projections,
     _stack_layers,
@@ -645,3 +648,312 @@ class TestOutputGroupId:
         a = "decoder.layers.0.self_attention.linear_qkv.weight"
         b = "decoder.layers.0.mlp.linear_fc2.weight"
         assert _output_group_id(a, True) != _output_group_id(b, True)
+
+
+def _gdp_args(num_householder=3, heads=24, head_dim=64, groups=24, state=128):
+    """Checkpoint args for a Gated DeltaProduct mixer (nm4-style defaults)."""
+    return SimpleNamespace(
+        gdp_num_householder=num_householder,
+        mamba_num_heads=heads,
+        mamba_head_dim=head_dim,
+        mamba_num_groups=groups,
+        mamba_state_dim=state,
+    )
+
+
+def _gdp_widths(args):
+    d_inner = args.mamba_num_heads * args.mamba_head_dim
+    gds = args.mamba_num_groups * args.mamba_state_dim
+    m = args.gdp_num_householder
+    in_proj = d_inner * (1 + m) + gds * (m + 1) + args.mamba_num_heads * (m + 1)
+    conv = d_inner * m + gds * (m + 1)
+    return in_proj, conv
+
+
+class TestGdpSplitNames:
+    """The concatenation order is the contract between the two directions."""
+
+    def test_in_proj_order(self):
+        assert _gdp_split_names(3, is_conv=False) == [
+            "z", "V0", "V1", "V2", "K0", "K1", "K2", "Q", "b0", "b1", "b2", "a"
+        ]
+
+    def test_conv_order(self):
+        assert _gdp_split_names(3, is_conv=True) == [
+            "V0", "V1", "V2", "K0", "K1", "K2", "Q"
+        ]
+
+    def test_single_householder(self):
+        assert _gdp_split_names(1, is_conv=False) == ["z", "V0", "K0", "Q", "b0", "a"]
+
+
+
+class TestSplitDeltaProductProjections:
+    def test_sections_match_gated_delta_product_layout(self):
+        args = _gdp_args()
+        in_proj_w, conv_w = _gdp_widths(args)
+        prefix = "decoder.layers.0.mixer."
+        tensors = {
+            f"{prefix}in_proj.weight": torch.arange(in_proj_w * 4, dtype=torch.float32).reshape(
+                in_proj_w, 4
+            ),
+            f"{prefix}conv1d.weight": torch.arange(conv_w * 4, dtype=torch.float32).reshape(
+                conv_w, 1, 4
+            ),
+            f"{prefix}out_proj.weight": torch.zeros(4, 4),
+        }
+        out, n = _split_deltaproduct_projections(tensors, args)
+        assert n == 2
+        # Fused keys are replaced by their sections; unrelated keys pass through.
+        assert f"{prefix}in_proj.weight" not in out
+        assert f"{prefix}out_proj.weight" in out
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        gds = args.mamba_num_groups * args.mamba_state_dim
+        assert out[f"{prefix}in_proj.weight.z"].shape[0] == d_inner
+        assert out[f"{prefix}in_proj.weight.V0"].shape[0] == d_inner
+        assert out[f"{prefix}in_proj.weight.K0"].shape[0] == gds
+        assert out[f"{prefix}in_proj.weight.Q"].shape[0] == gds
+        assert out[f"{prefix}in_proj.weight.b0"].shape[0] == args.mamba_num_heads
+        assert out[f"{prefix}in_proj.weight.a"].shape[0] == args.mamba_num_heads
+        assert out[f"{prefix}conv1d.weight.Q"].shape == (gds, 1, 4)
+
+    def test_noop_without_mamba_dims_in_args(self):
+        tensors = {"decoder.layers.0.mixer.in_proj.weight": torch.zeros(8, 4)}
+        out, n = _split_deltaproduct_projections(tensors, SimpleNamespace())
+        assert n == 0 and out == tensors
+
+    def test_width_mismatch_passes_through_for_mamba(self):
+        """A non-DeltaProduct width is left alone, not force-split."""
+        args = _gdp_args()
+        tensors = {"decoder.layers.0.mixer.in_proj.weight": torch.zeros(7, 4)}
+        out, n = _split_deltaproduct_projections(tensors, args)
+        assert n == 0 and out == tensors
+
+    def test_gdn_self_attention_keys_are_out_of_scope(self):
+        args = _gdp_args()
+        in_proj_w, _ = _gdp_widths(args)
+        key = "decoder.layers.0.self_attention.in_proj.weight"
+        tensors = {key: torch.zeros(in_proj_w, 4)}
+        out, n = _split_deltaproduct_projections(tensors, args)
+        assert n == 0 and out == tensors
+
+
+
+class TestDeltaProductVsMambaDisambiguation:
+    """Both mixers expose ``mixer.in_proj.weight``; the fused width decides which."""
+
+    def test_mamba_checkpoint_still_splits_despite_gdp_default_in_args(self):
+        """gdp_num_householder defaults to 3 and is back-filled onto old checkpoints,
+        so it must not be used as a presence test for DeltaProduct."""
+        args = _gdp_args()  # carries gdp_num_householder=3 like every fork checkpoint
+        d_inner = args.mamba_num_heads * args.mamba_head_dim
+        gds = args.mamba_num_groups * args.mamba_state_dim
+        mamba_w = 2 * d_inner + 2 * gds + args.mamba_num_heads
+        key = "decoder.layers.0.mixer.in_proj.weight"
+        tensors = {key: torch.randn(mamba_w, 4)}
+
+        # The DeltaProduct split must decline it...
+        out, n_gdp = _split_deltaproduct_projections(dict(tensors), args)
+        assert n_gdp == 0 and set(out) == {key}
+        # ...and the Mamba split must still handle it.
+        out, n_mamba = _split_mamba_projections(out, args)
+        assert n_mamba == 1
+        assert f"{key}.z" in out and f"{key}.dt" in out
+
+    def test_deltaproduct_width_is_claimed_by_the_gdp_split(self):
+        args = _gdp_args()
+        in_proj_w, _ = _gdp_widths(args)
+        key = "decoder.layers.0.mixer.in_proj.weight"
+        out, n = _split_deltaproduct_projections({key: torch.randn(in_proj_w, 4)}, args)
+        assert n == 1 and f"{key}.V2" in out
+
+    def test_widths_never_collide(self):
+        """The discriminator is only sound if the two layouts cannot share a width."""
+        for m in (1, 2, 3, 4):
+            args = _gdp_args(num_householder=m)
+            gdp_w, _ = _gdp_widths(args)
+            d_inner = args.mamba_num_heads * args.mamba_head_dim
+            gds = args.mamba_num_groups * args.mamba_state_dim
+            mamba_w = 2 * d_inner + 2 * gds + args.mamba_num_heads
+            assert gdp_w != mamba_w, m
+
+
+
+class TestMambaNotClaimedWhenHeadsAbsent:
+    """Regression: mamba_num_heads is Optional and defaults to None. Deriving the head
+    count from the in_proj width made the DeltaProduct/Mamba-2 width discriminator
+    self-fulfilling -- the layout summed to the observed width by construction, so a pure
+    Mamba-2 in_proj was claimed and silently split into [z,V*,K*,Q,b*,a]."""
+
+    @staticmethod
+    def _args(head_dim=64, groups=8, state=128):
+        return SimpleNamespace(
+            mamba_head_dim=head_dim, mamba_num_groups=groups, mamba_state_dim=state,
+            mamba_num_heads=None,   # the default
+            gdp_num_householder=3,  # back-filled onto every checkpoint
+        )
+
+    def test_pure_mamba_checkpoint_is_left_for_the_mamba_split(self):
+        args = self._args()
+        nheads, d_inner, gds = 32, 32 * 64, 8 * 128
+        width = 2 * d_inner + 2 * gds + nheads
+        key = "decoder.layers.0.mixer.in_proj.weight"
+        tensors = {key: torch.randn(width, 8)}
+
+        out, n_gdp = _split_deltaproduct_projections(dict(tensors), args)
+        assert n_gdp == 0 and set(out) == {key}
+
+        out, n_mamba = _split_mamba_projections(out, args)
+        assert n_mamba == 1
+        assert sorted(k.rsplit(".", 1)[-1] for k in out) == ["B", "C", "dt", "x", "z"]
+
+    @pytest.mark.parametrize(
+        "head_dim,groups,state,nheads",
+        [(64, 1, 128, 4), (64, 8, 128, 32), (64, 8, 256, 64), (128, 8, 256, 32)],
+    )
+    def test_known_false_positive_widths_are_not_claimed(self, head_dim, groups, state, nheads):
+        """Configurations whose Mamba-2 in_proj width factored into a bogus layout."""
+        args = self._args(head_dim, groups, state)
+        d_inner, gds = nheads * head_dim, groups * state
+        width = 2 * d_inner + 2 * gds + nheads
+        tensors = {"decoder.layers.0.mixer.in_proj.weight": torch.zeros(width, 4)}
+        _, n = _split_deltaproduct_projections(tensors, args)
+        assert n == 0
+
+    def test_deltaproduct_still_works_without_mamba_num_heads(self):
+        """The dotted conv1d is DeltaProduct-only, so it can still supply the head count."""
+        args = self._args(head_dim=64, groups=24, state=128)
+        m, head_dim, gds = 3, 64, 24 * 128
+        nheads = 24
+        d_inner = nheads * head_dim
+        in_w = d_inner * (1 + m) + gds * (m + 1) + nheads * (m + 1)
+        conv_w = d_inner * m + gds * (m + 1)
+        pre = "decoder.layers.0.mixer."
+        tensors = {f"{pre}in_proj.weight": torch.randn(in_w, 4),
+                   f"{pre}conv1d.weight": torch.randn(conv_w, 1, 4)}
+        out, n = _split_deltaproduct_projections(tensors, args)
+        assert n == 2, "conv1d width should have supplied nheads"
+        assert f"{pre}in_proj.weight.V2" in out and f"{pre}conv1d.weight.Q" in out
+
+    def test_conv_width_factorisation_rejects_non_deltaproduct(self):
+        assert _gdp_heads_from_conv_width(24 * 64 * 3 + 3072 * 4, 3, 64, 3072) == 24
+        assert _gdp_heads_from_conv_width(7, 3, 64, 3072) is None
+        assert _gdp_heads_from_conv_width(None, 3, 64, 3072) is None
+
+
+
+class TestHeadsRecoveredFromWidth:
+    """mamba_num_heads is Optional and defaults to None."""
+
+    def test_in_proj_alone_does_not_supply_the_head_count(self):
+        """An in_proj width must never be used to derive nheads: the layout is built from
+        that very number, so any width factors and the discriminator self-fulfils."""
+        args = _gdp_args()
+        in_proj_w, _ = _gdp_widths(args)
+        args_no_heads = SimpleNamespace(
+            gdp_num_householder=args.gdp_num_householder,
+            mamba_head_dim=args.mamba_head_dim,
+            mamba_num_groups=args.mamba_num_groups,
+            mamba_state_dim=args.mamba_state_dim,
+        )
+        key = "decoder.layers.0.mixer.in_proj.weight"
+        out, n = _split_deltaproduct_projections({key: torch.randn(in_proj_w, 3)}, args_no_heads)
+        assert n == 0 and set(out) == {key}
+
+    def test_dotted_conv1d_supplies_the_head_count(self):
+        args = _gdp_args()
+        in_proj_w, conv_w = _gdp_widths(args)
+        args_no_heads = SimpleNamespace(
+            gdp_num_householder=args.gdp_num_householder,
+            mamba_head_dim=args.mamba_head_dim,
+            mamba_num_groups=args.mamba_num_groups,
+            mamba_state_dim=args.mamba_state_dim,
+        )
+        pre = "decoder.layers.0.mixer."
+        tensors = {f"{pre}in_proj.weight": torch.randn(in_proj_w, 3),
+                   f"{pre}conv1d.weight": torch.randn(conv_w, 1, 4)}
+        out, n = _split_deltaproduct_projections(tensors, args_no_heads)
+        assert n == 2
+        assert out[f"{pre}in_proj.weight.a"].shape[0] == args.mamba_num_heads
+
+
+class TestMixerProjectionsShareARank:
+    """A DeltaProduct in_proj split needs the sibling conv1d width to recover the head
+    count, so a multi-rank convert must not hand them to different ranks."""
+
+    PRE = "decoder.layers.0.mixer."
+
+    def test_in_proj_and_conv1d_reduce_to_one_group(self):
+        ids = {_output_group_id(self.PRE + n, do_stack=False)
+               for n in ("in_proj.weight", "conv1d.weight", "conv1d.bias", "in_proj.bias")}
+        assert len(ids) == 1, ids
+
+    def test_mamba_fused_conv_joins_the_same_group(self):
+        ids = {_output_group_id(self.PRE + n, do_stack=False)
+               for n in ("in_proj.weight", "conv1d_weight", "conv1d_bias")}
+        assert len(ids) == 1, ids
+
+    def test_other_mixer_params_stay_separate(self):
+        base = _output_group_id(self.PRE + "in_proj.weight", do_stack=False)
+        for other in ("out_proj.weight", "norm.weight", "A_log", "dt_bias"):
+            assert _output_group_id(self.PRE + other, do_stack=False) != base
+
+    def test_distinct_layers_stay_separate(self):
+        a = _output_group_id("decoder.layers.0.mixer.in_proj.weight", do_stack=False)
+        b = _output_group_id("decoder.layers.1.mixer.in_proj.weight", do_stack=False)
+        assert a != b
+
+    def test_optimizer_subkey_follows_its_param(self):
+        a = _output_group_id(self.PRE + "in_proj.weight", do_stack=False)
+        b = _output_group_id(self.PRE + "conv1d.weight", do_stack=False)
+        assert a == b
+
+
+class TestDeltaProductWidthMismatchIsLoud:
+    """A mixer with a dotted conv1d IS DeltaProduct. If its in_proj width disagrees with
+    the args-derived layout, passing it on would hand it to the Mamba-2 transform, whose
+    own width assert can coincidentally hold -- emitting z/x/B/C/dt with wrong section
+    sizes and no error."""
+
+    @staticmethod
+    def _args(m):
+        return SimpleNamespace(mamba_head_dim=64, mamba_num_groups=24, mamba_state_dim=64,
+                               mamba_num_heads=8, gdp_num_householder=m)
+
+    def test_args_disagreeing_with_tensors_raises(self):
+        true_m = 2
+        a = self._args(3)                      # back-filled default, disagrees with tensors
+        d, g, n = 8 * 64, 24 * 64, 8
+        in_w = d * (1 + true_m) + g * (true_m + 1) + n * (true_m + 1)
+        cv_w = d * true_m + g * (true_m + 1)
+        pre = "decoder.layers.0.mixer."
+        tensors = {f"{pre}in_proj.weight": torch.randn(in_w, 4),
+                   f"{pre}conv1d.weight": torch.randn(cv_w, 1, 4)}
+        with pytest.raises(NotImplementedError, match="does not match the layout"):
+            _split_deltaproduct_projections(tensors, a)
+
+    def test_mamba_only_mixer_still_passes_through_silently(self):
+        """No dotted conv1d -> not DeltaProduct -> must NOT raise, just decline."""
+        a = self._args(3)
+        d, g, n = 8 * 64, 24 * 64, 8
+        pre = "decoder.layers.0.mixer."
+        tensors = {f"{pre}in_proj.weight": torch.randn(2 * d + 2 * g + n, 4),
+                   f"{pre}conv1d_weight": torch.randn(d + 2 * g, 4)}
+        out, k = _split_deltaproduct_projections(dict(tensors), a)
+        assert k == 0 and set(out) == set(tensors)
+
+    def test_hybrid_splits_each_mixer_by_its_own_kind(self):
+        a = self._args(3)
+        d, g, n, m = 8 * 64, 24 * 64, 8, 3
+        gdp_in = d * (1 + m) + g * (m + 1) + n * (m + 1)
+        gdp_cv = d * m + g * (m + 1)
+        tensors = {
+            "decoder.layers.0.mixer.in_proj.weight": torch.randn(2 * d + 2 * g + n, 4),
+            "decoder.layers.0.mixer.conv1d_weight": torch.randn(d + 2 * g, 4),
+            "decoder.layers.1.mixer.in_proj.weight": torch.randn(gdp_in, 4),
+            "decoder.layers.1.mixer.conv1d.weight": torch.randn(gdp_cv, 1, 4),
+        }
+        out, k = _split_deltaproduct_projections(dict(tensors), a)
+        assert k == 2                                    # only the DeltaProduct mixer
+        assert "decoder.layers.0.mixer.in_proj.weight" in out     # Mamba-2 untouched
+        assert "decoder.layers.1.mixer.in_proj.weight.V2" in out

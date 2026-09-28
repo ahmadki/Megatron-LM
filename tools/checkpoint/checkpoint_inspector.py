@@ -1322,6 +1322,186 @@ def _split_gdn_projections(tensors, args):
     return out, n_split
 
 
+def _gdp_split_names(num_householder, is_conv):
+    """Sub-key order for a Gated DeltaProduct fused projection.
+
+    Mirrors ``_get_in_proj_checkpoint_split_layout`` / ``_get_conv_checkpoint_split_layout``
+    in megatron/core/ssm/gated_delta_product.py. The fused tensor is exactly the
+    concatenation of these sections along dim 0, in this order, so the order is the
+    contract between the two directions — do not sort it.
+    """
+    v = [f"V{i}" for i in range(num_householder)]
+    k = [f"K{i}" for i in range(num_householder)]
+    if is_conv:
+        return v + k + ["Q"]
+    b = [f"b{i}" for i in range(num_householder)]
+    return ["z"] + v + k + ["Q"] + b + ["a"]
+
+
+def _gdp_heads_from_conv_width(width, num_householder, head_dim, gds):
+    """Recover ``mamba_num_heads`` from a fused DeltaProduct ``conv1d`` width.
+
+    ``width = d_inner*M + gds*(M+1)`` with ``d_inner = nheads * head_dim``. The in_proj
+    width must NOT be used for this: its layout is derived from the very number being
+    recovered, so any width factors into *some* layout and the width discriminator in
+    :func:`_split_deltaproduct_projections` becomes self-fulfilling -- a Mamba-2 in_proj
+    would be claimed as DeltaProduct. ``mixer.conv1d.weight`` (dotted) is built only by
+    GatedDeltaProduct; Mamba-2's fused convolution is ``mixer.conv1d_weight``
+    (underscore, see ``_MAMBA_CONV_RE``), so the dotted form is a positive signal.
+
+    Returns None when the width does not factor cleanly, i.e. it is not a DeltaProduct
+    conv1d for this configuration.
+    """
+    if not isinstance(width, int):
+        return None
+    numer = width - gds * (num_householder + 1)
+    heads, rem = divmod(numer, head_dim * num_householder)
+    if rem or heads <= 0:
+        return None
+    return heads
+
+
+def _deltaproduct_layouts(args, observed_conv_width=None):
+    """``(in_proj, conv)`` section/name layouts for a Gated DeltaProduct mixer, or None.
+
+    ``gdp_num_householder`` cannot be used as a presence test: it defaults to 3
+    (transformer_config.py) and checkpointing.py back-fills it to 3 on any checkpoint
+    that predates it, so it is set even for models with no DeltaProduct layer. The
+    layouts are therefore returned unconditionally when the Mamba dims are available,
+    and the caller disambiguates per key by matching the fused width -- which is exact,
+    since a DeltaProduct in_proj is always wider than a Mamba-2 one by
+    ``d_inner*(M-1) + gds*(M-1) + nheads*M``, which is positive for every ``M >= 1``
+    (at ``M == 1`` the margin is just ``nheads``).
+    """
+    if args is None:
+        return None
+    num_householder = getattr(args, "gdp_num_householder", None)
+    heads = getattr(args, "mamba_num_heads", None)
+    head_dim = getattr(args, "mamba_head_dim", None)
+    groups = getattr(args, "mamba_num_groups", None)
+    state = getattr(args, "mamba_state_dim", None)
+    if not all(isinstance(v, int) for v in (num_householder, head_dim, groups, state)):
+        return None
+    if num_householder < 1:
+        return None
+    if not isinstance(heads, int):
+        # mamba_num_heads is Optional and defaults to None (transformer_config.py), in
+        # which case the model derives it from hidden_size * expand. Rather than
+        # re-implement that, recover it from an observed fused conv1d width. It must be
+        # the conv width, not the in_proj width -- see _gdp_heads_from_conv_width.
+        heads = _gdp_heads_from_conv_width(
+            observed_conv_width, num_householder, head_dim, groups * state
+        )
+        if heads is None:
+            return None
+    d_inner = heads * head_dim
+    gds = groups * state
+    inproj = (
+        [d_inner] + [d_inner] * num_householder
+        + [gds] * num_householder + [gds]
+        + [heads] * num_householder + [heads],
+        _gdp_split_names(num_householder, is_conv=False),
+    )
+    conv = (
+        [d_inner] * num_householder + [gds] * num_householder + [gds],
+        _gdp_split_names(num_householder, is_conv=True),
+    )
+    return inproj, conv
+
+
+def _mixer_prefix(key):
+    """The ``...mixer.`` prefix a key belongs to, or None."""
+    m = re.match(r"^(.*\.mixer\.)", key)
+    return m.group(1) if m else None
+
+
+def _observed_conv_widths(tensors):
+    """Yield the section-axis width of every fused ``mixer.conv1d.weight`` present.
+
+    The dotted name is GatedDeltaProduct's nn.Conv1d; Mamba-2's fused convolution is
+    ``mixer.conv1d_weight``. Yielding only the dotted form keeps a Mamba-2-only
+    checkpoint from ever producing a candidate DeltaProduct layout.
+    """
+    for key, value in tensors.items():
+        if re.search(r"\.mixer\.conv1d\.(weight|bias)$", key):
+            dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
+            yield int(value.shape[dim])
+
+
+def _split_deltaproduct_projections(tensors, args):
+    """Split fused Gated DeltaProduct ``mixer.in_proj``/``conv1d`` into named sub-keys.
+
+    Mirrors the section sizes in
+    ``_get_in_proj_checkpoint_split_layout`` / ``_get_conv_checkpoint_split_layout``:
+    ``d_inner = mamba_num_heads * mamba_head_dim``, ``gds = mamba_num_groups *
+    mamba_state_dim``, ``nheads = mamba_num_heads``.
+
+    Only keys whose fused width actually matches the DeltaProduct layout are split;
+    anything else passes through for :func:`_split_mamba_projections` to handle. Mamba-2
+    shares the ``mixer.in_proj.weight`` name, and the widths can never collide (see
+    :func:`_deltaproduct_layouts`), so the width is a sound discriminator and a model
+    with both mixer kinds is handled per layer rather than all-or-nothing.
+    """
+    layouts = _deltaproduct_layouts(args)
+    if layouts is None:
+        # mamba_num_heads may be absent from args; offer each fused DeltaProduct conv1d
+        # width in turn until one factors into a valid layout. A checkpoint with no
+        # dotted mixer.conv1d.weight yields nothing here, so a Mamba-2-only store is
+        # never claimed.
+        for width in _observed_conv_widths(tensors):
+            layouts = _deltaproduct_layouts(args, observed_conv_width=width)
+            if layouts is not None:
+                break
+    if layouts is None:
+        return tensors, 0
+    inproj, conv = layouts
+
+    # Mixers that carry a dotted conv1d are DeltaProduct; Mamba-2's fused convolution is
+    # ``mixer.conv1d_weight``. Used below to tell "not DeltaProduct" from "DeltaProduct
+    # whose width disagrees with args", which must not be silently passed on.
+    gdp_mixers = {_mixer_prefix(k) for k in tensors
+                  if re.search(r"\.mixer\.conv1d\.(weight|bias)$", k)}
+
+    out = {}
+    n_split = 0
+    for key, value in tensors.items():
+        stem = key.split(".")
+        # Scope to ``.mixer.`` so a GDN ``self_attention.in_proj.weight`` that its own
+        # transform left alone is never mistaken for a DeltaProduct projection.
+        is_mixer = ".mixer." in key or key.endswith(".mixer")
+        if is_mixer and len(stem) >= 2 and stem[-2] == "in_proj" and stem[-1] in ("weight", "bias"):
+            sections, names = inproj
+        elif is_mixer and len(stem) >= 2 and stem[-2] == "conv1d" and stem[-1] in ("weight", "bias"):
+            sections, names = conv
+        else:
+            out[key] = value
+            continue
+        # Per-layer keys carry an explicit ``.layers.{idx}.`` and split dim 0; a stacked
+        # homogeneous block carries a leading num-layers axis.
+        dim = 0 if re.search(r"\.layers\.\d+\.", key) else 1
+        if value.shape[dim] != sum(sections):
+            if _mixer_prefix(key) in gdp_mixers:
+                # This mixer has a dotted conv1d, so it IS DeltaProduct and the width
+                # must match. Passing it on would hand it to the Mamba-2 transform,
+                # whose own width assert can coincidentally hold and silently emit
+                # z/x/B/C/dt with wrong section sizes.
+                raise NotImplementedError(
+                    f"'{key}' belongs to a Gated DeltaProduct mixer (it has a dotted "
+                    f"mixer.conv1d) but its dim-{dim} width {value.shape[dim]} does not "
+                    f"match the layout derived from args "
+                    f"(sum={sum(sections)}, sections={sections}). Refusing to hand it "
+                    "to another transform."
+                )
+            out[key] = value  # a Mamba-2 mixer; leave it for _split_mamba_projections
+            continue
+        start = 0
+        for size, name in zip(sections, names):
+            out[f"{key}.{name}"] = value.narrow(dim, start, size).contiguous()
+            start += size
+        n_split += 1
+    return out, n_split
+
+
 def _split_mamba_projections(tensors, args):
     """Split fused Mamba-2 ``in_proj``/``conv1d`` into named factory sub-keys.
 
@@ -1476,6 +1656,15 @@ def _output_group_id(fqn, do_stack):
         r"(\.mlp\.experts\.linear_fc[12]\.(?:weight|bias))\d+$", r"\1", g
     )  # grouped expert idx
     g = re.sub(r"\.local_experts\.\d+\.", ".experts.", g)  # SequentialMLP expert idx
+    # A mixer's fused projections are one group: splitting a DeltaProduct in_proj needs
+    # the head count, which is recovered from the sibling conv1d width, so a rank that
+    # owned the in_proj but not the conv1d would see no DeltaProduct signal and pass the
+    # fused tensor on to the Mamba-2 transform.
+    g = re.sub(
+        r"(\.mixer\.)(?:in_proj\.|conv1d\.|conv1d_)(?:weight|bias)(?=$|\.)",
+        r"\1__fused_proj__",
+        g,
+    )
     if do_stack:
         g = re.sub(r"(\.layers)\.\d+(\.)", r"\1\2", g)  # homogeneous per-layer -> stacked
     return g
@@ -1678,14 +1867,17 @@ def reverse_convert_checkpoint(
     else:
         n_layers = 0
 
-    # Gated-DeltaNet and Mamba-2 fused-projection splits (in_proj/conv1d -> named
-    # sub-keys). Run after stacking so the per-layer/stacked dim is unambiguous.
+    # Gated-DeltaNet, Gated-DeltaProduct and Mamba-2 fused-projection splits
+    # (in_proj/conv1d -> named sub-keys). Run after stacking so the per-layer/stacked
+    # dim is unambiguous.
     tensors, n_gdn = _split_gdn_projections(tensors, common_flat.get("args"))
+    tensors, n_gdp = _split_deltaproduct_projections(tensors, common_flat.get("args"))
     tensors, n_mamba = _split_mamba_projections(tensors, common_flat.get("args"))
 
     rank0_echo(
         f"[Convert] mtp={n_mtp} swiglu={n_swiglu} experts={n_experts} "
-        f"layer-stacks={n_layers} gdn-splits={n_gdn} mamba-splits={n_mamba} "
+        f"layer-stacks={n_layers} gdn-splits={n_gdn} gdp-splits={n_gdp} "
+        f"mamba-splits={n_mamba} "
         f"masters={n_masters} extra_state-dropped={n_skipped_extra_state} "
         f"layout={'stacked' if do_stack else 'per-layer'}"
     )
