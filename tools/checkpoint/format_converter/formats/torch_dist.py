@@ -118,11 +118,13 @@ class TorchDistAdapter:
     def output_grid(
         self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
     ) -> tuple[Region, ...]:
-        """One chunk per output: a whole tensor, or one layer of a stacked tensor.
+        """One chunk per output: a whole tensor, or one index of its layer and expert axes.
 
-        This is the grid Megatron saves stacked layers with (its loader reads
-        any grid). Pieces larger than half the unit budget are split further by
-        the scheduler; ``max_chunk_bytes`` only applies to fsdp_dtensor.
+        That is one layer of a stacked tensor, one expert of an expert tensor,
+        or one (layer, expert) of a stacked expert tensor: the grid Megatron
+        saves them with (its loader reads any grid). Pieces larger than half
+        the unit budget are split further by the scheduler; ``max_chunk_bytes``
+        only applies to fsdp_dtensor.
         """
         del dtype, max_chunk_bytes
         return (placed.region,)

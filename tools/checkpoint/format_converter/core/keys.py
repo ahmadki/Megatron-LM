@@ -29,6 +29,15 @@ only that block's layer segment is interpreted; the segments of the blocks
 around it are part of the prefix and kept as they are. Blocks of different
 model roots never share keys (``vision_model.decoder`` and
 ``language_model.decoder`` are different prefixes).
+
+The routed experts of a mixture-of-experts layer live under its experts
+module ``<...>.mlp.experts``, whose linear layers ``linear_fc1`` and
+``linear_fc2`` hold one weight (and bias) per expert. torch_dist stores each
+as one tensor over all experts, ``<...>.mlp.experts.experts.linear_fc<n>.<leaf>``,
+the global expert index along its leading axis (after the layer axis of a
+tensor stacked over layers); :class:`ExpertName` names such a tensor by the
+module path ``<...>.mlp.experts.linear_fc<n>`` (and one expert of it by its
+global index), whatever the format.
 """
 
 from __future__ import annotations
@@ -45,6 +54,13 @@ LAYER_SEGMENT = f".{LAYERS}."
 
 _INDEX_AND_INNER = re.compile(r"(?P<index>0|[1-9][0-9]*)\.(?P<inner>.+)")
 _NAME_START = re.compile(r"[A-Za-z_]")
+
+_EXPERTS_MODULE = r"(?P<experts>(?:.+\.)?mlp\.experts)"
+_EXPERT_LINEAR = r"(?P<linear>linear_fc[0-9])"
+_EXPERT_PATH = re.compile(rf"{_EXPERTS_MODULE}\.{_EXPERT_LINEAR}")
+_TORCH_DIST_EXPERT = re.compile(
+    rf"{_EXPERTS_MODULE}\.experts\.{_EXPERT_LINEAR}\.(?P<leaf>weight|bias)"
+)
 
 
 class KeyGrammarError(ValueError):
@@ -150,6 +166,80 @@ def join_layer_key(block: str, index: int | None, inner: str) -> str:
     return f"{block}{LAYER_SEGMENT}{index}.{inner}"
 
 
+@dataclass(frozen=True, slots=True)
+class ExpertName:
+    """A tensor of the routed experts of a mixture-of-experts layer, by its logical name.
+
+    Attributes:
+        path: The module path of the experts' linear layer,
+            ``<...>.mlp.experts.linear_fc<n>``.
+        leaf: ``weight`` or ``bias``.
+        expert: The global expert index, or ``None`` for a tensor that holds
+            every expert along its expert axis (torch_dist).
+    """
+
+    path: str
+    leaf: str
+    expert: int | None = None
+
+
+def split_torch_dist_expert(name: str) -> ExpertName | None:
+    """Parse ``name`` as torch_dist stores a routed-expert tensor (every expert in one tensor).
+
+    Args:
+        name: A name inside a layer, or a whole model-relative key.
+
+    Returns:
+        The tensor, from ``<...>.mlp.experts.experts.linear_fc<n>.<weight|bias>``,
+        or ``None`` when ``name`` is not under an experts module ``<...>.mlp.experts.``.
+
+    Raises:
+        KeyGrammarError: ``name`` is under an experts module but not in that form.
+    """
+    if ROUTED_EXPERTS.search(name) is None:
+        return None
+    match = _TORCH_DIST_EXPERT.fullmatch(name)
+    if match is None:
+        raise KeyGrammarError(
+            f"{name}: torch_dist stores routed-expert tensors as "
+            "<...>.mlp.experts.experts.linear_fc<n>.weight or .bias"
+        )
+    return ExpertName(f"{match.group('experts')}.{match.group('linear')}", match.group("leaf"))
+
+
+def join_torch_dist_expert(path: str, leaf: str) -> str:
+    """The torch_dist name of the routed-expert tensor ``path``/``leaf`` (every expert).
+
+    Raises:
+        KeyGrammarError: ``path`` is not ``<...>.mlp.experts.linear_fc<n>``.
+    """
+    experts, linear = _split_expert_path(path)
+    return f"{experts}.experts.{linear}.{leaf}"
+
+
+def _split_expert_path(path: str) -> tuple[str, str]:
+    """``(<...>.mlp.experts, linear_fc<n>)`` of an expert linear layer's module path."""
+    match = _EXPERT_PATH.fullmatch(path)
+    if match is None:
+        raise KeyGrammarError(f"{path} is not the module path of an experts' linear layer")
+    return match.group("experts"), match.group("linear")
+
+
+def torch_dist_chunk_axes(key: str) -> int:
+    """The leading axes along which Megatron saves a torch_dist tensor one index per chunk.
+
+    A tensor stacked over the layers of a block leads with its layer axis, and
+    a routed-expert tensor then has its expert axis: Megatron saves each layer,
+    and each expert of a layer, as a chunk of its own.
+
+    Raises:
+        KeyGrammarError: The key's layer segment or expert name is malformed.
+    """
+    layer_key = innermost_layer_key(key)
+    stacked = layer_key is not None and layer_key.stacked
+    return int(stacked) + int(split_torch_dist_expert(key) is not None)
+
+
 def split_leaf(name: str) -> tuple[str, str]:
     """Split ``<path>.<leaf>`` into ``(path, leaf)``; the path is empty for a bare leaf.
 
@@ -186,6 +276,9 @@ FUSED_MIXER = re.compile(
 
 EXPERT_PARAM = re.compile(r"(?:^|\.)(?:experts|shared_experts|router)\.")
 """A parameter or buffer of a mixture-of-experts layer."""
+
+ROUTED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.")
+"""A tensor under the routed experts of a mixture-of-experts layer (``<...>.mlp.experts.``)."""
 
 MIXER_PARAM = re.compile(r"(?:^|\.)mixer\.")
 """A parameter of a state-space mixer (Mamba-2 or Gated DeltaProduct)."""

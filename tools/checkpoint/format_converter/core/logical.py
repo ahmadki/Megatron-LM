@@ -18,7 +18,9 @@ directions.
 A :class:`LogicalId` names one model tensor as the live model does: the block
 it belongs to, its *dense* layer index in that block (the ``nn.ModuleList``
 position, whatever the stored index), the module path inside the layer and
-the leaf (parameter or buffer) name.
+the leaf (parameter or buffer) name, and for a tensor of one routed expert its
+global expert index (``core/keys.py`` gives the one module path of an
+expert's linear layer for every way the formats name it).
 """
 
 from __future__ import annotations
@@ -43,22 +45,27 @@ class LogicalId:
         path: Module path inside the layer, or from the model root outside
             blocks (may be empty).
         leaf: Parameter or buffer name.
+        expert: Global index of the routed expert the tensor belongs to
+            (``None`` for every other tensor).
 
     Raises:
         InternalError: Exactly one of ``block`` and ``layer`` is set, the
-            layer index is negative, or the leaf is empty.
+            layer or expert index is negative, or the leaf is empty.
     """
 
     block: str | None
     layer: int | None
     path: str
     leaf: str
+    expert: int | None = None
 
     def __post_init__(self) -> None:
         if (self.block is None) != (self.layer is None):
             raise InternalError(f"{self}: block and layer must be set together")
         if self.layer is not None and self.layer < 0:
             raise InternalError(f"{self}: negative layer index")
+        if self.expert is not None and self.expert < 0:
+            raise InternalError(f"{self}: negative expert index")
         if not self.leaf:
             raise InternalError(f"logical id at {self.path!r} has no leaf")
 
@@ -68,9 +75,8 @@ class LogicalId:
         return join_leaf(self.path, self.leaf)
 
     def __str__(self) -> str:
-        if self.block is None:
-            return self.name
-        return f"{self.block}[{self.layer}].{self.name}"
+        where = self.name if self.block is None else f"{self.block}[{self.layer}].{self.name}"
+        return where if self.expert is None else f"{where}[expert {self.expert}]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,8 +129,10 @@ class OutputSlice:
 
     Several outputs may tile one target tensor: each layer of a block that
     torch_dist stores stacked is the box ``[l:l+1, ...]`` of the stacked
-    tensor. The logical tensor has the box's shape without its first
-    ``squeezed`` axes, which have size 1.
+    tensor, each routed expert the box ``[e:e+1, ...]`` of its expert tensor,
+    and each (layer, expert) of a stacked expert tensor the box
+    ``[l:l+1, e:e+1, ...]``. The logical tensor has the box's shape without
+    its first ``squeezed`` axes, which have size 1.
 
     Attributes:
         key: The target key (model-relative, or with the format envelope).

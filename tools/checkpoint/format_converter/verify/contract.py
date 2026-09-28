@@ -21,7 +21,8 @@ reported as expected, not as a finding; anything else is a finding (exit 5).
   default ``--rerun-mode validate_results`` writes it into model-only saves
   too); A's chunk grid must be a coarsening of B's (tensor-parallel splits
   merged) that keeps B's boundaries along the layer axis of a tensor stacked
-  over layers (one chunk per layer).
+  over layers and the expert axis of a routed-expert tensor (one chunk per
+  layer and per expert).
 * ``E``: fsdp_dtensor -> torch_dist -> fsdp_dtensor vs its source. Dropped
   state may be absent in A; any chunk grid; the sanitized argument fields may
   differ.
@@ -50,7 +51,7 @@ EXACT, UPCAST, DOWNCAST = "exact", "upcast", "downcast"
 
 ANY_GRID, COARSENING = "any", "coarsening"
 """Chunk-grid rules: anything, or each of A's chunks exactly tiled by B's chunks (never merged
-along the layer axis of a tensor stacked over layers)."""
+along the layer axis of a tensor stacked over layers or the expert axis of an expert tensor)."""
 
 RERUN_STATE = re.compile(r"^rerun_state_machine")
 """Rerun state-machine state: the ``rerun_state_machine_state/shard_*`` items and the

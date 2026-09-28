@@ -28,13 +28,27 @@ def test_ids_render_block_layer_and_name():
     assert {QKV, LogicalId("decoder", 3, "self_attention.linear_qkv", "weight")} == {QKV}
 
 
+def test_expert_ids_name_one_expert():
+    fc1 = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 5)
+    assert str(fc1) == "decoder[1].mlp.experts.linear_fc1.weight[expert 5]"
+    assert fc1.name == "mlp.experts.linear_fc1.weight"
+    assert fc1 != LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 4)
+    assert fc1 != LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight")
+
+
 @pytest.mark.parametrize(
-    ("block", "layer", "leaf"),
-    [("decoder", None, "weight"), (None, 0, "weight"), ("decoder", -1, "weight"), (None, None, "")],
+    ("block", "layer", "leaf", "expert"),
+    [
+        ("decoder", None, "weight", None),
+        (None, 0, "weight", None),
+        ("decoder", -1, "weight", None),
+        (None, None, "", None),
+        ("decoder", 0, "weight", -1),
+    ],
 )
-def test_invalid_ids_are_internal_errors(block, layer, leaf):
+def test_invalid_ids_are_internal_errors(block, layer, leaf, expert):
     with pytest.raises(InternalError):
-        LogicalId(block, layer, "mlp.linear_fc1", leaf)
+        LogicalId(block, layer, "mlp.linear_fc1", leaf, expert)
 
 
 def test_slice_shape_is_its_region():

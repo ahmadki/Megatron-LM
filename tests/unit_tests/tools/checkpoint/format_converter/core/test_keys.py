@@ -7,15 +7,19 @@ from __future__ import annotations
 import pytest
 
 from tools.checkpoint.format_converter.core.keys import (
+    ExpertName,
     KeyGrammarError,
     LayerKey,
     attribute_layer_key,
     innermost_layer_key,
     join_layer_key,
     join_leaf,
+    join_torch_dist_expert,
     root_of,
     split_layer_key,
     split_leaf,
+    split_torch_dist_expert,
+    torch_dist_chunk_axes,
 )
 
 
@@ -154,3 +158,62 @@ def test_root_of():
     assert root_of("decoder.layers.0.x.weight") == "decoder"
     assert root_of("output_layer.weight") == "output_layer"
     assert root_of("bare") == "bare"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("mlp.experts.experts.linear_fc1.weight", ExpertName("mlp.experts.linear_fc1", "weight")),
+        (
+            "decoder.layers.3.mlp.experts.experts.linear_fc2.bias",
+            ExpertName("decoder.layers.3.mlp.experts.linear_fc2", "bias"),
+        ),
+        (
+            "transformer_layer.mlp.experts.experts.linear_fc1.weight",
+            ExpertName("transformer_layer.mlp.experts.linear_fc1", "weight"),
+        ),
+        ("mlp.shared_experts.linear_fc1.weight", None),
+        ("mlp.router.expert_bias", None),
+        ("mlp.linear_fc1.weight", None),
+    ],
+)
+def test_torch_dist_names_every_expert_in_one_tensor(name, expected):
+    assert split_torch_dist_expert(name) == expected
+    if expected is not None:
+        assert join_torch_dist_expert(expected.path, expected.leaf) == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mlp.experts.experts.3.linear_fc1.weight",  # singleton local shards
+        "mlp.experts.linear_fc1.weight3",  # an fsdp_dtensor name
+        "mlp.experts.local_experts.3.linear_fc1.weight",
+        "mlp.experts.experts.linear_fc1.layer_norm_weight",
+        "mlp.experts.experts.linear_fc1.weight_w",
+        "mlp.experts.weight1",
+    ],
+)
+def test_other_names_under_an_experts_module_are_not_torch_dist(name):
+    with pytest.raises(KeyGrammarError, match="torch_dist stores routed-expert tensors"):
+        split_torch_dist_expert(name)
+
+
+def test_joining_needs_an_experts_linear_layer():
+    with pytest.raises(KeyGrammarError):
+        join_torch_dist_expert("mlp.linear_fc1", "weight")
+
+
+@pytest.mark.parametrize(
+    ("key", "axes"),
+    [
+        ("decoder.layers.mlp.experts.experts.linear_fc1.weight", 2),
+        ("decoder.layers.2.mlp.experts.experts.linear_fc1.weight", 1),
+        ("decoder.layers.mlp.linear_fc1.weight", 1),
+        ("decoder.layers.2.mlp.linear_fc1.weight", 0),
+        ("decoder.layers.mlp.router.expert_bias", 1),
+        ("output_layer.weight", 0),
+    ],
+)
+def test_torch_dist_saves_a_chunk_per_layer_and_expert(key, axes):
+    assert torch_dist_chunk_axes(key) == axes

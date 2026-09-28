@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 
 import pytest
@@ -144,6 +145,43 @@ def test_contract_d_keeps_one_chunk_per_layer_of_a_stacked_tensor(tmp_path):
     assert _kinds(_verify(pairs, source, "D")) == [("layout", stacked)]
     whole_source = store("whole_source", dim0_grid((3, 8, 4), 3))  # a single chunk stays one
     assert _verify(store("whole_again", dim0_grid((3, 8, 4), 3)), whole_source, "D").ok
+
+
+@pytest.mark.parametrize(
+    ("key", "shape", "source_cuts", "expert_cuts", "merged_cuts"),
+    [
+        (  # stacked [L, E, ...]: one chunk per (layer, expert), split in two by tensor parallelism
+            "decoder.layers.mlp.experts.experts.linear_fc1.weight",
+            (2, 3, 4, 2),
+            [[1], [1, 2], [2], []],
+            [[1], [1, 2], [], []],
+            [[1], [], [], []],
+        ),
+        (  # per layer [E, ...]
+            "decoder.layers.1.mlp.experts.experts.linear_fc1.weight",
+            (3, 4, 2),
+            [[1, 2], [2], []],
+            [[1, 2], [], []],
+            [[], [], []],
+        ),
+    ],
+)
+def test_contract_d_keeps_one_chunk_per_expert(
+    tmp_path, key, shape, source_cuts, expert_cuts, merged_cuts
+):
+    """Megatron saves each expert of a routed-expert tensor (of each layer, when stacked) as its
+    own chunk: a round trip may merge the tensor-parallel splits of an expert, never experts."""
+    tensor = torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape).bfloat16()
+
+    def store(name, cuts):
+        grid = product_grid(shape, cuts)
+        return write_torch_dist_store(tmp_path / name, {key: tensor}, grids={key: grid})
+
+    source = store("source", source_cuts)
+    assert _verify(store("per_expert", expert_cuts), source, "D").ok
+    (finding,) = _verify(store("merged", merged_cuts), source, "D").findings
+    assert finding.kind is FindingKind.LAYOUT and finding.key == key
+    assert "with other layers or experts" in finding.detail
 
 
 def test_contract_d_allows_only_the_weights_only_flags(tmp_path):

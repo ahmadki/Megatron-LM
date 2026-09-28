@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tools.checkpoint.format_converter.core.blocks import BlockLayout
+from tools.checkpoint.format_converter.core.experts import ExpertLayout
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
 from tools.checkpoint.format_converter.core.logical import LogicalId, LogicalSlice, OutputSlice
 from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
@@ -183,3 +184,84 @@ def test_a_layer_of_a_stacked_block_is_placed_in_its_stacked_tensor():
 def test_composing_an_unknown_block_is_a_bug():
     with pytest.raises(InternalError):
         compose(LogicalId("encoder", 0, "x", "weight"), (4,), [HYBRID], TORCH_DIST)
+
+
+FOUR_EXPERTS = ExpertLayout(4)
+STACKED_FC1 = "decoder.layers.mlp.experts.experts.linear_fc1.weight"
+
+
+def test_a_stacked_expert_tensor_decomposes_into_one_slice_per_layer_and_expert():
+    """torch_dist's ``[L, E, ...]``: layer ``l``, expert ``e`` is ``[l:l+1, e:e+1, ...]``."""
+    entry_ = TensorEntry(STACKED_FC1, (3, 4, 6, 5), torch.bfloat16, ())
+    slices = decompose(STACKED_FC1, entry_, [STACKED], TORCH_DIST)
+    assert slices == [
+        LogicalSlice(
+            LogicalId("decoder", layer, "mlp.experts.linear_fc1", "weight", expert),
+            STACKED_FC1,
+            Region((layer, expert, 0, 0), (1, 1, 6, 5)),
+            torch.bfloat16,
+            squeezed=2,
+        )
+        for layer in range(3)
+        for expert in range(4)
+    ]
+    assert slices[6].shape == (6, 5)
+    assert slices[6].stored_box(Region((2, 1), (4, 3))) == Region((1, 2, 2, 1), (1, 1, 4, 3))
+
+
+def test_a_per_layer_expert_tensor_decomposes_into_one_slice_per_expert():
+    key = "decoder.layers.2.mlp.experts.experts.linear_fc2.bias"
+    slices = decompose(key, TensorEntry(key, (4, 6), torch.float32, ()), [HYBRID], TORCH_DIST)
+    assert [(s.lid, s.region, s.squeezed) for s in slices] == [
+        (
+            LogicalId("decoder", 2, "mlp.experts.linear_fc2", "bias", expert),
+            Region((expert, 0), (1, 6)),
+            1,
+        )
+        for expert in range(4)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("key", "shape", "blocks"),
+    [
+        ("decoder.layers.1.mlp.experts.experts.linear_fc1.weight", (), [HYBRID]),
+        ("decoder.layers.1.mlp.experts.experts.linear_fc1.weight", (0, 4), [HYBRID]),
+        (STACKED_FC1, (3,), [STACKED]),
+        ("decoder.layers.1.mlp.experts.experts.3.linear_fc1.weight", (6, 5), [HYBRID]),
+        ("decoder.layers.1.mlp.experts.linear_fc1.weight", (6, 5), [HYBRID]),
+    ],
+)
+def test_malformed_torch_dist_expert_tensors_are_grammar_errors(key, shape, blocks):
+    with pytest.raises(KeyGrammarError):
+        decompose(key, TensorEntry(key, shape, torch.float32, ()), blocks, TORCH_DIST)
+
+
+def test_an_expert_is_placed_at_its_index_of_the_expert_axis():
+    lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 2)
+    placed = compose(lid, (6, 5), [STACKED], TORCH_DIST, FOUR_EXPERTS)
+    assert placed == OutputSlice(STACKED_FC1, (3, 4, 6, 5), Region((1, 2, 0, 0), (1, 1, 6, 5)), 2)
+    assert placed.logical_box(Region((1, 2, 3, 0), (1, 1, 3, 5))) == Region((3, 0), (3, 5))
+    per_layer = compose(lid, (6, 5), [HYBRID], TORCH_DIST, FOUR_EXPERTS)
+    assert per_layer == OutputSlice(
+        "decoder.layers.1.mlp.experts.experts.linear_fc1.weight",
+        (4, 6, 5),
+        Region((2, 0, 0), (1, 6, 5)),
+        1,
+    )
+    entry_ = TensorEntry(STACKED_FC1, (3, 4, 6, 5), torch.float32, ())
+    (piece,) = [s for s in decompose(STACKED_FC1, entry_, [STACKED], TORCH_DIST) if s.lid == lid]
+    assert piece.region == placed.region  # decompose is the inverse
+
+
+@pytest.mark.parametrize("experts", [None, ExpertLayout(2)])
+def test_placing_an_expert_outside_the_expert_layout_is_a_bug(experts):
+    lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 2)
+    with pytest.raises(InternalError):
+        compose(lid, (6, 5), [STACKED], TORCH_DIST, experts)
+
+
+def test_expert_layouts_have_experts():
+    assert FOUR_EXPERTS.to_json() == {"num_experts": 4}
+    with pytest.raises(InternalError):
+        ExpertLayout(0)

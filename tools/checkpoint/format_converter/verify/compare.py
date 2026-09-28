@@ -31,7 +31,7 @@ from typing import TypeVar
 
 import torch
 
-from ..core.keys import KeyGrammarError, innermost_layer_key
+from ..core.keys import KeyGrammarError, torch_dist_chunk_axes
 from ..engine.metadata import TensorEntry
 from ..engine.reader import ReadReq, ReadStats, SourceReader
 from ..engine.regions import Region, bounding_box
@@ -295,20 +295,21 @@ def castable(a: torch.dtype, b: torch.dtype, cast: str) -> bool:
 def _coarsening_findings(key: str, a_grid: list[Region], b_grid: list[Region]) -> list[Finding]:
     """A finding unless every chunk of A is exactly tiled by chunks of B.
 
-    A tensor stacked over the layers of a layer list (a key without a layer
-    index) keeps B's chunk boundaries along its first (layer) axis: Megatron
-    saves each layer as its own chunk, and A may merge B's chunks along the
-    other axes only.
+    A tensor with leading index axes keeps B's chunk boundaries along them:
+    Megatron saves each layer of a tensor stacked over the layers of a layer
+    list (a key without a layer index), and each expert of a routed-expert
+    tensor, as its own chunk, and A may merge B's chunks along the other axes
+    only.
     """
-    stacked = _stacked_over_layers(key)
+    axes = _chunk_axes(key)
     for i, j in _overlapping_pairs(a_grid, b_grid):
         a, b = a_grid[i], b_grid[j]
         if not a.contains(b):
             detail = f"A's chunk {a} cuts B's chunk {b} (A's grid must merge whole chunks of B)"
-        elif stacked and a.ndim and (a.offsets[0], a.sizes[0]) != (b.offsets[0], b.sizes[0]):
+        elif (a.offsets[:axes], a.sizes[:axes]) != (b.offsets[:axes], b.sizes[:axes]):
             detail = (
-                f"A's chunk {a} merges B's chunk {b} with other layers (a tensor stacked over "
-                "layers keeps B's chunks along its layer axis)"
+                f"A's chunk {a} merges B's chunk {b} with other layers or experts (Megatron "
+                f"saves each index of the first {axes} axes of {key} as its own chunk)"
             )
         else:
             continue
@@ -316,13 +317,12 @@ def _coarsening_findings(key: str, a_grid: list[Region], b_grid: list[Region]) -
     return []
 
 
-def _stacked_over_layers(key: str) -> bool:
-    """Whether ``key`` names a tensor stacked over the layers of a layer list."""
+def _chunk_axes(key: str) -> int:
+    """The leading axes of ``key`` saved one chunk per index (layers, experts; 0 if malformed)."""
     try:
-        layer_key = innermost_layer_key(key)
+        return torch_dist_chunk_axes(key)
     except KeyGrammarError:
-        return False
-    return layer_key is not None and layer_key.index is None
+        return 0
 
 
 def _check_unit_budget(unit: CompareUnit, max_item_bytes: int) -> None:

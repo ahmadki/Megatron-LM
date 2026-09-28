@@ -5,12 +5,16 @@
 :func:`decompose` parses a source model key with the key grammar, attributes
 it to the innermost block whose layer list holds it (the longest matching
 block prefix; the layer segments of enclosing blocks stay in that prefix) and
-maps the stored layer index to the dense index; a torch_dist key stacked over
-the layers of a block becomes one slice per layer (``[l:l+1, ...]``, whose
-logical tensor has the layer's shape). Keys outside every block keep their
-path. :func:`compose` is the inverse for the target format: it places each
-layer of a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the
-stacked tensor ``<block>.layers.<name>``.
+maps the stored layer index to the dense index. A stored tensor may lead with
+index axes, each giving one logical tensor per index: a torch_dist key
+stacked over the layers of a block has a layer axis, and a torch_dist
+routed-expert tensor an expert axis after it, so ``[L, E, ...]`` becomes one
+slice per (layer, expert), ``[l:l+1, e:e+1, ...]``, whose logical tensor has
+one expert's shape. Keys outside every block keep their path.
+:func:`compose` is the inverse for the target format: it places each layer of
+a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the stacked
+tensor ``<block>.layers.<name>``, and each expert at its index of the expert
+axis.
 """
 
 from __future__ import annotations
@@ -21,12 +25,26 @@ from ..engine.metadata import TensorEntry
 from ..engine.regions import Region
 from ..errors import InternalError
 from .blocks import BlockLayout
-from .keys import KeyGrammarError, attribute_layer_key, join_layer_key, split_leaf
+from .experts import ExpertLayout
+from .keys import (
+    ExpertName,
+    KeyGrammarError,
+    LayerKey,
+    attribute_layer_key,
+    join_layer_key,
+    join_torch_dist_expert,
+    split_leaf,
+    split_torch_dist_expert,
+)
 from .logical import LogicalId, LogicalSlice, OutputSlice
 from .names import TORCH_DIST
 
 STACKED_AXES = 1
 """Leading axes a tensor stacked over layers has beyond one layer's shape."""
+
+_Axis = tuple[tuple[int | None, int | None], ...]
+"""The indices along one leading axis: ``(logical index, position on the axis)`` pairs; a
+single ``(index, None)`` when the stored tensor has no such axis."""
 
 
 def decompose(
@@ -41,76 +59,151 @@ def decompose(
         fmt: The store's format.
 
     Returns:
-        One slice holding the whole tensor, or one per layer for a tensor
-        stacked over the layers of a block.
+        One slice holding the whole tensor, or one per index of its leading
+        layer and expert axes.
 
     Raises:
-        KeyGrammarError: The key's layer segment is malformed, its form
-            (stacked or per layer) is not the one the format stores the block
-            in, its layer index is not one the format stores for the block,
-            a stacked tensor does not hold every layer, or the key has no leaf.
+        KeyGrammarError: The key's layer segment or expert name is malformed,
+            its form (stacked or per layer) is not the one the format stores
+            the block in, its layer index is not one the format stores for the
+            block, a stacked tensor does not hold every layer, a routed-expert
+            tensor has no expert axis, or the key has no leaf.
     """
     by_prefix = {block.prefix: block for block in blocks}
     layer_key = attribute_layer_key(relative, by_prefix)
-    whole = Region.full(entry.shape)
-    if layer_key is None:
-        path, leaf = split_leaf(relative)
-        return [LogicalSlice(LogicalId(None, None, path, leaf), entry.key, whole, entry.dtype)]
-    block = by_prefix[layer_key.block]
-    path, leaf = split_leaf(layer_key.inner)
-    if layer_key.stacked != (fmt == TORCH_DIST and block.stacked):
+    block = None if layer_key is None else by_prefix[layer_key.block]
+    name = relative if layer_key is None else layer_key.inner
+    expert = _expert_name(name, fmt)
+    path, leaf = (expert.path, expert.leaf) if expert is not None else split_leaf(name)
+    layers = _layer_axis(relative, entry, block, layer_key, fmt)
+    layer_axes = int(layers[0][1] is not None)
+    experts = _expert_axis(relative, entry, expert, axis=layer_axes)
+    lead = layer_axes + int(experts[0][1] is not None)
+    rest = entry.shape[lead:]
+    prefix = None if block is None else block.prefix
+    return [
+        LogicalSlice(
+            LogicalId(prefix, layer, path, leaf, index),
+            entry.key,
+            Region(
+                tuple(p for p in (layer_at, index_at) if p is not None) + (0,) * len(rest),
+                (1,) * lead + rest,
+            ),
+            entry.dtype,
+            squeezed=lead,
+        )
+        for layer, layer_at in layers
+        for index, index_at in experts
+    ]
+
+
+def _expert_name(name: str, fmt: str) -> ExpertName | None:
+    """The routed-expert tensor ``name`` holds in a store of format ``fmt``, if any."""
+    return split_torch_dist_expert(name) if fmt == TORCH_DIST else None
+
+
+def _layer_axis(
+    relative: str,
+    entry: TensorEntry,
+    block: BlockLayout | None,
+    layer_key: LayerKey | None,
+    fmt: str,
+) -> _Axis:
+    """The dense layers ``entry`` holds, and where along its layer axis if it has one."""
+    if block is None or layer_key is None:
+        return ((None, None),)
+    stacked = fmt == TORCH_DIST and block.stacked
+    if layer_key.stacked != stacked:
         form = "stacked over the layers" if layer_key.stacked else "one layer"
         raise KeyGrammarError(
             f"{relative} holds {form} of {block.prefix}, which {fmt} stores "
-            + ("stacked" if fmt == TORCH_DIST and block.stacked else "one layer per key")
+            + ("stacked" if stacked else "one layer per key")
         )
     if layer_key.index is not None:
-        lid = LogicalId(block.prefix, block.dense_index(layer_key.index, fmt), path, leaf)
-        return [LogicalSlice(lid, entry.key, whole, entry.dtype)]
+        return ((block.dense_index(layer_key.index, fmt), None),)
     if entry.shape[:STACKED_AXES] != (block.num_modules,):
         raise KeyGrammarError(
             f"{relative} of shape {entry.shape} does not hold the {block.num_modules} layers "
             f"of {block.prefix}"
         )
-    rest = entry.shape[STACKED_AXES:]
-    return [
-        LogicalSlice(
-            LogicalId(block.prefix, block.dense_index(stored, fmt), path, leaf),
-            entry.key,
-            Region((stored,) + (0,) * len(rest), (1, *rest)),
-            entry.dtype,
-            squeezed=STACKED_AXES,
+    return tuple((block.dense_index(stored, fmt), stored) for stored in range(block.num_modules))
+
+
+def _expert_axis(relative: str, entry: TensorEntry, expert: ExpertName | None, axis: int) -> _Axis:
+    """The experts ``entry`` holds, and where along its expert axis (``axis``) if it has one."""
+    if expert is None or expert.expert is not None:
+        return ((None if expert is None else expert.expert, None),)
+    if len(entry.shape) <= axis or entry.shape[axis] < 1:
+        raise KeyGrammarError(
+            f"{relative} of shape {entry.shape} has no expert axis (dimension {axis})"
         )
-        for stored in range(block.num_modules)
-    ]
+    return tuple((index, index) for index in range(entry.shape[axis]))
 
 
 def compose(
-    lid: LogicalId, shape: tuple[int, ...], blocks: Sequence[BlockLayout], fmt: str
+    lid: LogicalId,
+    shape: tuple[int, ...],
+    blocks: Sequence[BlockLayout],
+    fmt: str,
+    experts: ExpertLayout | None = None,
 ) -> OutputSlice:
     """Where the logical tensor ``lid`` of shape ``shape`` goes in a store of format ``fmt``.
 
+    Args:
+        lid: The logical tensor.
+        shape: Its shape.
+        blocks: The model's blocks.
+        fmt: The target format.
+        experts: How the model's routed experts are stored (needed for their tensors).
+
     Returns:
-        The slice with the model-relative key: the whole tensor, or its layer
-        ``[l:l+1, ...]`` of a tensor stacked over the layers of a block that
-        torch_dist stores stacked (``l`` its torch_dist index).
+        The slice with the model-relative key: the whole tensor, or its box
+        of a tensor with leading index axes: ``[l:l+1, ...]`` of a tensor
+        stacked over the layers of a block that torch_dist stores stacked
+        (``l`` its torch_dist index), and ``[..., e:e+1, ...]`` of a torch_dist
+        routed-expert tensor.
 
     Raises:
-        InternalError: ``lid`` names a block that is not in ``blocks``.
+        InternalError: ``lid`` names a block that is not in ``blocks``, or a
+            routed expert that ``experts`` does not place.
     """
-    whole = Region.full(shape)
+    name, expert_axis = _output_name(lid, fmt, experts)
+    leading: list[tuple[int, int]] = []  # (index, axis length) of each leading axis
     if lid.block is None or lid.layer is None:
-        return OutputSlice(lid.name, shape, whole)
-    by_prefix = {block.prefix: block for block in blocks}
-    if lid.block not in by_prefix:
-        raise InternalError(f"{lid} names an unknown block")
-    block = by_prefix[lid.block]
-    stored = block.stored_index(lid.layer, fmt)
-    if not (fmt == TORCH_DIST and block.stacked):
-        return OutputSlice(join_layer_key(block.prefix, stored, lid.name), shape, whole)
+        key = name
+    else:
+        block = next((block for block in blocks if block.prefix == lid.block), None)
+        if block is None:
+            raise InternalError(f"{lid} names an unknown block")
+        stored = block.stored_index(lid.layer, fmt)
+        stacked = fmt == TORCH_DIST and block.stacked
+        key = join_layer_key(block.prefix, None if stacked else stored, name)
+        if stacked:
+            leading.append((stored, block.num_modules))
+    if expert_axis is not None:
+        leading.append(expert_axis)
     return OutputSlice(
-        join_layer_key(block.prefix, None, lid.name),
-        (block.num_modules, *shape),
-        Region((stored,) + whole.offsets, (1, *shape)),
-        squeezed=STACKED_AXES,
+        key,
+        tuple(length for _, length in leading) + shape,
+        Region(
+            tuple(index for index, _ in leading) + (0,) * len(shape), (1,) * len(leading) + shape
+        ),
+        squeezed=len(leading),
     )
+
+
+def _output_name(
+    lid: LogicalId, fmt: str, experts: ExpertLayout | None
+) -> tuple[str, tuple[int, int] | None]:
+    """The name of ``lid`` inside its layer (or from the root) in ``fmt``, and its expert axis.
+
+    The expert axis is ``(expert index, number of experts)`` for a routed
+    expert's tensor that ``fmt`` stores in one tensor with the others.
+    """
+    if lid.expert is None:
+        return lid.name, None
+    if experts is None or lid.expert >= experts.num_experts:
+        raise InternalError(f"{lid} is not an expert of the model's expert layout {experts}")
+    if fmt != TORCH_DIST:
+        raise InternalError(f"{lid}: {fmt} names no routed experts yet")
+    return join_torch_dist_expert(lid.path, lid.leaf), (lid.expert, experts.num_experts)
