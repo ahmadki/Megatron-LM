@@ -45,6 +45,13 @@ FC_R02 = "FC-R02"
 FC_R03 = "FC-R03"
 """The model was built with a spec or implementation whose keys the rules do not know."""
 
+FC_R04 = "FC-R04"
+"""The model stores every local expert of a grouped linear layer in one parameter."""
+
+FC_R05 = "FC-R05"
+"""Grouped expert biases in fsdp_dtensor with expert parallelism (Megatron-FSDP keeps them
+expert-parallel-local)."""
+
 FC_R06 = "FC-R06"
 """The model uses grouped tensor parallelism (weight shards or rematerialization > 1)."""
 
@@ -75,9 +82,6 @@ FC_R19 = "FC-R19"
 
 FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant)."""
-
-FC_P03 = "FC-P03"
-"""Pending: mixture-of-experts layers."""
 
 FC_P04 = "FC-P04"
 """Pending: shortcut-MoE layer numbering or hybrid multi-token prediction."""

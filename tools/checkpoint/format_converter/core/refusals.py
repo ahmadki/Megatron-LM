@@ -27,33 +27,38 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import SINGLE_ROOTS, VLM_ROOTS
+from .experts import built_expert_form
 from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
-    EXPERT_PARAM,
     FACTORY_PART,
     FC1_WEIGHT,
     FUSED_MIXER,
     GDN_PARAM,
     GDP_PART,
     GLU_HALF,
+    GROUPED_EXPERT_BIAS,
     LAYER_SEGMENT,
+    LEGACY_GROUPED_EXPERTS,
     MIXER_PARAM,
     MLA_PARAM,
+    SINGLE_GROUPED_EXPERTS,
+    SINGLETON_EXPERT_SHARD,
     TE_OP_FUSER_MLP,
+    TORCH_DIST_EXPERT_BIAS,
     fc2_weight_of,
     root_of,
 )
-from .names import FSDP_DTENSOR, TORCH_DIST
+from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P03: "mixture-of-experts layers",
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
     errors.FC_P06: "gated linear_fc1 that fsdp_dtensor keeps fused (args.swiglu off)",
@@ -78,8 +83,8 @@ HYBRID_SPEC_MODULES = (
 GDP_SPEC_NAMES = frozenset({"gated_delta_product_stack_spec", "gdp_stack_spec"})
 """Names of the Gated DeltaProduct stack spec in those modules."""
 
-PENDING_SYMBOLS = frozenset("EMG+")
-"""Hybrid layer symbols of pending families (experts, mixers, Gated DeltaNet, MLA)."""
+PENDING_SYMBOLS = frozenset("MG+")
+"""Hybrid layer symbols of pending families (mixers, Gated DeltaNet, MLA)."""
 
 GDN_VARIANTS = frozenset({"gdn", "gdn2", "gated_delta_net"})
 """``experimental_attention_variant`` values of the Gated DeltaNet family."""
@@ -99,7 +104,13 @@ HETEROGENEOUS_ARGS = (
     "heterogeneous_layers_config_encoded_json",
 )
 
-REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-")
+SINGLE_GROUPED_ARGS = ("moe_single_grouped_weight", "moe_single_grouped_bias")
+"""Arguments that store every local expert of a grouped linear layer in one parameter."""
+
+SINGLETON_LOCAL_SHARDS = "singleton_local_shards"
+"""The ``content_metadata`` flag of a checkpoint saved one local shard per key."""
+
+REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E")
 REGISTRY.allow(
     Allowlist.STACK_SPECS,
     *(
@@ -150,6 +161,8 @@ class Facts:
         optimizer: ``drop`` or ``convert`` (``--optimizer``).
         allowed_roots: Key prefixes accepted besides the known roots (``--allow-root``).
         allow_missing_fp8_extra_state: ``--allow-missing-fp8-extra-state``.
+        content_metadata: The source's ``content_metadata`` (torch_dist common state).
+        expert_naming: ``--expert-naming``.
     """
 
     source: str
@@ -159,6 +172,8 @@ class Facts:
     optimizer: str = "drop"
     allowed_roots: tuple[str, ...] = ()
     allow_missing_fp8_extra_state: bool = False
+    content_metadata: Any = None
+    expert_naming: str = AUTO_EXPERT_NAMING
 
     def keys_matching(self, pattern: re.Pattern[str]) -> tuple[str, ...]:
         """The model-relative keys ``pattern`` finds a match in (sorted)."""
@@ -379,16 +394,131 @@ def _mtp_keys(facts: Facts) -> tuple[str, ...]:
     return tuple(key for key in sorted(facts.model) if key.startswith(_block_heads(MTP_BLOCKS)))
 
 
+def _key_evidence(keys: tuple[str, ...]) -> list[str]:
+    return [f"{len(keys)} model key(s) such as {keys[0]}"] if keys else []
+
+
 @REGISTRY.detector
-def pending_experts(facts: Facts) -> Iterator[Refusal]:
-    """FC-P03: mixture-of-experts layers."""
-    evidence = []
-    experts = facts.args.get("num_experts", None)
-    if experts:
-        evidence.append(f"args.num_experts={experts}")
-    if "E" in _symbols(facts):
-        evidence.append("hybrid layer symbol E")
-    yield from _pending(errors.FC_P03, evidence, facts.keys_matching(EXPERT_PARAM))
+def single_grouped_experts(facts: Facts) -> Iterator[Refusal]:
+    """FC-R04: single grouped expert parameters (every local expert of a layer in one tensor).
+
+    Megatron-FSDP does not support them (``validate_args``), and their
+    fsdp_dtensor keys are not per expert.
+    """
+    flags = [f"args.{name}=True" for name in SINGLE_GROUPED_ARGS if facts.args.get(name, False)]
+    keys = facts.keys_matching(SINGLE_GROUPED_EXPERTS)
+    evidence = flags + _key_evidence(keys)
+    if evidence:
+        yield Refusal(
+            errors.FC_R04,
+            "single grouped expert parameters hold every local expert of a linear layer in one "
+            f"tensor, which Megatron-FSDP does not support ({'; '.join(evidence)})",
+            keys=keys,
+            hint="convert a checkpoint of a run without --moe-single-grouped-weight and "
+            "--moe-single-grouped-bias",
+        )
+
+
+@REGISTRY.detector
+def ep_local_grouped_biases(facts: Facts) -> Iterator[Refusal]:
+    """FC-R05: grouped expert biases in fsdp_dtensor with expert parallelism.
+
+    Megatron-FSDP renumbers the weights of a grouped experts module from their
+    expert-parallel-local index to the global one, but not the biases
+    (``get_expert_index_from_key`` matches ``weight<e>`` only), so every
+    expert-parallel rank saves and loads its local experts' biases under the
+    same keys.
+    """
+    ep = facts.args.get("expert_model_parallel_size", None) or 1
+    if ep <= 1:
+        return
+    if facts.source == FSDP_DTENSOR:
+        keys = facts.keys_matching(GROUPED_EXPERT_BIAS)
+        hint = (
+            "the store holds the biases of one expert-parallel rank only: convert a checkpoint "
+            "saved with --expert-model-parallel-size 1, or with sequential experts (no "
+            "--moe-grouped-gemm), which name their biases by global index"
+        )
+    elif _fsdp_expert_form(facts) == GROUPED:
+        keys = facts.keys_matching(TORCH_DIST_EXPERT_BIAS)
+        hint = (
+            "for a GPT model, pass --expert-naming sequential for a job built without "
+            "--moe-grouped-gemm (SequentialMLP experts name their biases by global index); the "
+            "hybrid stack spec always builds grouped experts"
+        )
+    else:
+        return
+    if keys:
+        yield Refusal(
+            errors.FC_R05,
+            f"grouped expert biases with args.expert_model_parallel_size={ep}: Megatron-FSDP "
+            "names them by their expert-parallel-local index, so the expert-parallel ranks "
+            "overwrite one another's",
+            keys=keys,
+            hint=hint,
+        )
+
+
+def _fsdp_expert_form(facts: Facts) -> str:
+    """How the fsdp_dtensor target names routed experts (``--expert-naming``, or as built).
+
+    A hybrid model's are named as its stack spec builds them whatever the flag
+    says (the expert layout refuses another naming as a usage error).
+    """
+    if facts.expert_naming != AUTO_EXPERT_NAMING and hybrid_pattern_of(facts.args) is None:
+        return facts.expert_naming
+    return built_expert_form(facts.args)[0]
+
+
+@REGISTRY.detector
+def legacy_grouped_experts(facts: Facts) -> Iterator[Refusal]:
+    """FC-R13: parameters of the legacy ``GroupedMLP`` (``weight1``/``weight2``)."""
+    keys = facts.keys_matching(LEGACY_GROUPED_EXPERTS)
+    if keys:
+        yield Refusal(
+            errors.FC_R13,
+            "parameters of the legacy GroupedMLP, whose weight1 and weight2 hold every local "
+            "expert of a layer in one tensor",
+            keys=keys,
+            hint="load the checkpoint into a current Megatron model (TEGroupedMLP experts) and "
+            "save it again",
+        )
+
+
+def singleton_local_shards_refusal(
+    content_metadata: Any, keys: tuple[str, ...] = ()
+) -> Refusal | None:
+    """FC-R17 for a checkpoint saved with ``singleton_local_shards``, if it was.
+
+    Args:
+        content_metadata: The checkpoint's ``content_metadata``, whose flag says so.
+        keys: Model keys in the singleton form (experts saved as
+            ``experts.experts.<e>.<name>``), which say so too.
+    """
+    flagged = isinstance(content_metadata, Mapping) and bool(
+        content_metadata.get(SINGLETON_LOCAL_SHARDS)
+    )
+    if not flagged and not keys:
+        return None
+    return Refusal(
+        errors.FC_R17,
+        f"the checkpoint was saved with {SINGLETON_LOCAL_SHARDS}, which this tool does not read"
+        + ("" if flagged else " (its experts are saved one key per expert)"),
+        keys=(("content_metadata",) if flagged else ()) + keys,
+        hint="load it with current Megatron and save it again without that option",
+    )
+
+
+@REGISTRY.detector
+def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
+    """FC-R17: a torch_dist source saved with ``singleton_local_shards``."""
+    if facts.source != TORCH_DIST:
+        return
+    refusal = singleton_local_shards_refusal(
+        facts.content_metadata, facts.keys_matching(SINGLETON_EXPERT_SHARD)
+    )
+    if refusal is not None:
+        yield refusal
 
 
 @REGISTRY.detector

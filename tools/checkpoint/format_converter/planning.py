@@ -393,6 +393,8 @@ def _plan_cross_format(
             optimizer=opts.optimizer,
             allowed_roots=opts.allow_roots,
             allow_missing_fp8_extra_state=opts.allow_missing_fp8_extra_state,
+            content_metadata=decoded.state.get(CONTENT_METADATA),
+            expert_naming=opts.expert_naming,
         )
     )
     if refusals:

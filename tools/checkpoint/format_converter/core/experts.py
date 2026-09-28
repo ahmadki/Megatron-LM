@@ -32,6 +32,12 @@ against the store:
   argument changes the experts module its stack spec builds. An fsdp_dtensor
   source that names its experts otherwise is ambiguous (FC-A04): its
   arguments would build other expert modules than the ones that saved it.
+
+Megatron-FSDP names the expert biases of a grouped experts module by their
+expert-parallel-local index (``handle_experts_in_state_dict`` renumbers the
+weights only): such a store is only right at expert-parallel size 1. The
+refusal fence refuses it for a checkpoint saved with expert parallelism
+(FC-R05), and :func:`grouped_bias_warnings` warns about the others.
 """
 
 from __future__ import annotations
@@ -46,7 +52,13 @@ from ..errors import InternalError, Refusal, RefusalError, UsageError
 from .args_view import ArgsView
 from .blocks import index_ranges
 from .hybrid_pattern import hybrid_pattern_of
-from .keys import ExpertName, KeyGrammarError, innermost_layer_key, split_expert_name
+from .keys import (
+    TORCH_DIST_EXPERT_BIAS,
+    ExpertName,
+    KeyGrammarError,
+    innermost_layer_key,
+    split_expert_name,
+)
 from .names import AUTO_EXPERT_NAMING, EXPERT_FORMS, GROUPED, SEQUENTIAL, TORCH_DIST
 
 EXPERT_MODULES = {GROUPED: "TEGroupedMLP", SEQUENTIAL: "SequentialMLP"}
@@ -131,6 +143,27 @@ def expert_layout(
     grouped_gemm = None if hybrid_pattern_of(args) is not None else form == GROUPED
     layout = ExpertLayout(num_experts, form, grouped_gemm)
     return layout, f"args.num_experts={num_experts}; {stored}; {why}"
+
+
+def grouped_bias_warnings(
+    layout: ExpertLayout | None, model: Mapping[str, TensorEntry], source: str
+) -> list[str]:
+    """Why an fsdp_dtensor target's grouped expert biases load right only without expert
+    parallelism (Megatron-FSDP names them by their expert-parallel-local index)."""
+    if layout is None or source != TORCH_DIST or layout.fsdp_form != GROUPED:
+        return []
+    biases = sorted(key for key in model if TORCH_DIST_EXPERT_BIAS.search(key))
+    if not biases:
+        return []
+    if layout.grouped_gemm is None:  # a hybrid model: its stack spec builds no other experts
+        advice = "the hybrid stack spec always builds grouped experts"
+    else:
+        advice = "sequential experts, --expert-naming sequential, name them by global index"
+    return [
+        f"grouped expert biases ({len(biases)} tensors such as {biases[0]}): Megatron-FSDP names "
+        "them by their expert-parallel-local index, so a job loads them right only with "
+        f"--expert-model-parallel-size 1 ({advice})"
+    ]
 
 
 def built_expert_form(args: ArgsView) -> tuple[str, str]:

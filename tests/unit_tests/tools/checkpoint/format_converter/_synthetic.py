@@ -15,6 +15,7 @@ import argparse
 import io
 import json
 import pickle
+import re
 import types
 import warnings
 from collections.abc import Callable, Mapping, Sequence
@@ -466,3 +467,105 @@ def vision_language_tensors(
         **vision,
         **extra,
     }
+
+
+def moe_layer_tensors(
+    layer: str, experts: int, hidden: int = 8, ffn: int = 6, *, bias: bool, seed: int
+) -> dict[str, torch.Tensor]:
+    """Random tensors of one mixture-of-experts layer under ``layer`` (e.g. ``decoder.layers.1``).
+
+    The routed experts are named as fsdp_dtensor names grouped experts
+    (``mlp.experts.linear_fc<n>.weight<e>``, ``bias<e>`` with ``bias``); the router has a
+    bfloat16 weight and a float32 ``expert_bias``, the pre-MLP norm is float32. Each expert
+    draws its own values.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    shapes = {"linear_fc1": (ffn, hidden), "linear_fc2": (hidden, ffn)}
+    tensors = {
+        f"{layer}.pre_mlp_layernorm.weight": torch.randn(hidden, generator=generator),
+        f"{layer}.mlp.router.weight": torch.randn(experts, hidden, generator=generator).bfloat16(),
+        f"{layer}.mlp.router.expert_bias": torch.randn(experts, generator=generator),
+    }
+    for expert in range(experts):
+        for linear, shape in shapes.items():
+            weight = torch.randn(shape, generator=generator).bfloat16()
+            tensors[f"{layer}.mlp.experts.{linear}.weight{expert}"] = weight
+            if bias:
+                tensors[f"{layer}.mlp.experts.{linear}.bias{expert}"] = torch.randn(
+                    shape[0], generator=generator
+                ).bfloat16()
+    return tensors
+
+
+def gpt_moe_tensors(
+    layers: int = 2, experts: int = 4, hidden: int = 8, *, moe_layers=None, bias: bool = True
+) -> dict[str, torch.Tensor]:
+    """A GPT model whose ``moe_layers`` (default: all) are mixture-of-experts layers.
+
+    One tensor per layer and per expert, grouped experts named as fsdp_dtensor
+    names them (see :func:`moe_layer_tensors`); other layers have a dense MLP.
+    """
+    dense = gpt_tensors(layers, hidden, ffn=2 * hidden)
+    moe_layers = range(layers) if moe_layers is None else moe_layers
+    tensors = {}
+    for key, tensor in dense.items():
+        head, _, name = key.partition(".layers.")
+        index = name.split(".", 1)[0] if head == "decoder" else None
+        if index is not None and int(index) in moe_layers and ".mlp." in name:
+            continue
+        tensors[key] = tensor
+    for layer in moe_layers:
+        tensors.update(
+            moe_layer_tensors(f"decoder.layers.{layer}", experts, hidden, bias=bias, seed=layer)
+        )
+    return tensors
+
+
+_GROUPED_EXPERT = re.compile(
+    r"^(?P<head>.*\.mlp\.experts)\.(?P<linear>linear_fc\d)\.(?P<leaf>weight|bias)(?P<e>\d+)$"
+)
+
+
+def sequential_experts(tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The tensors with grouped expert names renamed as ``SequentialMLP`` names them."""
+    renamed = {}
+    for key, tensor in tensors.items():
+        match = _GROUPED_EXPERT.match(key)
+        if match:
+            key = f"{match['head']}.local_experts.{match['e']}.{match['linear']}.{match['leaf']}"
+        renamed[key] = tensor
+    return renamed
+
+
+def stack_experts(tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The tensors with each layer's grouped experts stacked as torch_dist stores them.
+
+    ``<...>.mlp.experts.linear_fc<n>.<leaf><e>`` for ``e = 0..E-1`` become
+    ``<...>.mlp.experts.experts.linear_fc<n>.<leaf>`` of shape ``[E, ...]``
+    (``torch.stack`` in expert order); other keys are kept.
+    """
+    stacked: dict[str, dict[int, torch.Tensor]] = {}
+    kept = {}
+    for key, tensor in tensors.items():
+        match = _GROUPED_EXPERT.match(key)
+        if match:
+            name = f"{match['head']}.experts.{match['linear']}.{match['leaf']}"
+            stacked.setdefault(name, {})[int(match["e"])] = tensor
+        else:
+            kept[key] = tensor
+    for name, experts in stacked.items():
+        assert sorted(experts) == list(range(len(experts))), name
+        kept[name] = torch.stack([experts[e] for e in range(len(experts))])
+    return kept
+
+
+def expert_grids(tensors: Mapping[str, torch.Tensor]) -> dict[str, tuple[Region, ...]]:
+    """One chunk per expert (and per layer of a stacked tensor) of every torch_dist expert
+    tensor, as Megatron saves them."""
+    grids = {}
+    for key, tensor in tensors.items():
+        if ".mlp.experts.experts." in key:
+            axes = 2 if key.split(".layers.", 1)[1][0].isalpha() else 1
+            cuts = [list(range(1, tensor.shape[d])) if d < axes else [] for d in range(tensor.ndim)]
+            grids[key] = product_grid(tuple(tensor.shape), cuts)
+    return grids

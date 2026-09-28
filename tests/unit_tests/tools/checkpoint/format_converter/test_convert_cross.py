@@ -316,21 +316,21 @@ def _expect(capsys, code, *argv, lines):
 
 
 def test_refusals_are_all_reported_before_anything_is_read(tmp_path, capsys):
-    moe = write_torch_dist_source(
-        tmp_path / "moe",
-        common={**COMMON, "args": hybrid_args(num_experts=4, spec=["x.y", "custom"])},
+    fenced = write_torch_dist_source(
+        tmp_path / "fenced",
+        common={**COMMON, "args": hybrid_args(swiglu=True, spec=["x.y", "custom"])},
     )
     _expect(
         capsys,
         3,
         "convert",
-        moe,
+        fenced,
         tmp_path / "out",
         "--to",
         "fsdp_dtensor",
         "--optimizer",
         "convert",
-        lines=["error: FC-R03: args.spec='x.y.custom'", "error: FC-P03:", "error: FC-P12:"],
+        lines=["error: FC-R03: args.spec='x.y.custom'", "error: FC-P07:", "error: FC-P12:"],
     )
     assert not (tmp_path / "out").exists()
     extra = {"frontend.proj.weight": torch.ones(4)}

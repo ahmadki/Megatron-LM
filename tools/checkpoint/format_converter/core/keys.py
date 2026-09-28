@@ -349,11 +349,23 @@ FUSED_MIXER = re.compile(
 )
 """A fused state-space or linear-attention projection as fsdp_dtensor stores it."""
 
-EXPERT_PARAM = re.compile(r"(?:^|\.)(?:experts|shared_experts|router)\.")
-"""A parameter or buffer of a mixture-of-experts layer."""
-
 ROUTED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.")
 """A tensor under the routed experts of a mixture-of-experts layer (``<...>.mlp.experts.``)."""
+
+SINGLE_GROUPED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.linear_fc[0-9]\.(?:weight|bias)$")
+"""One grouped parameter for every expert (``moe_single_grouped_weight``/``_bias``)."""
+
+GROUPED_EXPERT_BIAS = re.compile(r"(?:^|\.)mlp\.experts\.linear_fc[0-9]\.bias(?:0|[1-9][0-9]*)$")
+"""An expert bias of a grouped experts module (fsdp_dtensor ``linear_fc<n>.bias<e>``)."""
+
+TORCH_DIST_EXPERT_BIAS = re.compile(r"(?:^|\.)mlp\.experts\.experts\.linear_fc[0-9]\.bias$")
+"""The expert biases of a linear layer as torch_dist stores them (one tensor over all experts)."""
+
+LEGACY_GROUPED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.weight[12]$")
+"""A parameter of the legacy ``GroupedMLP``: every local expert of a linear layer in one tensor."""
+
+SINGLETON_EXPERT_SHARD = re.compile(r"(?:^|\.)mlp\.experts\.experts\.(?:0|[1-9][0-9]*)\.")
+"""An expert saved with ``singleton_local_shards`` (torch_dist ``experts.experts.<e>.<name>``)."""
 
 MIXER_PARAM = re.compile(r"(?:^|\.)mixer\.")
 """A parameter of a state-space mixer (Mamba-2 or Gated DeltaProduct)."""
@@ -376,10 +388,18 @@ EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
 """A Transformer Engine ``_extra_state`` key (``_extra_state<i>`` when grouped; torch_dist
 stores it as a tensor or a ``/shard_*`` byte item)."""
 
-FC1_WEIGHT = re.compile(r"(?:^|\.)linear_fc1\.weight$")
-"""The weight of an MLP's first projection (a candidate gated linear unit)."""
+FC1_WEIGHT = re.compile(r"(?:^|\.)linear_fc1\.weight(?:0|[1-9][0-9]*)?$")
+"""The weight of an MLP's first projection (a candidate gated linear unit): ``linear_fc1.weight``,
+or one expert's ``linear_fc1.weight<e>`` of a grouped experts module in fsdp_dtensor."""
 
 
 def fc2_weight_of(fc1_key: str) -> str:
-    """The key of the ``linear_fc2.weight`` beside a ``linear_fc1.weight`` key."""
-    return fc1_key[: -len("fc1.weight")] + "fc2.weight"
+    """The key of the ``linear_fc2`` weight beside a ``linear_fc1`` weight key (see FC1_WEIGHT).
+
+    Raises:
+        KeyGrammarError: ``fc1_key`` is not a ``linear_fc1`` weight.
+    """
+    match = FC1_WEIGHT.search(fc1_key)
+    if match is None:
+        raise KeyGrammarError(f"{fc1_key} is not a linear_fc1 weight")
+    return fc1_key[: match.start()] + match.group(0).replace("linear_fc1", "linear_fc2")

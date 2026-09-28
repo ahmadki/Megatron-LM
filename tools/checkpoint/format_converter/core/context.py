@@ -30,7 +30,7 @@ from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
-from .experts import ExpertLayout, expert_layout
+from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
 from .keys import root_of
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
@@ -114,7 +114,7 @@ class ArchContext:
         derivations: How each field was derived, in derivation order.
         warnings: What the conversion does that a job built from the
             arguments may not load (``--block-layout`` against Megatron's
-            layout).
+            layout, grouped expert biases under expert parallelism).
     """
 
     direction: str
@@ -224,9 +224,11 @@ def build_arch_context(
     )
     if direction == FSDP_TO_TD:
         _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
-    warnings = requested_layout_warnings(facts, blocks)
     experts, evidence = expert_layout(args, model, source, expert_naming)
     log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
+    warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
+        experts, model, source
+    )
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )

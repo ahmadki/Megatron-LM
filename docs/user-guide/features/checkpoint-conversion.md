@@ -67,7 +67,6 @@ with a pending-family code:
 
 | Code | Family |
 |---|---|
-| `FC-P03` | mixture-of-experts layers |
 | `FC-P04` | shortcut-MoE layer numbering and hybrid multi-token prediction |
 | `FC-P05` | Gated DeltaProduct mixers |
 | `FC-P06`, `FC-P07` | gated `linear_fc1` (SwiGLU), kept fused or split into halves |
@@ -291,6 +290,8 @@ condition of every code.
 | `FC-R01` | Megatron-FSDP v2 store or arguments |
 | `FC-R02` | virtual-pipeline sections, or an `fsdp_dtensor` source saved with pipeline parallelism |
 | `FC-R03` | a spec or implementation whose keys no rule knows (not Transformer Engine, a custom `--spec`, heterogeneous specs, the operation-fuser MLP) |
+| `FC-R04` | single grouped expert parameters (`--moe-single-grouped-weight`, `--moe-single-grouped-bias`), which Megatron-FSDP does not support |
+| `FC-R05` | grouped expert biases in `fsdp_dtensor` with expert parallelism (Megatron-FSDP keeps their expert-parallel-local indices) |
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
 | `FC-R11` | layer indices that contradict the hybrid layer pattern |
@@ -329,7 +330,7 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** Mixture-of-experts, SwiGLU, state-space mixers,
+- **Pending families.** SwiGLU, state-space mixers,
   Gated DeltaNet, multi-token prediction and multi-latent attention are
   refused until the versions that add them (see the
   [Support Matrix](#support-matrix)).

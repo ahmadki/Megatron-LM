@@ -94,6 +94,29 @@ def test_a_supported_hybrid_model_passes_in_both_directions():
 
 
 GPT_ARGS = {"hybrid_layer_pattern": None}
+E = 4
+EP2 = {"num_experts": E, "expert_model_parallel_size": 2}
+GROUPED_EXPERTS = {
+    f"decoder.layers.{layer}.mlp.experts.linear_fc{n}.weight{expert}": (F, H) if n == 1 else (H, F)
+    for layer in (1, 3)
+    for n in (1, 2)
+    for expert in range(E)
+}
+"""Grouped fsdp_dtensor expert weights (global indices) of two MoE layers."""
+GROUPED_BIASES = {
+    f"decoder.layers.{layer}.mlp.experts.linear_fc{n}.bias{expert}": (F,) if n == 1 else (H,)
+    for layer in (1, 3)
+    for n in (1, 2)
+    for expert in range(E // 2)
+}
+"""Grouped fsdp_dtensor expert biases at expert-parallel size 2 (local indices, as saved)."""
+TORCH_DIST_EXPERTS = {
+    f"decoder.layers.{layer}.mlp.experts.experts.linear_fc{n}.{leaf}": shape
+    for layer in (1, 3)
+    for n, shapes in ((1, {"weight": (E, F, H), "bias": (E, F)}), (2, {"weight": (E, H, F)}))
+    for leaf, shape in shapes.items()
+}
+"""torch_dist expert tensors (fc1 with biases) of two MoE layers."""
 FSDP_SWIGLU_KEYS = {
     **{f"decoder.layers.{layer}.mlp.linear_fc1.weight": None for layer in (1, 3)},
     **{
@@ -163,9 +186,64 @@ CASES = {
     "R20 symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*D"})),
     "R20 unknown symbol": (errors.FC_R20, facts(args={"hybrid_layer_pattern": "*-*Z"})),
     "R20 variant": (errors.FC_R20, facts(args={"experimental_attention_variant": "dsa"})),
-    "P03 args": (errors.FC_P03, facts(args={"num_experts": 8})),
-    "P03 symbol": (errors.FC_P03, facts(args={"hybrid_layer_pattern": "*E*E"})),
-    "P03 keys": (errors.FC_P03, facts(keys={"decoder.layers.1.mlp.router.weight": (8, H)})),
+    "R04 single grouped weight": (errors.FC_R04, facts(args={"moe_single_grouped_weight": True})),
+    "R04 single grouped bias": (
+        errors.FC_R04,
+        facts(args={"moe_single_grouped_bias": True}, source=FSDP_DTENSOR, target=TORCH_DIST),
+    ),
+    "R04 unindexed keys": (
+        errors.FC_R04,
+        facts(
+            keys={"decoder.layers.1.mlp.experts.linear_fc1.weight": (E * F, H)},
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+        ),
+    ),
+    "R05 fsdp grouped biases": (
+        errors.FC_R05,
+        facts(
+            args=EP2,
+            keys={**GROUPED_EXPERTS, **GROUPED_BIASES},
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+        ),
+    ),
+    "R05 grouped biases for fsdp": (
+        errors.FC_R05,
+        facts(args={**GPT_ARGS, **EP2, "moe_grouped_gemm": True}, keys=TORCH_DIST_EXPERTS),
+    ),
+    "R05 grouped biases for a hybrid fsdp": (
+        errors.FC_R05,
+        facts(args={**EP2, "hybrid_layer_pattern": "*E*E"}, keys=TORCH_DIST_EXPERTS),
+    ),
+    "R05 grouped biases for a hybrid fsdp whatever the expert naming": (
+        errors.FC_R05,
+        facts(
+            args={**EP2, "hybrid_layer_pattern": "*E*E"},
+            keys=TORCH_DIST_EXPERTS,
+            expert_naming="sequential",
+        ),
+    ),
+    "R05 grouped biases by expert naming": (
+        errors.FC_R05,
+        facts(args={**GPT_ARGS, **EP2}, keys=TORCH_DIST_EXPERTS, expert_naming="grouped"),
+    ),
+    "R13 legacy grouped mlp": (
+        errors.FC_R13,
+        facts(
+            keys={"decoder.layers.1.mlp.experts.weight1": (H, E * F)},
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+        ),
+    ),
+    "R17 content metadata": (
+        errors.FC_R17,
+        facts(content_metadata={"singleton_local_shards": True}),
+    ),
+    "R17 singleton experts": (
+        errors.FC_R17,
+        facts(keys={"decoder.layers.1.mlp.experts.experts.3.linear_fc1.weight": (F, H)}),
+    ),
     "P04 shortcut": (errors.FC_P04, facts(args={"moe_shortcut_connection": True})),
     "P04 hybrid mtp": (errors.FC_P04, facts(args={"hybrid_layer_pattern": "*-*-/*-"})),
     "P04 legacy mtp": (
@@ -231,11 +309,48 @@ def test_every_detector_code_has_a_case():
         errors.FC_R01,
         errors.FC_R02,
         errors.FC_R03,
+        errors.FC_R04,
+        errors.FC_R05,
         errors.FC_R06,
         errors.FC_R07,
         errors.FC_R13,
+        errors.FC_R17,
         errors.FC_R20,
     }
+
+
+def test_mixture_of_experts_models_pass():
+    """Experts, router and expert biases without expert parallelism, or named sequential."""
+    moe = {"num_experts": E, "moe_grouped_gemm": True}
+    router = {f"decoder.layers.{layer}.mlp.router.expert_bias": (E,) for layer in (1, 3)}
+    assert codes(facts(args=moe, keys={**TORCH_DIST_EXPERTS, **router})) == []
+    fsdp = {"source": FSDP_DTENSOR, "target": TORCH_DIST}
+    assert codes(facts(args=moe, keys={**GROUPED_EXPERTS, **GROUPED_BIASES}, **fsdp)) == []
+    assert codes(facts(args={**EP2, "hybrid_layer_pattern": "*E*E"})) == []  # symbol E
+    sequential = {**GPT_ARGS, **EP2}  # sequential experts name their biases by global index
+    assert codes(facts(args=sequential, keys=TORCH_DIST_EXPERTS)) == []
+    grouped = {**sequential, "moe_grouped_gemm": True}
+    assert codes(facts(args=grouped, keys=GROUPED_EXPERTS, **fsdp)) == []  # no biases
+    assert codes(facts(args=grouped, keys=TORCH_DIST_EXPERTS, expert_naming="sequential")) == []
+    content = {"singleton_local_shards": False}
+    assert codes(facts(content_metadata=content, keys=TORCH_DIST_EXPERTS, args=moe)) == []
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+def test_gated_experts_are_fenced_in_every_expert_naming(source):
+    """SwiGLU experts stay pending: gated linear_fc1 of grouped fsdp_dtensor experts too."""
+    if source == FSDP_DTENSOR:
+        fc1 = {k: (2 * F, H) for k in GROUPED_EXPERTS if "linear_fc1" in k}
+        gated, target = {**GROUPED_EXPERTS, **fc1}, TORCH_DIST
+    else:
+        fc1 = {k: (E, 2 * F, H) for k in TORCH_DIST_EXPERTS if k.endswith("linear_fc1.weight")}
+        gated, target = {**TORCH_DIST_EXPERTS, **fc1}, FSDP_DTENSOR
+    direction = {"source": source, "target": target}
+    moe = {"num_experts": E, "moe_grouped_gemm": True}
+    (unsplit,) = detect_refusals(facts(args=moe, keys=gated, **direction))
+    assert unsplit.code == errors.FC_P06 and unsplit.keys == tuple(sorted(fc1))
+    split = codes(facts(args={**moe, "swiglu": True}, keys=GROUPED_EXPERTS, **direction))
+    assert split == [errors.FC_P07]
 
 
 def test_swiglu_halves_are_pending_whatever_the_arguments_say():
@@ -349,29 +464,42 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     found = facts(args=args, keys=keys)
-    assert codes(found) == [errors.FC_P03, errors.FC_P04, errors.FC_P05, errors.FC_P06]
+    assert codes(found) == [errors.FC_P04, errors.FC_P05, errors.FC_P06]
 
 
 def test_refusals_carry_the_evidence():
-    (refusal,) = detect_refusals(facts(args={"num_experts": 8, "hybrid_layer_pattern": "*E*-"}))
+    (refusal,) = detect_refusals(facts(args={"moe_shortcut_connection": True}))
     assert refusal.message == (
-        "not supported yet: mixture-of-experts layers (args.num_experts=8; hybrid layer symbol E)"
+        "not supported yet: shortcut-MoE layer numbering and hybrid multi-token prediction "
+        "(args.moe_shortcut_connection=True)"
     )
+    (refusal,) = detect_refusals(CASES["R05 grouped biases for fsdp"][1])
+    assert refusal.message == (
+        "grouped expert biases with args.expert_model_parallel_size=2: Megatron-FSDP names them "
+        "by their expert-parallel-local index, so the expert-parallel ranks overwrite one "
+        "another's"
+    )
+    assert refusal.keys == (
+        "decoder.layers.1.mlp.experts.experts.linear_fc1.bias",
+        "decoder.layers.3.mlp.experts.experts.linear_fc1.bias",
+    )
+    (refusal,) = detect_refusals(CASES["R04 single grouped weight"][1])
+    assert refusal.message.endswith("(args.moe_single_grouped_weight=True)")
     (refusal,) = detect_refusals(facts(args={"megatron_fsdp_version": 2}))
     assert "args.megatron_fsdp_version=2" in refusal.message
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P03, "experts", hint="later")
+    pending = Refusal(errors.FC_P04, "shortcut", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P03)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P04)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P03: experts hint: later",
+        "FC-P04: shortcut hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

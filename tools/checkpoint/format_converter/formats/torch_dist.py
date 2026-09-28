@@ -39,6 +39,7 @@ from .. import errors
 from ..core.keys import EXTRA_STATE
 from ..core.logical import OutputSlice
 from ..core.names import DIALECTS, TORCH_DIST
+from ..core.refusals import singleton_local_shards_refusal
 from ..engine.metadata import MetadataView
 from ..engine.reader import SourceReader
 from ..engine.regions import Region
@@ -218,14 +219,9 @@ def weights_only_common(
             keys=("modelopt_state",),
             hint="convert the checkpoint before applying ModelOpt",
         ).to_error()
-    content = common.get("content_metadata")
-    if isinstance(content, Mapping) and content.get("singleton_local_shards"):
-        raise Refusal(
-            errors.FC_R17,
-            "the checkpoint was saved with singleton_local_shards, which this tool does not read",
-            keys=("content_metadata",),
-            hint="load it with current Megatron and save it again without that option",
-        ).to_error()
+    singleton = singleton_local_shards_refusal(common.get("content_metadata"))
+    if singleton is not None:
+        raise singleton.to_error()
     known = set(KEPT_COMMON_KEYS) | set(DROPPED_COMMON_KEYS)
     unknown = sorted(set(common) - known - drop_keys)
     if unknown:
