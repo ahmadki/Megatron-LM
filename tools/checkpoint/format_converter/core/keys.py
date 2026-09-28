@@ -35,9 +35,14 @@ module ``<...>.mlp.experts``, whose linear layers ``linear_fc1`` and
 ``linear_fc2`` hold one weight (and bias) per expert. torch_dist stores each
 as one tensor over all experts, ``<...>.mlp.experts.experts.linear_fc<n>.<leaf>``,
 the global expert index along its leading axis (after the layer axis of a
-tensor stacked over layers); :class:`ExpertName` names such a tensor by the
-module path ``<...>.mlp.experts.linear_fc<n>`` (and one expert of it by its
-global index), whatever the format.
+tensor stacked over layers). fsdp_dtensor stores one tensor per expert, named
+as the experts module names its parameters with the local index replaced by
+the global one (``handle_experts_in_state_dict``): *grouped*
+(``TEGroupedMLP``) ``<...>.mlp.experts.linear_fc<n>.<leaf><e>``, or
+*sequential* (``SequentialMLP``) ``<...>.mlp.experts.local_experts.<e>.linear_fc<n>.<leaf>``.
+:class:`ExpertName` names such a tensor by the module path
+``<...>.mlp.experts.linear_fc<n>`` (and one expert of it by its global index),
+whatever the format.
 """
 
 from __future__ import annotations
@@ -45,6 +50,9 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+
+from ..errors import InternalError
+from .names import GROUPED, SEQUENTIAL, TORCH_DIST
 
 LAYERS = "layers"
 """Name of the layer list of a block (``nn.ModuleList`` attribute)."""
@@ -57,10 +65,16 @@ _NAME_START = re.compile(r"[A-Za-z_]")
 
 _EXPERTS_MODULE = r"(?P<experts>(?:.+\.)?mlp\.experts)"
 _EXPERT_LINEAR = r"(?P<linear>linear_fc[0-9])"
+_EXPERT_LEAF = r"(?P<leaf>weight|bias)"
+_EXPERT_INDEX = r"(?P<expert>0|[1-9][0-9]*)"
 _EXPERT_PATH = re.compile(rf"{_EXPERTS_MODULE}\.{_EXPERT_LINEAR}")
-_TORCH_DIST_EXPERT = re.compile(
-    rf"{_EXPERTS_MODULE}\.experts\.{_EXPERT_LINEAR}\.(?P<leaf>weight|bias)"
-)
+_TORCH_DIST_EXPERT = re.compile(rf"{_EXPERTS_MODULE}\.experts\.{_EXPERT_LINEAR}\.{_EXPERT_LEAF}")
+_FSDP_EXPERT = {
+    GROUPED: re.compile(rf"{_EXPERTS_MODULE}\.{_EXPERT_LINEAR}\.{_EXPERT_LEAF}{_EXPERT_INDEX}"),
+    SEQUENTIAL: re.compile(
+        rf"{_EXPERTS_MODULE}\.local_experts\.{_EXPERT_INDEX}\.{_EXPERT_LINEAR}\.{_EXPERT_LEAF}"
+    ),
+}
 
 
 class KeyGrammarError(ValueError):
@@ -176,11 +190,28 @@ class ExpertName:
         leaf: ``weight`` or ``bias``.
         expert: The global expert index, or ``None`` for a tensor that holds
             every expert along its expert axis (torch_dist).
+        form: How fsdp_dtensor named the tensor (``grouped`` or ``sequential``;
+            ``None`` for torch_dist).
     """
 
     path: str
     leaf: str
     expert: int | None = None
+    form: str | None = None
+
+
+def split_expert_name(name: str, fmt: str) -> ExpertName | None:
+    """Parse ``name`` as a store of format ``fmt`` names a routed-expert tensor.
+
+    Returns:
+        The tensor, or ``None`` when ``name`` is not under an experts module
+        ``<...>.mlp.experts.``.
+
+    Raises:
+        KeyGrammarError: ``name`` is under an experts module but not in a form
+            of ``fmt``.
+    """
+    return split_torch_dist_expert(name) if fmt == TORCH_DIST else split_fsdp_expert(name)
 
 
 def split_torch_dist_expert(name: str) -> ExpertName | None:
@@ -215,6 +246,50 @@ def join_torch_dist_expert(path: str, leaf: str) -> str:
     """
     experts, linear = _split_expert_path(path)
     return f"{experts}.experts.{linear}.{leaf}"
+
+
+def split_fsdp_expert(name: str) -> ExpertName | None:
+    """Parse ``name`` as fsdp_dtensor names one routed expert's tensor (grouped or sequential).
+
+    Args:
+        name: A name inside a layer, or a whole model-relative key.
+
+    Returns:
+        The tensor, from ``<...>.mlp.experts.linear_fc<n>.<weight|bias><e>``
+        (grouped) or ``<...>.mlp.experts.local_experts.<e>.linear_fc<n>.<weight|bias>``
+        (sequential), ``e`` a canonical decimal index; ``None`` when ``name``
+        is not under an experts module ``<...>.mlp.experts.``.
+
+    Raises:
+        KeyGrammarError: ``name`` is under an experts module but in neither form.
+    """
+    if ROUTED_EXPERTS.search(name) is None:
+        return None
+    for form, pattern in _FSDP_EXPERT.items():
+        match = pattern.fullmatch(name)
+        if match is not None:
+            path = f"{match.group('experts')}.{match.group('linear')}"
+            return ExpertName(path, match.group("leaf"), int(match.group("expert")), form)
+    raise KeyGrammarError(
+        f"{name}: fsdp_dtensor names routed-expert tensors <...>.mlp.experts.linear_fc<n>."
+        "<weight|bias><e> (grouped) or <...>.mlp.experts.local_experts.<e>.linear_fc<n>."
+        "<weight|bias> (sequential)"
+    )
+
+
+def join_fsdp_expert(path: str, leaf: str, expert: int, form: str) -> str:
+    """The fsdp_dtensor name of expert ``expert`` of the tensor ``path``/``leaf`` in ``form``.
+
+    Raises:
+        KeyGrammarError: ``path`` is not ``<...>.mlp.experts.linear_fc<n>``.
+        InternalError: ``form`` is neither ``grouped`` nor ``sequential``.
+    """
+    experts, linear = _split_expert_path(path)
+    if form == GROUPED:
+        return f"{experts}.{linear}.{leaf}{expert}"
+    if form == SEQUENTIAL:
+        return f"{experts}.local_experts.{expert}.{linear}.{leaf}"
+    raise InternalError(f"unknown expert naming {form!r}")
 
 
 def _split_expert_path(path: str) -> tuple[str, str]:

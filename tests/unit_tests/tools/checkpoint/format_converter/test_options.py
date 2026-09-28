@@ -9,7 +9,7 @@ import re
 import pytest
 
 from tools.checkpoint.format_converter import cli, options
-from tools.checkpoint.format_converter.core.names import TORCH_DIST_LAYOUTS
+from tools.checkpoint.format_converter.core.names import EXPERT_NAMINGS, TORCH_DIST_LAYOUTS
 from tools.checkpoint.format_converter.engine.staging import RESUME_MODES
 from tools.checkpoint.format_converter.errors import UsageError
 from tools.checkpoint.format_converter.formats.detect import FORMATS
@@ -105,6 +105,7 @@ def test_output_fields_cover_what_shapes_the_output():
         "ignore_manifest": False,
         "block_layouts": {},
         "torch_dist_layout": "native",
+        "expert_naming": "auto",
         "copy_sidecars": True,
     }
 
@@ -121,6 +122,13 @@ def test_torch_dist_layout_is_validated():
     with pytest.raises(UsageError, match="asks for decoder stacked"):
         options.PlanOptions(torch_dist_layout="per-layer", block_layouts=(("decoder", "stacked"),))
     options.PlanOptions(torch_dist_layout="per-layer", block_layouts=(("encoder", "per_layer"),))
+
+
+def test_expert_naming_is_validated():
+    assert cli.EXPERT_NAMINGS == EXPERT_NAMINGS
+    assert options.PlanOptions(expert_naming="sequential").expert_naming == "sequential"
+    with pytest.raises(UsageError, match="must be one of auto, grouped, sequential"):
+        options.PlanOptions(expert_naming="local")
 
 
 def test_block_layouts_are_normalized_and_validated():

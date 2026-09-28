@@ -301,6 +301,17 @@ def test_refusals_and_budgets_exit_with_their_codes(tmp_path, capsys):
         "convert",
         match="keeps model weights only",
     )
+    _expect(
+        capsys,
+        2,
+        "plan",
+        good,
+        "--to",
+        "torch_dist",
+        "--expert-naming",
+        "sequential",
+        match="a torch_dist rewrite keeps the source's keys",
+    )
     (tmp_path / "dst" / ITER).mkdir(parents=True)
     _expect(
         capsys, 6, "convert", good, tmp_path / "dst", "--to", "torch_dist", match="already exists"

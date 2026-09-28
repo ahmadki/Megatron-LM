@@ -34,6 +34,7 @@ MAP_CHOICES = ("identity", "convert")
 EXPECTED_DIFF_CHOICES = ("A", "B", "C", "D", "E")
 RESUME_CHOICES = ("auto", "never")
 TORCH_DIST_LAYOUTS = ("native", "per-layer")
+EXPERT_NAMINGS = ("auto", "grouped", "sequential")
 MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
@@ -367,6 +368,14 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "build PREFIX that way",
     )
     parser.add_argument(
+        "--expert-naming",
+        choices=EXPERT_NAMINGS,
+        default="auto",
+        help="how fsdp_dtensor names routed experts: auto as the model's builder does (default; "
+        "grouped for TEGroupedMLP, sequential for SequentialMLP), or as given (a hybrid model's "
+        "target is always grouped); an fsdp_dtensor source must name them so",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         metavar="N",
@@ -413,6 +422,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "ignore_manifest": args.ignore_manifest,
         "block_layouts": tuple(args.block_layout),
         "torch_dist_layout": args.torch_dist_layout,
+        "expert_naming": args.expert_naming,
     }
     for name in (
         "workers",

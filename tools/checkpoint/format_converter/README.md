@@ -259,6 +259,31 @@ are global). Keys under other top-level modules are refused (`FC-R13`) unless
   than the one decided, the conversion is refused (`FC-A06`) unless a flag
   asks for the block's layout or `--ignore-manifest` is given, so a round trip
   restores the source's layout or fails.
+* **Routed experts.** `torch_dist` stores each linear layer of a
+  mixture-of-experts layer's routed experts as one tensor over all experts,
+  `<...>.mlp.experts.experts.linear_fc<n>.<weight|bias>` of shape `[E, ...]`
+  (`[L, E, ...]` in a stacked block), expert `e` at the global index `e` of
+  its expert axis and saved as a chunk of its own; `TEGroupedMLP` and
+  `SequentialMLP` write the same keys. `fsdp_dtensor` stores one tensor per
+  expert under its global index, named as the experts module names its
+  parameters: *grouped* (`TEGroupedMLP`), `<...>.mlp.experts.linear_fc<n>.<leaf><e>`,
+  or *sequential* (`SequentialMLP`),
+  `<...>.mlp.experts.local_experts.<e>.linear_fc<n>.<leaf>`. Converting to
+  `fsdp_dtensor`, each expert (of each layer) is read straight from its
+  stored chunk, and the naming is the one of the experts module the loading
+  job builds: grouped for a hybrid model (its stack spec always builds
+  `TEGroupedMLP`), else grouped iff `args.moe_grouped_gemm`. For a GPT model,
+  `--expert-naming grouped|sequential` chooses it instead, and then sets
+  `moe_grouped_gemm` in the store's arguments to match (the GPT builders read
+  it); a hybrid model's experts cannot be named otherwise (exit 2), since no
+  argument changes the module its stack spec builds. Converting to
+  `torch_dist`, each expert is written as its own chunk of the expert tensor,
+  which is never materialized whole; an `fsdp_dtensor` source must name its
+  experts as its arguments (or `--expert-naming`) build them (`FC-A04`
+  otherwise). The number of experts is `args.num_experts`: every expert axis
+  has that length, and every `fsdp_dtensor` expert tensor is stored for
+  exactly the experts `0..E-1` (`FC-R12` for indices that are not contiguous
+  from 0, `FC-R13` for another number).
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
@@ -449,6 +474,7 @@ arguments and the model keys before any tensor is read.
 | `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
 | `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
 | `FC-A02` | converting to `torch_dist`, a layer list of an unknown kind (not the language model's decoder or `vision_model.decoder`), whose layout depends on its module: pass `--block-layout PREFIX=stacked` or `=per_layer` |
+| `FC-A04` | an `fsdp_dtensor` source names its routed experts otherwise (grouped or sequential) than the experts module its arguments build (`args.moe_grouped_gemm`; hybrid models always build grouped experts): pass `--expert-naming` with the store's naming if the store is right |
 | `FC-A05` | `--from` disagrees with the detected format |
 | `FC-A06` | the source's `conversion_manifest.json` describes another store (its `.metadata` digest differs), or records another `torch_dist` layout of a block than the one decided (the hint names the flag that restores it); `--ignore-manifest` converts without restoring what it records |
 | `FC-E01` | the common state references Megatron (or other non-plain) classes and Megatron cannot be imported, or it was decoded for display only; run inside the Megatron container |

@@ -44,7 +44,7 @@ from . import __version__, errors
 from .core.args_view import ArgsView
 from .core.context import ArchContext, build_arch_context
 from .core.manifest import MANIFEST_FILE, Manifest
-from .core.names import FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
+from .core.names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
 from .core.planner import plan_model
 from .core.refusals import Facts, detect_refusals
 from .core.registry import REGISTRY
@@ -278,14 +278,17 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
 
     Raises:
         UsageError: The conversion is not supported (fsdp_dtensor to
-            fsdp_dtensor, or ``--optimizer convert`` in a rewrite), or
-            ``--block-layout`` or ``--torch-dist-layout per-layer`` is given
-            without an fsdp_dtensor source and a torch_dist target.
+            fsdp_dtensor, or ``--optimizer convert`` or ``--expert-naming`` in
+            a rewrite), or ``--block-layout`` or ``--torch-dist-layout
+            per-layer`` is given without an fsdp_dtensor source and a
+            torch_dist target.
         RefusedError: A refusal (FC-R, FC-P; FC-E01 unless ``dry_run``),
             including layer lists the layouts cannot explain (FC-R11, FC-R12).
         AmbiguousError: The source holds another store's manifest, or one
-            that records another layout of a block (FC-A06), or a block's
-            torch_dist layout cannot be decided (FC-A02).
+            that records another layout of a block (FC-A06), a block's
+            torch_dist layout cannot be decided (FC-A02), or an fsdp_dtensor
+            source names its experts otherwise than its arguments build them
+            (FC-A04).
         IntegrityError: The store is unreadable or has no common state.
         BudgetExceeded: A unit or the whole conversion exceeds its memory budget.
     """
@@ -297,6 +300,12 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
         if opts.optimizer != "drop":
             raise UsageError(
                 "a torch_dist rewrite keeps model weights only", hint="drop --optimizer convert"
+            )
+        if opts.expert_naming != AUTO_EXPERT_NAMING:
+            raise UsageError(
+                "--expert-naming chooses fsdp_dtensor expert names; a torch_dist rewrite keeps "
+                "the source's keys",
+                hint="drop --expert-naming",
             )
         return _plan_rewrite(store, detection, opts, dry_run=dry_run)
     if detection.fmt == opts.to_format:
@@ -400,6 +409,7 @@ def _plan_cross_format(
         block_layouts=dict(opts.block_layouts),
         drop_content_metadata=CONTENT_METADATA in opts.drop_common_keys,
         per_layer=opts.torch_dist_layout == PER_LAYER_LAYOUT,
+        expert_naming=opts.expert_naming,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:
@@ -551,7 +561,8 @@ def _content_metadata_record(common: Mapping[str, Any]) -> dict[str, Any]:
 def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], SanitizedArgs]:
     """The args sanitation of the target format (restoring the source manifest's originals)."""
     if ctx.target[0] == FSDP_DTENSOR:
-        return sanitize_for_fsdp_dtensor
+        grouped_gemm = None if ctx.experts is None else ctx.experts.grouped_gemm
+        return lambda args: sanitize_for_fsdp_dtensor(args, grouped_gemm=grouped_gemm)
     restore = {} if ctx.manifest is None else ctx.manifest.original_args()
     return lambda args: sanitize_for_torch_dist(args, restore)
 

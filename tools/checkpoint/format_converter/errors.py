@@ -55,7 +55,8 @@ FC_R11 = "FC-R11"
 """The layer indices a store holds contradict the hybrid layer pattern."""
 
 FC_R12 = "FC-R12"
-"""A block's layers are stacked inconsistently, or its layer indices are not contiguous."""
+"""A block's layers are stacked inconsistently, or its layer (or an fsdp_dtensor store's expert)
+indices are not contiguous."""
 
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""
@@ -107,6 +108,9 @@ FC_P12 = "FC-P12"
 
 FC_A02 = "FC-A02"
 """How torch_dist stores a block of an unknown kind cannot be decided (``--block-layout``)."""
+
+FC_A04 = "FC-A04"
+"""An fsdp_dtensor source names its routed experts otherwise than its arguments build them."""
 
 FC_A05 = "FC-A05"
 """``--from`` names a different format than the one detected from the store."""

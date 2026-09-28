@@ -302,6 +302,7 @@ condition of every code.
 | `FC-R19` | an `fsdp_dtensor` store with split fused-projection keys |
 | `FC-R20` | hybrid layer symbols or attention variants no rule is verified for |
 | `FC-A02` | a layer list of unknown kind converted to `torch_dist` (`--block-layout`) |
+| `FC-A04` | an `fsdp_dtensor` source names its routed experts otherwise than its arguments build them (`--expert-naming`) |
 | `FC-A05` | `--from` disagrees with the detected format |
 | `FC-A06` | the source's manifest describes another store, or records another block layout |
 | `FC-E01` | `convert` without Megatron (run in the training container) |

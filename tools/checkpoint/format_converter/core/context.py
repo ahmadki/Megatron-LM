@@ -30,9 +30,11 @@ from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
+from .experts import ExpertLayout, expert_layout
 from .keys import root_of
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
+    AUTO_EXPERT_NAMING,
     DIALECTS,
     FSDP_DTENSOR,
     FSDP_MODEL_PREFIX,
@@ -100,6 +102,8 @@ class ArchContext:
             (``fsdp_to_td``; ``None`` when it gets none or the target is fsdp_dtensor).
         blocks: The model's layered blocks and how each format numbers and
             stacks their layers.
+        experts: How each format stores the model's routed experts (``None``
+            without mixture-of-experts layers).
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -125,6 +129,7 @@ class ArchContext:
     vpp: int | None
     td_content_metadata: Mapping[str, Any] | None
     blocks: tuple[BlockLayout, ...]
+    experts: ExpertLayout | None
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     dtype_policy: DtypePolicy
@@ -150,6 +155,7 @@ def build_arch_context(
     block_layouts: Mapping[str, str] | None = None,
     drop_content_metadata: bool = False,
     per_layer: bool = False,
+    expert_naming: str = AUTO_EXPERT_NAMING,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -170,17 +176,23 @@ def build_arch_context(
         per_layer: A torch_dist target stores every TransformerBlock per layer
             and marks it in its ``content_metadata`` (``--torch-dist-layout
             per-layer``).
+        expert_naming: How fsdp_dtensor names routed experts
+            (``--expert-naming``; ``auto``: as the model's builder does).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
             or ``block_layouts`` names a block that is not a TransformerBlock.
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
-            and ``fp16``; FC-R11 for layer indices the blocks do not explain;
-            FC-R12 for inconsistently stacked layers or layers that cannot be
-            stacked as asked).
+            and ``fp16``, or routed experts that disagree with
+            ``args.num_experts``; FC-R11 for layer indices the blocks do not
+            explain; FC-R12 for inconsistently stacked layers, layers that
+            cannot be stacked as asked, or expert indices other than
+            ``0..E-1``).
         AmbiguousError: The source holds a manifest of another store, or one
             that records another torch_dist layout of a block (FC-A06); a
-            block's torch_dist layout cannot be decided (FC-A02).
+            block's torch_dist layout cannot be decided (FC-A02); an
+            fsdp_dtensor source names its experts otherwise than its
+            arguments build them (FC-A04).
         IntegrityError: The manifest's ``content_metadata`` is not a mapping.
     """
     direction = DIRECTIONS.get((source, target))
@@ -213,6 +225,8 @@ def build_arch_context(
     if direction == FSDP_TO_TD:
         _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
     warnings = requested_layout_warnings(facts, blocks)
+    experts, evidence = expert_layout(args, model, source, expert_naming)
+    log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
@@ -232,6 +246,7 @@ def build_arch_context(
         vpp=vpp,
         td_content_metadata=content_metadata,
         blocks=blocks,
+        experts=experts,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         dtype_policy=DtypePolicy.PRESERVE,

@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Names of the supported checkpoint formats, their dialects, the fsdp_dtensor key envelope
-and the torch_dist block layouts.
+"""Names of the supported checkpoint formats, their dialects, the fsdp_dtensor key envelope,
+the torch_dist block layouts and the fsdp_dtensor names of routed experts.
 
 This module imports nothing, so the command line can validate format flags
 without importing torch.
@@ -38,3 +38,18 @@ PER_LAYER_LAYOUT = "per-layer"
 
 TORCH_DIST_LAYOUTS = (NATIVE_LAYOUT, PER_LAYER_LAYOUT)
 """Values of ``--torch-dist-layout``."""
+
+GROUPED = "grouped"
+"""fsdp_dtensor expert naming of ``TEGroupedMLP``: ``<...>.mlp.experts.linear_fc<n>.weight<e>``."""
+
+SEQUENTIAL = "sequential"
+"""fsdp_dtensor expert naming of ``SequentialMLP``: ``<...>.mlp.experts.local_experts.<e>.*``."""
+
+EXPERT_FORMS = (GROUPED, SEQUENTIAL)
+"""How fsdp_dtensor names the tensors of routed experts (as the model's experts module does)."""
+
+AUTO_EXPERT_NAMING = "auto"
+"""``--expert-naming``: the naming the model's builder gives its experts (the default)."""
+
+EXPERT_NAMINGS = (AUTO_EXPERT_NAMING, *EXPERT_FORMS)
+"""Values of ``--expert-naming``."""

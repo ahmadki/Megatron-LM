@@ -12,7 +12,9 @@ arguments must therefore describe the store:
 * fsdp_dtensor: ``ckpt_format='fsdp_dtensor'`` and ``use_megatron_fsdp``; one
   pipeline stage (Megatron-FSDP stores have no pipeline stages: the pipeline
   and virtual-pipeline fields are reset and ``|`` stage separators are
-  removed from the hybrid layer pattern);
+  removed from the hybrid layer pattern); ``moe_grouped_gemm`` set to build
+  the experts module whose names the store uses (a GPT model's builder
+  reads it);
 * torch_dist: ``ckpt_format='torch_dist'``, no ``use_megatron_fsdp``; values
   a previous conversion recorded in its manifest are restored, except that
   ``no_save_optim`` and ``no_save_rng`` are never cleared for a store without
@@ -32,6 +34,7 @@ from typing import Any
 
 from ..core.args_view import ArgsView
 from ..core.format_args import (
+    EXPERT_FORM_FIELD,
     FSDP_DTENSOR_FIELDS,
     PATTERN_FIELDS,
     SINGLE_STAGE_FIELDS,
@@ -66,8 +69,15 @@ def sanitize_weights_only(args: argparse.Namespace) -> SanitizedArgs:
     return _apply(args, WEIGHTS_ONLY_FIELDS)
 
 
-def sanitize_for_fsdp_dtensor(args: argparse.Namespace) -> SanitizedArgs:
+def sanitize_for_fsdp_dtensor(
+    args: argparse.Namespace, *, grouped_gemm: bool | None = None
+) -> SanitizedArgs:
     """Arguments of a weights-only fsdp_dtensor store written from a torch_dist checkpoint.
+
+    Args:
+        args: The torch_dist checkpoint's arguments.
+        grouped_gemm: The ``moe_grouped_gemm`` under which Megatron builds the
+            experts module whose names the store uses (``None``: left as is).
 
     Raises:
         IntegrityError: ``args`` is not a Namespace.
@@ -79,8 +89,10 @@ def sanitize_for_fsdp_dtensor(args: argparse.Namespace) -> SanitizedArgs:
         for name in PATTERN_FIELDS
         if isinstance(view.get(name, None), str)
     }
+    experts = {} if grouped_gemm is None else {EXPERT_FORM_FIELD: grouped_gemm}
     return _apply(
-        args, {**WEIGHTS_ONLY_FIELDS, **FSDP_DTENSOR_FIELDS, **SINGLE_STAGE_FIELDS, **unpiped}
+        args,
+        {**WEIGHTS_ONLY_FIELDS, **FSDP_DTENSOR_FIELDS, **SINGLE_STAGE_FIELDS, **unpiped, **experts},
     )
 
 

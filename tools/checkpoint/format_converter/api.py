@@ -244,6 +244,7 @@ _REPLAYED_OPTIONS = {
     "ignore_manifest": bool,
     "block_layouts": _pairs,
     "torch_dist_layout": str,
+    "expert_naming": str,
 }
 """Options a conversion manifest records that shape the replayed plan, and their parsers."""
 

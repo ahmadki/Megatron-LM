@@ -14,7 +14,8 @@ one expert's shape. Keys outside every block keep their path.
 :func:`compose` is the inverse for the target format: it places each layer of
 a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the stacked
 tensor ``<block>.layers.<name>``, and each expert at its index of the expert
-axis.
+axis (fsdp_dtensor names each expert's tensor in the model's expert
+naming instead).
 """
 
 from __future__ import annotations
@@ -31,10 +32,11 @@ from .keys import (
     KeyGrammarError,
     LayerKey,
     attribute_layer_key,
+    join_fsdp_expert,
     join_layer_key,
     join_torch_dist_expert,
+    split_expert_name,
     split_leaf,
-    split_torch_dist_expert,
 )
 from .logical import LogicalId, LogicalSlice, OutputSlice
 from .names import TORCH_DIST
@@ -73,7 +75,7 @@ def decompose(
     layer_key = attribute_layer_key(relative, by_prefix)
     block = None if layer_key is None else by_prefix[layer_key.block]
     name = relative if layer_key is None else layer_key.inner
-    expert = _expert_name(name, fmt)
+    expert = split_expert_name(name, fmt)
     path, leaf = (expert.path, expert.leaf) if expert is not None else split_leaf(name)
     layers = _layer_axis(relative, entry, block, layer_key, fmt)
     layer_axes = int(layers[0][1] is not None)
@@ -95,11 +97,6 @@ def decompose(
         for layer, layer_at in layers
         for index, index_at in experts
     ]
-
-
-def _expert_name(name: str, fmt: str) -> ExpertName | None:
-    """The routed-expert tensor ``name`` holds in a store of format ``fmt``, if any."""
-    return split_torch_dist_expert(name) if fmt == TORCH_DIST else None
 
 
 def _layer_axis(
@@ -204,6 +201,6 @@ def _output_name(
         return lid.name, None
     if experts is None or lid.expert >= experts.num_experts:
         raise InternalError(f"{lid} is not an expert of the model's expert layout {experts}")
-    if fmt != TORCH_DIST:
-        raise InternalError(f"{lid}: {fmt} names no routed experts yet")
-    return join_torch_dist_expert(lid.path, lid.leaf), (lid.expert, experts.num_experts)
+    if fmt == TORCH_DIST:
+        return join_torch_dist_expert(lid.path, lid.leaf), (lid.expert, experts.num_experts)
+    return join_fsdp_expert(lid.path, lid.leaf, lid.expert, experts.fsdp_form), None

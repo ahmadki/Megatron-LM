@@ -73,6 +73,17 @@ def test_fsdp_dtensor_arguments_describe_a_single_stage_megatron_fsdp_store():
     assert vars(args) == vars(_training_args())
 
 
+def test_fsdp_dtensor_arguments_build_the_experts_module_the_store_names():
+    """``--expert-naming`` against the arguments: the store's arguments must build its naming."""
+    args = _training_args(moe_grouped_gemm=True)
+    assert "moe_grouped_gemm" not in sanitize_for_fsdp_dtensor(args, grouped_gemm=True).changes
+    result = sanitize_for_fsdp_dtensor(args, grouped_gemm=False)
+    assert result.changes["moe_grouped_gemm"] == (True, False)
+    assert "moe_grouped_gemm" not in sanitize_for_fsdp_dtensor(args).changes  # not constrained
+    unset = sanitize_for_fsdp_dtensor(_training_args(), grouped_gemm=True)
+    assert "moe_grouped_gemm" not in vars(unset.args)  # only existing fields change
+
+
 def test_torch_dist_arguments_restore_a_manifest_but_never_clear_no_save_flags():
     fsdp = sanitize_for_fsdp_dtensor(_training_args())
     restore = {field: old for field, (old, _) in fsdp.changes.items()}

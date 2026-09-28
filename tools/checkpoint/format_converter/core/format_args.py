@@ -38,7 +38,17 @@ SINGLE_STAGE_FIELDS: Mapping[str, Any] = {
 PATTERN_FIELDS = ("hybrid_layer_pattern", "hybrid_override_pattern")
 """Hybrid layer patterns, whose ``|`` separators mark pipeline stages."""
 
+EXPERT_FORM_FIELD = "moe_grouped_gemm"
+"""Whether Megatron's GPT builders build ``TEGroupedMLP`` experts (else ``SequentialMLP``),
+which fsdp_dtensor stores name differently."""
+
 SANITIZED_FIELDS = frozenset(
-    {*WEIGHTS_ONLY_FIELDS, *FSDP_DTENSOR_FIELDS, *SINGLE_STAGE_FIELDS, *PATTERN_FIELDS}
+    {
+        *WEIGHTS_ONLY_FIELDS,
+        *FSDP_DTENSOR_FIELDS,
+        *SINGLE_STAGE_FIELDS,
+        *PATTERN_FIELDS,
+        EXPERT_FORM_FIELD,
+    }
 )
 """Every argument field a weights-only conversion may change."""

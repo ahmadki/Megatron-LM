@@ -164,7 +164,7 @@ def _compile(
     entries = {entry.key: entry for entry in source.values()}
     pieces: list[Piece] = []
     for output in outputs:
-        relative = compose(output.lid, output.shape, ctx.blocks, target.fmt)
+        relative = compose(output.lid, output.shape, ctx.blocks, target.fmt, ctx.experts)
         placed = dataclasses.replace(relative, key=target.stored_key(relative.key))
         planner_path = target.planner_path(placed.key)
         for chunk in target.output_grid(placed, output.dtype, max_chunk_bytes=max_chunk_bytes):

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .core.names import (
+    AUTO_EXPERT_NAMING,
+    EXPERT_NAMINGS,
     FORMATS,
     NATIVE_LAYOUT,
     PER_LAYER_LAYOUT,
@@ -256,6 +258,8 @@ class PlanOptions:
         torch_dist_layout: ``native`` (each block as Megatron would store it)
             or ``per-layer`` (every TransformerBlock per layer, marked in
             ``content_metadata``) for a torch_dist target of an fsdp_dtensor source.
+        expert_naming: How fsdp_dtensor names routed experts: ``auto`` (as the
+            model's builder does), ``grouped`` or ``sequential`` (cross-format only).
     """
 
     to_format: str = TORCH_DIST
@@ -274,10 +278,13 @@ class PlanOptions:
     ignore_manifest: bool = False
     block_layouts: tuple[tuple[str, str], ...] = ()
     torch_dist_layout: str = NATIVE_LAYOUT
+    expert_naming: str = AUTO_EXPERT_NAMING
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
             raise UsageError(f"--to must be one of {', '.join(FORMATS)}, got {self.to_format!r}")
+        if self.expert_naming not in EXPERT_NAMINGS:
+            raise UsageError(f"--expert-naming must be one of {', '.join(EXPERT_NAMINGS)}")
         object.__setattr__(self, "block_layouts", _block_layouts(self.block_layouts))
         self._check_torch_dist_layout()
         if self.optimizer not in OPTIMIZER_CHOICES:
@@ -323,6 +330,7 @@ class PlanOptions:
             "ignore_manifest": self.ignore_manifest,
             "block_layouts": dict(self.block_layouts),
             "torch_dist_layout": self.torch_dist_layout,
+            "expert_naming": self.expert_naming,
         }
 
     def _check_torch_dist_layout(self) -> None:

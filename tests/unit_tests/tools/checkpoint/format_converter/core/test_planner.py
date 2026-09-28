@@ -176,6 +176,89 @@ def test_layers_of_an_fsdp_store_are_stacked_one_chunk_per_layer():
     assert all(p.planner_path is None for p in plan.pieces)
 
 
+EXPERTS_FC1 = "decoder.layers.mlp.experts.experts.linear_fc1.weight"
+
+
+@pytest.mark.parametrize(
+    ("naming", "name"),
+    [("grouped", "linear_fc1.weight{e}"), ("sequential", "local_experts.{e}.linear_fc1.weight")],
+)
+def test_stacked_experts_are_written_one_tensor_per_layer_and_expert(naming, name):
+    """torch_dist's ``[L, E, 4, 4]`` saved one chunk per (layer, expert), split in two columns."""
+    grid = [
+        Region((layer, expert, 0, col), (1, 1, 4, 2))
+        for layer in (0, 1)
+        for expert in (0, 1, 2)
+        for col in (0, 2)
+    ]
+    model = {EXPERTS_FC1: entry(EXPERTS_FC1, (2, 3, 4, 4), grid)}
+    args = ArgsView(argparse.Namespace(num_layers=2, num_experts=3))
+    ctx = build_arch_context(
+        source=TORCH_DIST, target=FSDP_DTENSOR, args=args, model=model, expert_naming=naming
+    )
+    plan = plan_model(ctx, model, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=64)
+    assert plan.claims == {"identity": 6} and plan.outputs == 6
+    chunks = iter(model[EXPERTS_FC1].chunks)
+    expected = []
+    for layer in (0, 1):
+        for expert in (0, 1, 2):
+            left, right = next(chunks), next(chunks)
+            expected.append(
+                (
+                    f"model.module.decoder.layers.{layer}.mlp.experts.{name.format(e=expert)}",
+                    (4, 4),
+                    Region((0, 0), (4, 4)),
+                    (
+                        CopyOp(
+                            left,
+                            Region((layer, expert, 0, 0), (1, 1, 4, 2)),
+                            Region((0, 0), (4, 2)),
+                        ),
+                        CopyOp(
+                            right,
+                            Region((layer, expert, 0, 2), (1, 1, 4, 2)),
+                            Region((0, 2), (4, 2)),
+                        ),
+                    ),
+                )
+            )
+    assert sorted((p.key, p.global_shape, p.chunk, p.ops) for p in plan.pieces) == sorted(expected)
+
+
+@pytest.mark.parametrize(
+    ("naming", "name"),
+    [("grouped", "linear_fc1.weight{e}"), ("sequential", "local_experts.{e}.linear_fc1.weight")],
+)
+def test_experts_of_an_fsdp_store_are_stacked_one_chunk_per_layer_and_expert(naming, name):
+    model = {}
+    for layer in (0, 1):
+        for expert in (0, 1, 2):
+            key = f"model.module.decoder.layers.{layer}.mlp.experts.{name.format(e=expert)}"
+            model[key.removeprefix("model.module.")] = entry(key, (4, 4), dim0_regions((4, 4), 2))
+    args = ArgsView(
+        argparse.Namespace(num_layers=2, num_experts=3, moe_grouped_gemm=naming == "grouped")
+    )
+    ctx = build_arch_context(source=FSDP_DTENSOR, target=TORCH_DIST, args=args, model=model)
+    assert ctx.experts is not None and ctx.experts.fsdp_form == naming
+    plan = plan_model(ctx, model, TorchDistAdapter(), rules=[IdentityRule()], max_chunk_bytes=8)
+    expected = []
+    for layer in (0, 1):
+        for expert in (0, 1, 2):
+            relative = f"decoder.layers.{layer}.mlp.experts.{name.format(e=expert)}"
+            top, bottom = model[relative].chunks
+            expected.append(
+                (
+                    Region((layer, expert, 0, 0), (1, 1, 4, 4)),
+                    (
+                        CopyOp(top, Region((0, 0), (2, 4)), Region((0, 0, 0, 0), (1, 1, 2, 4))),
+                        CopyOp(bottom, Region((2, 0), (2, 4)), Region((0, 0, 2, 0), (1, 1, 2, 4))),
+                    ),
+                )
+            )
+    assert {(p.key, p.global_shape) for p in plan.pieces} == {(EXPERTS_FC1, (2, 3, 4, 4))}
+    assert [(p.chunk, p.ops) for p in plan.pieces] == expected
+
+
 def test_unclaimed_slices_are_refused_with_the_reasons():
     model = source()
     ctx = context(TORCH_DIST, FSDP_DTENSOR, model)

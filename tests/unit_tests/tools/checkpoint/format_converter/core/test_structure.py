@@ -11,7 +11,12 @@ from tools.checkpoint.format_converter.core.blocks import BlockLayout
 from tools.checkpoint.format_converter.core.experts import ExpertLayout
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
 from tools.checkpoint.format_converter.core.logical import LogicalId, LogicalSlice, OutputSlice
-from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
+from tools.checkpoint.format_converter.core.names import (
+    FSDP_DTENSOR,
+    GROUPED,
+    SEQUENTIAL,
+    TORCH_DIST,
+)
 from tools.checkpoint.format_converter.core.structure import compose, decompose
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 from tools.checkpoint.format_converter.engine.regions import Region
@@ -186,7 +191,7 @@ def test_composing_an_unknown_block_is_a_bug():
         compose(LogicalId("encoder", 0, "x", "weight"), (4,), [HYBRID], TORCH_DIST)
 
 
-FOUR_EXPERTS = ExpertLayout(4)
+FOUR_EXPERTS = ExpertLayout(4, GROUPED)
 STACKED_FC1 = "decoder.layers.mlp.experts.experts.linear_fc1.weight"
 
 
@@ -254,14 +259,56 @@ def test_an_expert_is_placed_at_its_index_of_the_expert_axis():
     assert piece.region == placed.region  # decompose is the inverse
 
 
-@pytest.mark.parametrize("experts", [None, ExpertLayout(2)])
+@pytest.mark.parametrize("experts", [None, ExpertLayout(2, GROUPED)])
 def test_placing_an_expert_outside_the_expert_layout_is_a_bug(experts):
     lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 2)
     with pytest.raises(InternalError):
         compose(lid, (6, 5), [STACKED], TORCH_DIST, experts)
 
 
-def test_expert_layouts_have_experts():
-    assert FOUR_EXPERTS.to_json() == {"num_experts": 4}
-    with pytest.raises(InternalError):
-        ExpertLayout(0)
+def test_expert_layouts_have_experts_and_a_naming():
+    assert FOUR_EXPERTS.to_json() == {
+        "num_experts": 4,
+        "fsdp_form": "grouped",
+        "grouped_gemm": None,
+    }
+    for num_experts, form in ((0, GROUPED), (4, "stacked")):
+        with pytest.raises(InternalError):
+            ExpertLayout(num_experts, form)
+
+
+@pytest.mark.parametrize(
+    ("key", "form"),
+    [
+        ("decoder.layers.1.mlp.experts.linear_fc1.weight3", GROUPED),
+        ("decoder.layers.1.mlp.experts.local_experts.3.linear_fc1.weight", SEQUENTIAL),
+    ],
+)
+def test_fsdp_names_each_expert_by_its_global_index(key, form):
+    lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 3)
+    assert decompose_one(key, [STACKED], FSDP_DTENSOR) == lid
+    assert compose(lid, (4,), [STACKED], FSDP_DTENSOR, ExpertLayout(4, form)) == OutputSlice(
+        key, (4,), Region.full((4,))
+    )
+    # one expert of the stacked torch_dist tensor
+    placed = compose(lid, (4,), [STACKED], TORCH_DIST, ExpertLayout(4, form))
+    assert (placed.key, placed.global_shape, placed.region) == (
+        "decoder.layers.mlp.experts.experts.linear_fc1.weight",
+        (3, 4, 4),
+        Region((1, 3, 0), (1, 1, 4)),
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "decoder.layers.1.mlp.experts.linear_fc1.weight",  # a single grouped weight
+        "decoder.layers.1.mlp.experts.linear_fc1.weight03",
+        "decoder.layers.1.mlp.experts.weight1",  # legacy GroupedMLP
+        "decoder.layers.1.mlp.experts.experts.linear_fc1.weight",  # torch_dist
+        "decoder.layers.1.mlp.experts.local_experts.x.linear_fc1.weight",
+    ],
+)
+def test_malformed_fsdp_expert_names_are_grammar_errors(key):
+    with pytest.raises(KeyGrammarError, match="fsdp_dtensor names routed-expert tensors"):
+        decompose(key, entry(key), [STACKED], FSDP_DTENSOR)
