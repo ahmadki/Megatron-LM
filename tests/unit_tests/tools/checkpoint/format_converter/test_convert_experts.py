@@ -322,3 +322,77 @@ def test_hybrid_grouped_expert_biases_have_no_sequential_way_out(tmp_path, caplo
         capsys.readouterr()
         assert run("plan", src, "--to", "fsdp_dtensor", "--expert-naming", naming) == 3
         assert "error: FC-R05: grouped expert biases" in capsys.readouterr().err
+
+
+VOCAB, TOPK, LATENT = 16, 2, 4
+
+
+def router_and_latent_tensors(layers: int = LAYERS) -> dict[str, torch.Tensor]:
+    """What else a mixture-of-experts layer may hold, each in the dtype Megatron keeps it in.
+
+    The router's quantile-balancing bias (fp32) and hash-routing token-to-expert table
+    (int32), the latent projections (bf16) with the latent norm (fp32), and shared experts.
+    """
+    generator = torch.Generator().manual_seed(3)
+    shapes = {
+        "mlp.router.qb_beta": ((EXPERTS,), torch.float32),
+        "mlp.fc1_latent_proj.weight": ((LATENT, 8), torch.bfloat16),
+        "mlp.fc2_latent_proj.weight": ((8, LATENT), torch.bfloat16),
+        "mlp.fc2_norm.weight": ((LATENT,), torch.float32),
+        "mlp.shared_experts.linear_fc1.weight": ((6, 8), torch.bfloat16),
+        "mlp.shared_experts.linear_fc2.weight": ((8, 6), torch.bfloat16),
+        "mlp.shared_experts.gate_weight": ((1, 8), torch.bfloat16),
+    }
+    tensors = {}
+    for layer in range(layers):
+        for name, (shape, dtype) in shapes.items():
+            tensors[f"decoder.layers.{layer}.{name}"] = torch.randn(shape, generator=generator).to(
+                dtype
+            )
+        tid2eid = torch.randint(0, EXPERTS, (VOCAB, TOPK), generator=generator, dtype=torch.int32)
+        tensors[f"decoder.layers.{layer}.mlp.router.tid2eid"] = tid2eid
+    return tensors
+
+
+LATENT_MOE = {**GROUPED, **router_and_latent_tensors()}
+"""The GPT-MoE model with router buffers, latent projections and shared experts."""
+
+
+def test_router_buffers_and_latent_tensors_keep_their_dtypes_to_fsdp_dtensor(tmp_path):
+    source = stack_layers(stack_experts(LATENT_MOE), "decoder")
+    assert source["decoder.layers.mlp.router.tid2eid"].dtype == torch.int32
+    grids = {**layer_grids(source, "decoder"), **expert_grids(source)}  # Megatron's grid
+    src = write_gpt_source(tmp_path / "src", source, grids=grids, args=moe_args())
+    convert_checkpoint(src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0))
+    expect_fsdp_store(tmp_path / "fsdp" / ITER, LATENT_MOE)
+    dtypes = {k: e.dtype for k, e in MetadataView.load(tmp_path / "fsdp" / ITER).tensors.items()}
+    assert dtypes["model.module.decoder.layers.1.mlp.router.tid2eid"] == torch.int32
+    assert dtypes["model.module.decoder.layers.1.mlp.router.qb_beta"] == torch.float32
+    assert dtypes["model.module.decoder.layers.1.mlp.router.expert_bias"] == torch.float32
+    out, _ = fsdp_to_td(tmp_path, tmp_path / "fsdp" / ITER)
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
+
+
+def test_router_buffers_and_latent_tensors_keep_their_dtypes_to_torch_dist(tmp_path):
+    """A Megatron-FSDP save: fp32 main weights, fp32 buffers and an int32 table, all kept."""
+    stored = {
+        key: tensor.float() if tensor.is_floating_point() else tensor
+        for key, tensor in LATENT_MOE.items()
+    }
+    args = moe_args(ckpt_format="fsdp_dtensor", use_megatron_fsdp=True)
+    store = write_fsdp_store(tmp_path / "fsdp" / ITER, stored, args=args)
+    out, _ = fsdp_to_td(tmp_path, store)
+    expected = stack_layers(stack_experts(stored), "decoder")
+    tensors = read_tensors(out)
+    assert set(tensors) == set(expected)
+    for key, tensor in tensors.items():
+        assert bitwise_equal(tensor, expected[key]), key
+    assert tensors["decoder.layers.mlp.router.tid2eid"].dtype == torch.int32
+    assert grid_of(out, "decoder.layers.mlp.router.tid2eid") == [
+        ((layer, 0, 0), (1, VOCAB, TOPK)) for layer in range(LAYERS)
+    ]
+    back = convert_checkpoint(
+        out, tmp_path / "fsdp_again", ConvertOptions(to_format="fsdp_dtensor", workers=0)
+    )
+    assert back.plan["claims"] == {"identity": len(stored)}
+    expect_fsdp_store(tmp_path / "fsdp_again" / ITER, stored)

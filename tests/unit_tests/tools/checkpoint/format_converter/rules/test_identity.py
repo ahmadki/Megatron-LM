@@ -65,6 +65,34 @@ def test_a_layer_of_a_stacked_tensor_is_copied_with_the_layer_shape():
     assert output.copies == (LogicalCopy(lid, Region.full((16, 8)), Region.full((16, 8))),)
 
 
+def test_one_expert_of_an_expert_tensor_is_copied_as_that_experts_tensor():
+    lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 3)
+    expert = LogicalSlice(
+        lid,
+        "decoder.layers.mlp.experts.experts.linear_fc1.weight",
+        Region((1, 3, 0, 0), (1, 1, 6, 8)),
+        torch.bfloat16,
+        2,
+    )
+    (instance,) = IdentityRule().claim(LogicalPool([expert]), _context(TORCH_DIST, FSDP_DTENSOR))
+    (output,) = instance.outputs
+    assert (output.lid, output.shape, output.dtype) == (lid, (6, 8), torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    ("key", "dtype"),
+    [
+        ("decoder.layers.1.mlp.router.expert_bias", torch.float32),
+        ("decoder.layers.1.mlp.router.qb_beta", torch.float32),
+        ("decoder.layers.1.mlp.router.tid2eid", torch.int32),
+    ],
+)
+def test_router_buffers_keep_their_dtype_in_a_bf16_model(key, dtype):
+    buffer = _slice(key, (16, 2), dtype)
+    (instance,) = IdentityRule().claim(LogicalPool([buffer]), _context(FSDP_DTENSOR, TORCH_DIST))
+    assert instance.outputs[0].dtype == dtype
+
+
 def test_sentinel_keys_are_declined_with_their_reason():
     part = _slice("decoder.layers.0.mixer.in_proj.weight.z", (8, 8))
     plain = _slice("output_layer.weight", (16, 8))

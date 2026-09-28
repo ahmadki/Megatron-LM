@@ -288,7 +288,11 @@ are global). Keys under other top-level modules are refused (`FC-R13`) unless
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
   `fsdp_dtensor` store round to the parameters of a `torch_dist` job as the
-  training step would.
+  training step would. Buffers keep their dtype too, whatever the model's:
+  the router's `expert_bias` and `qb_beta` stay fp32 and its hash-routing
+  table `tid2eid` stays int32 (the router's buffers, shared experts and the
+  latent projections `fc1_latent_proj`, `fc2_latent_proj` and `fc2_norm` of a
+  mixture-of-experts layer are stored alike in both formats).
 * **Chunk grids.** `fsdp_dtensor` tensors are written as one chunk split along
   dimension 0 into chunks of at most `--max-output-chunk-bytes` (1 GiB);
   `torch_dist` tensors stacked over layers as one chunk per layer and other
