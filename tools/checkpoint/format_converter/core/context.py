@@ -16,6 +16,7 @@ passed, so it describes a supported model.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -31,8 +32,9 @@ from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
-from .glu import GluLayout, glu_layout, swiglu_split
+from .glu import Fc1, GluLayout, glu_layout, swiglu_split
 from .keys import root_of
+from .logical import LogicalId
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
     AUTO_EXPERT_NAMING,
@@ -63,6 +65,38 @@ PER_LAYER_CONTENT_METADATA: Mapping[str, Any] = {
 Megatron writes (``_build_sharded_state_dict_metadata``) plus ``non_homogeneous_layers``."""
 
 _MODULE_LEVELS = re.compile(r"(?:module\.)+")
+
+
+@dataclass(frozen=True, slots=True)
+class PackKind:
+    """A tensor-parallel size fsdp_dtensor packs fused tensors at.
+
+    Attributes:
+        field: The context field (and derivation) of the size.
+        flag: The flag that gives it for an fsdp_dtensor target.
+        arg: The training argument of the size.
+        experts: Whether it packs the tensors of routed experts (else every other one).
+        rank: What it packs per, for messages.
+    """
+
+    field: str
+    flag: str
+    arg: str
+    experts: bool
+    rank: str
+
+
+TENSOR_PARALLEL = PackKind(
+    "pack_tp", "--fsdp-tp", "tensor_model_parallel_size", False, "tensor-parallel rank"
+)
+EXPERT_TENSOR_PARALLEL = PackKind(
+    "pack_etp", "--fsdp-etp", "expert_tensor_parallel_size", True, "expert tensor-parallel rank"
+)
+
+
+def pack_kind(lid: LogicalId) -> PackKind:
+    """The size a fused tensor of ``lid`` is packed at: the expert size for a routed expert's."""
+    return EXPERT_TENSOR_PARALLEL if lid.expert is not None else TENSOR_PARALLEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +141,10 @@ class ArchContext:
             without mixture-of-experts layers).
         glu: The model's MLP first projections (``linear_fc1``): which are
             gated linear units, and which fsdp_dtensor stores as SwiGLU halves.
+        pack_tp: The tensor-parallel size the fsdp_dtensor side packs fused
+            tensors at (``None``: it packs none).
+        pack_etp: The expert tensor-parallel size it packs the fused tensors
+            of routed experts at (``None``: it packs none).
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -134,6 +172,8 @@ class ArchContext:
     blocks: tuple[BlockLayout, ...]
     experts: ExpertLayout | None
     glu: GluLayout
+    pack_tp: int | None
+    pack_etp: int | None
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     dtype_policy: DtypePolicy
@@ -144,6 +184,10 @@ class ArchContext:
     def derivation_log(self) -> list[dict[str, Any]]:
         """The derivations as JSON records."""
         return [derivation.to_json() for derivation in self.derivations]
+
+    def pack_size(self, lid: LogicalId) -> int | None:
+        """The size fsdp_dtensor packs a fused tensor of ``lid`` at (``None``: it packs none)."""
+        return self.pack_etp if pack_kind(lid).experts else self.pack_tp
 
 
 def build_arch_context(
@@ -160,6 +204,8 @@ def build_arch_context(
     drop_content_metadata: bool = False,
     per_layer: bool = False,
     expert_naming: str = AUTO_EXPERT_NAMING,
+    fsdp_tp: int | None = None,
+    fsdp_etp: int | None = None,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -182,6 +228,10 @@ def build_arch_context(
             per-layer``).
         expert_naming: How fsdp_dtensor names routed experts
             (``--expert-naming``; ``auto``: as the model's builder does).
+        fsdp_tp: The tensor-parallel size an fsdp_dtensor target packs fused
+            tensors at (``--fsdp-tp``; ``None``: the source's, if it is 1).
+        fsdp_etp: The expert tensor-parallel size it packs routed experts'
+            fused tensors at (``--fsdp-etp``; likewise).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
@@ -192,12 +242,15 @@ def build_arch_context(
             explain; FC-R12 for inconsistently stacked layers, layers that
             cannot be stacked as asked, expert indices other than
             ``0..E-1``, or gated linear units that contradict one another or
-            the arguments).
+            the arguments; FC-R10 for packed tensors that do not divide by
+            their pack size, or pack sizes the manifest records otherwise).
         AmbiguousError: The source holds a manifest of another store, or one
             that records another torch_dist layout of a block (FC-A06); a
             block's torch_dist layout cannot be decided (FC-A02); an
             fsdp_dtensor source names its experts otherwise than its
-            arguments build them (FC-A04).
+            arguments build them (FC-A04); an fsdp_dtensor target packs
+            tensors per tensor-parallel rank, the source was saved at a
+            tensor-parallel size above 1 and no pack size is given (FC-A01).
         IntegrityError: The manifest's ``content_metadata`` is not a mapping.
     """
     direction = DIRECTIONS.get((source, target))
@@ -239,6 +292,9 @@ def build_arch_context(
     warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
         experts, model, source
     )
+    packs = _Packs(direction, glu, manifest, log, warnings, args=args, src_tp=tp, fsdp_tp=fsdp_tp)
+    pack_tp = packs.size(TENSOR_PARALLEL, saved=tp, flag=fsdp_tp)
+    pack_etp = packs.size(EXPERT_TENSOR_PARALLEL, saved=etp, flag=fsdp_etp)
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
@@ -260,6 +316,8 @@ def build_arch_context(
         blocks=blocks,
         experts=experts,
         glu=glu,
+        pack_tp=pack_tp,
+        pack_etp=pack_etp,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         dtype_policy=DtypePolicy.PRESERVE,
@@ -406,6 +464,224 @@ def _block_summary(block: BlockLayout) -> dict[str, Any]:
     summary = block.to_json()
     del summary["prefix"], summary["evidence"]
     return summary
+
+
+class _Packs:
+    """Derives the sizes fsdp_dtensor packs fused tensors at (the tensors: ``glu``'s packed
+    first projections), checked against the manifest, the part sizes and the padded vocabulary.
+
+    Args:
+        direction: The conversion's direction.
+        glu: The model's first projections.
+        manifest: The source's conversion manifest, if any.
+        log: The derivations, appended to.
+        warnings: The context's warnings, appended to.
+        args: The checkpoint's training arguments.
+        src_tp: The tensor-parallel size the source was saved with.
+        fsdp_tp: ``--fsdp-tp``, if given.
+    """
+
+    def __init__(
+        self,
+        direction: str,
+        glu: GluLayout,
+        manifest: Manifest | None,
+        log: list[Derivation],
+        warnings: list[str],
+        *,
+        args: ArgsView,
+        src_tp: int,
+        fsdp_tp: int | None,
+    ) -> None:
+        self._direction = direction
+        self._packed = [fc1 for fc1 in glu.fc1s.values() if fc1.packed]
+        self._recorded = {
+            record.get("field"): record.get("value")
+            for record in (() if manifest is None else manifest.derivations)
+        }
+        self._log = log
+        self._warnings = warnings
+        self._args = args
+        self._src_tp = src_tp
+        self._fsdp_tp = fsdp_tp
+
+    def size(self, kind: PackKind, *, saved: int, flag: int | None) -> int | None:
+        """The pack size of ``kind`` (``None`` when nothing is packed at it); logged.
+
+        Args:
+            kind: Which size.
+            saved: The size the source was saved with.
+            flag: The size given for an fsdp_dtensor target (``kind.flag``).
+
+        Raises:
+            AmbiguousError: A torch_dist source saved at a size above 1 is
+                converted with packed tensors and no ``flag``, or with packed
+                routed experts, no ``--fsdp-etp`` and a ``--fsdp-tp`` other
+                than its tensor-parallel size (FC-A01).
+            RefusedError: A packed tensor does not divide by the size, an
+                fsdp_dtensor source's manifest records another size, or the
+                padded vocabulary does not divide by ``--fsdp-tp`` (FC-R10).
+        """
+        packed = [fc1 for fc1 in self._packed if pack_kind(fc1.lid) is kind]
+        if not packed:
+            unused = "" if flag is None else f"; {kind.flag} {flag} has no effect"
+            if flag is not None:
+                self._warnings.append(self._unused_flag_warning(kind, flag))
+            self._log.append(
+                Derivation(kind.field, None, f"no fused tensor to pack per rank{unused}")
+            )
+            return None
+        keys = tuple(sorted({fc1.key for fc1 in packed}))
+        if self._direction == TD_TO_FSDP:
+            size, evidence = self._target_size(kind, saved, flag, len(packed), keys)
+            _check_divisible(
+                packed, size, f"{kind.flag} {size}", f"pass a {kind.flag} that divides them"
+            )
+            if kind is TENSOR_PARALLEL and size != saved:
+                evidence += self._padded_vocab(size, saved)
+        else:
+            size, evidence = saved, f"args.{kind.arg}={saved} of the job that saved the source"
+            self._check_recorded(kind, size, keys)
+            _check_divisible(
+                packed, size, f"the store's args.{kind.arg}={size}", "check the store's arguments"
+            )
+        self._log.append(
+            Derivation(
+                kind.field,
+                size,
+                f"{evidence}; {len(packed)} gated linear_fc1 that fsdp_dtensor keeps fused, "
+                "packed per rank",
+            )
+        )
+        return size
+
+    def _unused_flag_warning(self, kind: PackKind, flag: int) -> str:
+        """What a pack-size flag with nothing to pack at it means for the loading job."""
+        unused = (
+            f"{kind.flag} {flag} has no effect: the fsdp_dtensor store packs no tensor per "
+            f"{kind.rank}"
+        )
+        experts = [fc1 for fc1 in self._packed if pack_kind(fc1.lid).experts]
+        if kind.experts or not experts:
+            return f"{unused}, so it loads at any {kind.arg}"
+        etp = EXPERT_TENSOR_PARALLEL
+        return (
+            f"{unused}, but it packs {len(experts)} gated linear_fc1 of routed experts per "
+            f"{etp.rank}: they load right only at the {etp.arg} the store's arguments record "
+            f"({etp.field}), which the loading job must set with --expert-tensor-parallel-size "
+            "(Megatron does not take it from a checkpoint)"
+        )
+
+    def _target_size(
+        self, kind: PackKind, saved: int, flag: int | None, count: int, keys: tuple[str, ...]
+    ) -> tuple[int, str]:
+        if flag is not None:
+            return flag, f"{kind.flag} {flag}"
+        if kind.experts and self._fsdp_tp is not None and self._fsdp_tp != self._src_tp:
+            raise Refusal(
+                errors.FC_A01,
+                f"fsdp_dtensor packs {count} gated linear_fc1 of routed experts per "
+                f"{kind.rank} of the job that loads it, and {TENSOR_PARALLEL.flag} "
+                f"{self._fsdp_tp} is not the size the source was saved with "
+                f"(args.{TENSOR_PARALLEL.arg}={self._src_tp}): a job at tensor-parallel size "
+                f"{self._fsdp_tp} runs its routed experts at expert tensor-parallel size "
+                f"{self._fsdp_tp} unless it sets --expert-tensor-parallel-size",
+                keys=keys,
+                hint=f"pass {kind.flag} N with the {kind.arg} of that job (the store's arguments "
+                "then record it)",
+            ).to_error()
+        if saved == 1:
+            return 1, f"args.{kind.arg}=1 of the source"
+        raise Refusal(
+            errors.FC_A01,
+            f"fsdp_dtensor packs {count} gated linear_fc1 per rank of the job that loads it, and "
+            f"the source was saved with args.{kind.arg}={saved}: the store loads right only at "
+            "the size it is packed at",
+            keys=keys,
+            hint=f"pass {kind.flag} N with the {kind.arg} of that job (the store's arguments then "
+            "record it)",
+        ).to_error()
+
+    def _padded_vocab(self, size: int, saved: int) -> str:
+        """The store's padded vocabulary under the tensor-parallel size ``size`` its arguments get
+        (the source's: ``saved``); the evidence.
+
+        A job at that size needs it to divide by ``size`` (FC-R10 otherwise). A
+        job started with ``--use-checkpoint-args`` takes ``padded_vocab_size``
+        from the store; one that pads its vocabulary itself pads it to a
+        multiple of ``make_vocab_size_divisible_by * size``, which is warned
+        about when it differs, or may (a smaller size with ``args.vocab_size``
+        unset).
+        """
+        padded = self._args.get("padded_vocab_size", None)
+        divisible_by = self._args.get("make_vocab_size_divisible_by", None)
+        if padded is None or divisible_by is None:
+            return (
+                "; the padded vocabulary is not checked (args.padded_vocab_size or "
+                "args.make_vocab_size_divisible_by is unset)"
+            )
+        if padded % size:
+            raise Refusal(
+                errors.FC_R10,
+                f"args.padded_vocab_size={padded} does not divide by {TENSOR_PARALLEL.flag} "
+                f"{size}: a job at that tensor-parallel size cannot shard the embedding and the "
+                "output layer",
+                hint=f"pass a {TENSOR_PARALLEL.flag} that divides it",
+            ).to_error()
+        multiple = divisible_by * size
+        padding = f"make_vocab_size_divisible_by x {size} = {multiple}"
+        vocab = self._args.get("vocab_size", None)
+        if vocab is not None:
+            repadded = math.ceil(vocab / multiple) * multiple
+            if repadded == padded:
+                return (
+                    f"; args.padded_vocab_size={padded} is args.vocab_size={vocab} padded to a "
+                    f"multiple of {padding}, as a job at that size pads it"
+                )
+            differs = f"pads args.vocab_size={vocab} to {repadded} ({padding}), not to"
+        elif padded % multiple:
+            differs = f"pads it to a multiple of {padding}, not to"
+        elif size >= saved:
+            return (
+                f"; args.padded_vocab_size={padded} is a multiple of {padding}, as a job at that "
+                "size pads it"
+            )
+        else:
+            differs = (
+                f"pads it to a multiple of {padding}, which may be fewer rows (args.vocab_size is "
+                "unset) than"
+            )
+        self._warnings.append(
+            f"{TENSOR_PARALLEL.flag} {size}: a job at that tensor-parallel size that pads its "
+            f"vocabulary itself {differs} the store's args.padded_vocab_size={padded}: load the "
+            "store with --use-checkpoint-args, which takes padded_vocab_size from it"
+        )
+        return f"; a job that pads its vocabulary itself {differs} args.padded_vocab_size={padded}"
+
+    def _check_recorded(self, kind: PackKind, size: int, keys: tuple[str, ...]) -> None:
+        recorded = self._recorded.get(kind.field)
+        if recorded is not None and recorded != size:
+            raise Refusal(
+                errors.FC_R10,
+                f"the source's {MANIFEST_FILE} records that its fused tensors were packed at "
+                f"{kind.field}={recorded}, but its args.{kind.arg}={size}",
+                keys=keys,
+                hint="check the store's arguments; --ignore-manifest unpacks at the arguments' "
+                "size",
+            ).to_error()
+
+
+def _check_divisible(packed: list[Fc1], size: int, given: str, hint: str) -> None:
+    """Every packed tensor's halves divide by its pack size ``size``, ``given`` as said (FC-R10)."""
+    uneven = sorted({fc1.key for fc1 in packed if any(part % size for part in fc1.parts.sizes)})
+    if uneven:
+        raise Refusal(
+            errors.FC_R10,
+            f"the gate and value halves of {len(uneven)} stored gated linear_fc1 tensors do not "
+            f"divide by {given}",
+            keys=tuple(uneven),
+            hint=hint,
+        ).to_error()
 
 
 def _fsdp_swiglu(args: ArgsView, direction: str, log: list[Derivation]) -> bool:

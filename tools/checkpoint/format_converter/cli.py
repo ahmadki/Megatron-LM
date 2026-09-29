@@ -376,6 +376,25 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "target is always grouped); an fsdp_dtensor source must name them so",
     )
     parser.add_argument(
+        "--fsdp-tp",
+        type=int,
+        metavar="N",
+        help="torch_dist to fsdp_dtensor: the tensor-parallel size of the job that will load the "
+        "store; fsdp_dtensor packs fused tensors (a gated linear_fc1 it does not split) per "
+        "tensor-parallel rank, so the store only loads at this size, which its arguments record "
+        "(default: the source's, if it is 1; required otherwise when such tensors exist)",
+    )
+    parser.add_argument(
+        "--fsdp-etp",
+        type=int,
+        metavar="N",
+        help="torch_dist to fsdp_dtensor: the expert tensor-parallel size of that job, which the "
+        "fused tensors of routed experts are packed at (default and requirement as --fsdp-tp; "
+        "also required when --fsdp-tp is not the source's tensor-parallel size, since a job's "
+        "expert size follows its tensor-parallel size unless it sets "
+        "--expert-tensor-parallel-size)",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         metavar="N",
@@ -423,6 +442,8 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "block_layouts": tuple(args.block_layout),
         "torch_dist_layout": args.torch_dist_layout,
         "expert_naming": args.expert_naming,
+        "fsdp_tp": args.fsdp_tp,
+        "fsdp_etp": args.fsdp_etp,
     }
     for name in (
         "workers",

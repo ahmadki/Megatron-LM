@@ -38,6 +38,13 @@ SINGLE_STAGE_FIELDS: Mapping[str, Any] = {
 PATTERN_FIELDS = ("hybrid_layer_pattern", "hybrid_override_pattern")
 """Hybrid layer patterns, whose ``|`` separators mark pipeline stages."""
 
+PACK_TP_FIELDS = ("tensor_model_parallel_size", "tensor_parallel_num_weight_shards")
+"""The tensor-parallel size a store's fused tensors are packed at, and the weight shards every
+job saves as many of (``validate_args``: one per tensor-parallel rank)."""
+
+PACK_ETP_FIELDS = ("expert_tensor_parallel_size", "expert_tensor_parallel_num_weight_shards")
+"""The same for the expert tensor-parallel size (routed experts)."""
+
 EXPERT_FORM_FIELD = "moe_grouped_gemm"
 """Whether Megatron's GPT builders build ``TEGroupedMLP`` experts (else ``SequentialMLP``),
 which fsdp_dtensor stores name differently."""
@@ -48,6 +55,8 @@ SANITIZED_FIELDS = frozenset(
         *FSDP_DTENSOR_FIELDS,
         *SINGLE_STAGE_FIELDS,
         *PATTERN_FIELDS,
+        *PACK_TP_FIELDS,
+        *PACK_ETP_FIELDS,
         EXPERT_FORM_FIELD,
     }
 )

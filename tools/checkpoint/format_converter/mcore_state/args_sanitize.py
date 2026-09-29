@@ -14,7 +14,9 @@ arguments must therefore describe the store:
   and virtual-pipeline fields are reset and ``|`` stage separators are
   removed from the hybrid layer pattern); ``moe_grouped_gemm`` set to build
   the experts module whose names the store uses (a GPT model's builder
-  reads it);
+  reads it); the (expert) tensor-parallel size set to the size its fused
+  tensors are packed at, if it packs any (with the weight shards every job
+  saves as many of);
 * torch_dist: ``ckpt_format='torch_dist'``, no ``use_megatron_fsdp``; values
   a previous conversion recorded in its manifest are restored, except that
   ``no_save_optim`` and ``no_save_rng`` are never cleared for a store without
@@ -36,6 +38,8 @@ from ..core.args_view import ArgsView
 from ..core.format_args import (
     EXPERT_FORM_FIELD,
     FSDP_DTENSOR_FIELDS,
+    PACK_ETP_FIELDS,
+    PACK_TP_FIELDS,
     PATTERN_FIELDS,
     SINGLE_STAGE_FIELDS,
     TORCH_DIST_FIELDS,
@@ -70,7 +74,11 @@ def sanitize_weights_only(args: argparse.Namespace) -> SanitizedArgs:
 
 
 def sanitize_for_fsdp_dtensor(
-    args: argparse.Namespace, *, grouped_gemm: bool | None = None
+    args: argparse.Namespace,
+    *,
+    grouped_gemm: bool | None = None,
+    pack_tp: int | None = None,
+    pack_etp: int | None = None,
 ) -> SanitizedArgs:
     """Arguments of a weights-only fsdp_dtensor store written from a torch_dist checkpoint.
 
@@ -78,6 +86,10 @@ def sanitize_for_fsdp_dtensor(
         args: The torch_dist checkpoint's arguments.
         grouped_gemm: The ``moe_grouped_gemm`` under which Megatron builds the
             experts module whose names the store uses (``None``: left as is).
+        pack_tp: The tensor-parallel size the store's fused tensors are
+            packed at (``None``: it packs none; left as is).
+        pack_etp: The expert tensor-parallel size the fused tensors of its
+            routed experts are packed at (likewise).
 
     Raises:
         IntegrityError: ``args`` is not a Namespace.
@@ -90,10 +102,31 @@ def sanitize_for_fsdp_dtensor(
         if isinstance(view.get(name, None), str)
     }
     experts = {} if grouped_gemm is None else {EXPERT_FORM_FIELD: grouped_gemm}
+    packs = {
+        **_pack_fields(view, PACK_TP_FIELDS, pack_tp),
+        **_pack_fields(view, PACK_ETP_FIELDS, pack_etp),
+    }
     return _apply(
         args,
-        {**WEIGHTS_ONLY_FIELDS, **FSDP_DTENSOR_FIELDS, **SINGLE_STAGE_FIELDS, **unpiped, **experts},
+        {
+            **WEIGHTS_ONLY_FIELDS,
+            **FSDP_DTENSOR_FIELDS,
+            **SINGLE_STAGE_FIELDS,
+            **unpiped,
+            **experts,
+            **packs,
+        },
     )
+
+
+def _pack_fields(view: ArgsView, fields: tuple[str, str], size: int | None) -> dict[str, int]:
+    """The size field set to the pack ``size``, and the weight-shard field too unless it is unset
+    (``validate_args`` derives an unset one from the size)."""
+    if size is None:
+        return {}
+    size_field, shards_field = fields
+    shards = {} if view.get(shards_field, None) is None else {shards_field: size}
+    return {size_field: size, **shards}
 
 
 def sanitize_for_torch_dist(

@@ -60,7 +60,8 @@ FC_R07 = "FC-R07"
 
 FC_R10 = "FC-R10"
 """A tensor packed per tensor-parallel rank (rank-major) cannot be laid out consistently: its
-parts do not divide by the pack size."""
+parts do not divide by the pack size, or the pack size a store's arguments give contradicts its
+conversion manifest."""
 
 FC_R11 = "FC-R11"
 """The layer indices a store holds contradict the hybrid layer pattern."""
@@ -111,6 +112,10 @@ FC_P11 = "FC-P11"
 
 FC_P12 = "FC-P12"
 """Pending: converting optimizer state from torch_dist to fsdp_dtensor."""
+
+FC_A01 = "FC-A01"
+"""fsdp_dtensor packs tensors per tensor-parallel rank, and the pack size (the loading job's
+tensor-parallel size) must be given (``--fsdp-tp``/``--fsdp-etp``)."""
 
 FC_A02 = "FC-A02"
 """How torch_dist stores a block of an unknown kind cannot be decided (``--block-layout``)."""

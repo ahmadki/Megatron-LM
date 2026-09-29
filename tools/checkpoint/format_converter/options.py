@@ -260,6 +260,10 @@ class PlanOptions:
             ``content_metadata``) for a torch_dist target of an fsdp_dtensor source.
         expert_naming: How fsdp_dtensor names routed experts: ``auto`` (as the
             model's builder does), ``grouped`` or ``sequential`` (cross-format only).
+        fsdp_tp: The tensor-parallel size fsdp_dtensor packs fused tensors at
+            (torch_dist to fsdp_dtensor; ``None``: the source's, if it is 1).
+        fsdp_etp: The expert tensor-parallel size fsdp_dtensor packs routed
+            experts' fused tensors at (likewise).
     """
 
     to_format: str = TORCH_DIST
@@ -279,6 +283,8 @@ class PlanOptions:
     block_layouts: tuple[tuple[str, str], ...] = ()
     torch_dist_layout: str = NATIVE_LAYOUT
     expert_naming: str = AUTO_EXPERT_NAMING
+    fsdp_tp: int | None = None
+    fsdp_etp: int | None = None
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
@@ -307,6 +313,9 @@ class PlanOptions:
         if self.max_host_bytes is None:
             budget = int(HOST_BUDGET_FRACTION * _available_or_fallback())
             object.__setattr__(self, "max_host_bytes", budget)
+        for flag, value in (("--fsdp-tp", self.fsdp_tp), ("--fsdp-etp", self.fsdp_etp)):
+            if value is not None and value < 1:
+                raise UsageError(f"{flag} must be at least 1, got {value}")
         for flag, value in (
             ("--unit-bytes", self.unit_bytes),
             ("--max-unit-bytes-hard", self.max_unit_bytes_hard),
@@ -331,6 +340,8 @@ class PlanOptions:
             "block_layouts": dict(self.block_layouts),
             "torch_dist_layout": self.torch_dist_layout,
             "expert_naming": self.expert_naming,
+            "fsdp_tp": self.fsdp_tp,
+            "fsdp_etp": self.fsdp_etp,
         }
 
     def _check_torch_dist_layout(self) -> None:

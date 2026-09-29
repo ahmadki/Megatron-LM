@@ -84,6 +84,32 @@ def test_fsdp_dtensor_arguments_build_the_experts_module_the_store_names():
     assert "moe_grouped_gemm" not in vars(unset.args)  # only existing fields change
 
 
+def test_fsdp_dtensor_arguments_record_the_sizes_fused_tensors_are_packed_at():
+    """The pack size replaces the (expert) tensor-parallel size, with the weight shards a job
+    saves as many of; an unset shard count stays unset (validate_args derives it)."""
+    args = _training_args(
+        tensor_model_parallel_size=2,
+        tensor_parallel_num_weight_shards=2,
+        expert_tensor_parallel_size=None,
+        expert_tensor_parallel_num_weight_shards=None,
+    )
+    result = sanitize_for_fsdp_dtensor(args, pack_tp=1, pack_etp=4)
+    assert {k: v for k, v in result.changes.items() if "tensor" in k} == {
+        "tensor_model_parallel_size": (2, 1),
+        "tensor_parallel_num_weight_shards": (2, 1),
+        "expert_tensor_parallel_size": (None, 4),
+    }
+    untouched = sanitize_for_fsdp_dtensor(args)  # nothing is packed: any size loads the store
+    assert not {k for k in untouched.changes if "tensor" in k}
+    same = sanitize_for_fsdp_dtensor(args, pack_tp=2)
+    assert not {k for k in same.changes if "tensor" in k}
+    bare = sanitize_for_fsdp_dtensor(_training_args(), pack_tp=2, pack_etp=2)
+    assert "tensor_model_parallel_size" not in vars(bare.args)  # only existing fields change
+    back = sanitize_for_torch_dist(result.args, {f: old for f, (old, _) in result.changes.items()})
+    assert vars(back.args)["tensor_model_parallel_size"] == 2
+    assert vars(back.args)["expert_tensor_parallel_size"] is None
+
+
 def test_torch_dist_arguments_restore_a_manifest_but_never_clear_no_save_flags():
     fsdp = sanitize_for_fsdp_dtensor(_training_args())
     restore = {field: old for field, (old, _) in fsdp.changes.items()}

@@ -58,6 +58,7 @@ from .experts import ExpertLayout
 from .keys import GLU_PARTS, LINEAR_FC, KeyGrammarError, fc2_path_of, is_fc1_path, is_swiglu_key
 from .logical import LogicalId
 from .names import FSDP_DTENSOR
+from .part_layout import PartLayout
 from .structure import compose, decompose
 
 WEIGHT, BIAS = "weight", "bias"
@@ -94,6 +95,17 @@ class Fc1:
     def group(self) -> str:
         """Where it is, for summaries: its block, or the module holding it outside blocks."""
         return self.lid.block if self.lid.block is not None else self.lid.path.rpartition(".")[0]
+
+    @property
+    def packed(self) -> bool:
+        """Whether fsdp_dtensor keeps it fused though it is gated: packed per tensor-parallel rank
+        (per expert tensor-parallel rank for a routed expert)."""
+        return self.gated and not self.split
+
+    @property
+    def parts(self) -> PartLayout:
+        """Its gate and value halves, of its weight's (and bias's) rows."""
+        return PartLayout(GLU_PARTS, (self.rows // len(GLU_PARTS),) * len(GLU_PARTS))
 
 
 @dataclass(frozen=True)

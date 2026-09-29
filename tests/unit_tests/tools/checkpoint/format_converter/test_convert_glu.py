@@ -258,3 +258,14 @@ def test_halves_that_megatron_fsdp_does_not_write_are_refused(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "error: FC-R12: the store holds SwiGLU halves that Megatron-FSDP does not write" in err
     assert "(here False) is set" in err
+
+
+def test_pack_sizes_are_given_for_an_fsdp_dtensor_target_only(tmp_path, capsys, caplog):
+    src = write_gpt_source(tmp_path / "src", STACKED, args=swiglu_args())
+    fsdp, report = to_fsdp(tmp_path, src, fsdp_tp=2)
+    assert "--fsdp-tp 2 has no effect: the fsdp_dtensor store packs no tensor per" in caplog.text
+    assert "tensor_model_parallel_size" not in report["common"]["args_changes"]  # halves only
+    for store in (fsdp, src):
+        assert run("plan", store, "--to", "torch_dist", "--fsdp-etp", "2") == 2
+        err = capsys.readouterr().err
+        assert "error: only torch_dist to fsdp_dtensor conversions take --fsdp-etp" in err

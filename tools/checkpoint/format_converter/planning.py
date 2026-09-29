@@ -296,6 +296,8 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
     detection = detect_format(store, from_format=opts.from_format)
     if (detection.fmt, opts.to_format) != (FSDP_DTENSOR, TORCH_DIST):
         _refuse_torch_dist_layouts(opts)
+    if (detection.fmt, opts.to_format) != (TORCH_DIST, FSDP_DTENSOR):
+        _refuse_fsdp_layouts(opts)
     if detection.fmt == opts.to_format == TORCH_DIST:
         if opts.optimizer != "drop":
             raise UsageError(
@@ -315,6 +317,21 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
             hint="convert to torch_dist",
         )
     return _plan_cross_format(store, detection, opts, dry_run=dry_run)
+
+
+def _refuse_fsdp_layouts(opts: PlanOptions) -> None:
+    """The pack-size flags only apply to fsdp_dtensor targets of torch_dist sources."""
+    flags = [
+        flag
+        for flag, value in (("--fsdp-tp", opts.fsdp_tp), ("--fsdp-etp", opts.fsdp_etp))
+        if value is not None
+    ]
+    if flags:
+        raise UsageError(
+            f"only torch_dist to fsdp_dtensor conversions take {' and '.join(flags)} (the pack "
+            "size of the fsdp_dtensor target)",
+            hint="drop them: an fsdp_dtensor source is unpacked at the sizes its arguments give",
+        )
 
 
 def _refuse_torch_dist_layouts(opts: PlanOptions) -> None:
@@ -412,6 +429,8 @@ def _plan_cross_format(
         drop_content_metadata=CONTENT_METADATA in opts.drop_common_keys,
         per_layer=opts.torch_dist_layout == PER_LAYER_LAYOUT,
         expert_naming=opts.expert_naming,
+        fsdp_tp=opts.fsdp_tp,
+        fsdp_etp=opts.fsdp_etp,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:
@@ -564,7 +583,9 @@ def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], 
     """The args sanitation of the target format (restoring the source manifest's originals)."""
     if ctx.target[0] == FSDP_DTENSOR:
         grouped_gemm = None if ctx.experts is None else ctx.experts.grouped_gemm
-        return lambda args: sanitize_for_fsdp_dtensor(args, grouped_gemm=grouped_gemm)
+        return lambda args: sanitize_for_fsdp_dtensor(
+            args, grouped_gemm=grouped_gemm, pack_tp=ctx.pack_tp, pack_etp=ctx.pack_etp
+        )
     restore = {} if ctx.manifest is None else ctx.manifest.original_args()
     return lambda args: sanitize_for_torch_dist(args, restore)
 

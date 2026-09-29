@@ -106,8 +106,17 @@ def test_output_fields_cover_what_shapes_the_output():
         "block_layouts": {},
         "torch_dist_layout": "native",
         "expert_naming": "auto",
+        "fsdp_tp": None,
+        "fsdp_etp": None,
         "copy_sidecars": True,
     }
+
+
+@pytest.mark.parametrize("flag", ["fsdp_tp", "fsdp_etp"])
+def test_pack_sizes_are_positive(flag):
+    assert options.PlanOptions(**{flag: 2}).output_fields()[flag] == 2
+    with pytest.raises(UsageError, match="must be at least 1, got 0"):
+        options.PlanOptions(**{flag: 0})
 
 
 def test_torch_dist_layout_is_validated():
