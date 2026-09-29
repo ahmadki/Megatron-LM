@@ -58,6 +58,10 @@ FC_R06 = "FC-R06"
 FC_R07 = "FC-R07"
 """A torch_dist target would lose FP8 delayed-scaling state that its loader requires."""
 
+FC_R10 = "FC-R10"
+"""A tensor packed per tensor-parallel rank (rank-major) cannot be laid out consistently: its
+parts do not divide by the pack size."""
+
 FC_R11 = "FC-R11"
 """The layer indices a store holds contradict the hybrid layer pattern."""
 

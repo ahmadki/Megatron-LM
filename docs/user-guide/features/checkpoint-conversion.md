@@ -351,6 +351,7 @@ condition of every code.
 | `FC-R05` | grouped expert biases in `fsdp_dtensor` with expert parallelism (Megatron-FSDP keeps their expert-parallel-local indices) |
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
+| `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size |
 | `FC-R11` | layer indices that contradict the hybrid layer pattern |
 | `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), or layers that differ where they would be stacked |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |

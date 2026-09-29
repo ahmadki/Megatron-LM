@@ -467,6 +467,7 @@ arguments and the model keys before any tensor is read.
 | `FC-R05` | grouped expert biases (`linear_fc<n>.bias<e>`) of an `fsdp_dtensor` store with expert parallelism (`expert_model_parallel_size` above 1), in either direction: Megatron-FSDP names them by their expert-parallel-local index (it renumbers only the weights), so the expert-parallel ranks save and load one another's; sequential experts (`--expert-naming sequential` for a GPT job without `--moe-grouped-gemm`; a hybrid model always builds grouped experts) name them by global index |
 | `FC-R06` | grouped tensor parallelism (a weight rematerialization size above 1, or more weight shards than tensor-parallel ranks, for the dense or the expert layers), which may pad stored tensors; as many shards as tensor-parallel ranks, which every Megatron job saves, is plain tensor parallelism |
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
+| `FC-R10` | a tensor packed per tensor-parallel rank (rank-major) cannot be laid out: a part of the fused tensor does not divide by the tensor-parallel size it is packed at |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
 | `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`); or an `fsdp_dtensor` expert tensor is stored for expert indices that are not `0..n-1` (such as `0-1, 3`) |
 | `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`) or under both single-model and vision-language roots, model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor`, parameters of the legacy `GroupedMLP` (`<...>.mlp.experts.weight1`/`weight2`: every local expert in one tensor), routed-expert tensors while `args.num_experts` is unset, or expert tensors of another number of experts than `args.num_experts` |
@@ -678,6 +679,16 @@ only (`core/`, `rules/`):
   consumed and the `LogicalOutput`s (output tensors as `LogicalCopy` boxes of
   source slices) it builds. Every slice is claimed and consumed exactly once;
   anything else is an internal error.
+* **Fused parts** (`core/part_layout.py`). A parameter that concatenates
+  several parts along its first axis (a gated `linear_fc1`'s `W` and `V`, a
+  mixer's `in_proj` components) is sharded part by part over the
+  tensor-parallel ranks, so a store that concatenates the ranks' local tensors
+  holds it *rank-major*, `[W_0; V_0; W_1; V_1; ...]`. A `PartLayout` lists the
+  parts (one entry per component, never an aggregate of components) with their
+  global sizes; `rank_major_map(tp)` gives where each rank's shard of each part
+  sits in the tensor packed at `tp` (the parts' concatenation at `tp = 1`), and
+  `repack_map` moves rows between two pack sizes. A part that does not divide
+  by the pack size is refused (`FC-R10`).
 * **Sentinels** (`Sentinel` in `core/registry.py`, registered in
   `core/refusals.py`, which the identity rule imports so that it never runs
   without them) name source keys the generic identity rule must never convert
