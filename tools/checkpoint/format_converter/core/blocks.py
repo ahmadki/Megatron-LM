@@ -20,10 +20,14 @@ the source stores (FC-R11 on a mismatch).
 Kinds of blocks:
 
 * ``hybrid_stack``: the ``HybridStack`` decoder of a hybrid model, stored per
-  layer in both formats and, without shortcut-MoE grouping, numbered
-  identically (torch_dist uses ``layer_number - 1``, which is the pattern
-  position; ``hybrid_block.py``); a tensor stacked over its layers is refused
-  (FC-R12).
+  layer in both formats (a tensor stacked over its layers is refused,
+  FC-R12). torch_dist numbers a module by its first layer's
+  ``layer_number - 1``, which is the pattern position (``hybrid_block.py``),
+  and fsdp_dtensor by its layer-list index: without shortcut-MoE grouping
+  every layer is a module and both formats number it identically; with it,
+  each ``E`` joins the layer before it in one module
+  (``core/hybrid_pattern.py``), so the torch_dist indices skip the ``E``
+  positions of the pairs while the fsdp_dtensor indices stay dense.
 * ``transformer_block``: a ``TransformerBlock`` (a GPT decoder, a vision
   encoder), numbered identically in both formats and stored stacked or per
   layer in torch_dist (``core/stacking.py``).
@@ -47,7 +51,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
-from .hybrid_pattern import hybrid_pattern_of
+from .hybrid_pattern import group_modules, hybrid_pattern_of
 from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, root_of, split_layer_key
 from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
 from .registry import REGISTRY
@@ -139,6 +143,13 @@ class BlockLayout:
     def stored_index(self, dense: int, fmt: str) -> int:
         """The index a store of format ``fmt`` holds the dense layer ``dense`` under."""
         return self.stored_indices(fmt)[dense]
+
+    def index_table(self) -> str:
+        """Every module's dense index, torch_dist index and symbols: ``0: 0 E, 1: 1 *E, 2: 3 -``."""
+        return ", ".join(
+            f"{dense}: {stored}" + ("" if self.symbols is None else f" {self.symbols[dense]}")
+            for dense, stored in enumerate(self.dense_to_td)
+        )
 
     def to_json(self) -> dict[str, Any]:
         """JSON-serializable form."""
@@ -265,10 +276,13 @@ DefaultClassifier = Callable[[BlockFacts, BlockCensus], BlockLayout]
 
 @REGISTRY.classifier
 def hybrid_stack(facts: BlockFacts) -> Iterator[BlockLayout]:
-    """The ``HybridStack`` decoder of a hybrid model: per layer, numbered by pattern position.
+    """The ``HybridStack`` decoder of a hybrid model: per layer, its modules numbered by pattern
+    position in torch_dist (see the module docstring).
 
     Raises:
-        RefusedError: The source stores tensors stacked over its layers (FC-R12).
+        RefusedError: The source stores tensors stacked over its layers
+            (FC-R12), ``args.num_layers`` is not the pattern's number of
+            layers, or shortcut-MoE grouping of the pattern is impossible (FC-R11).
     """
     pattern = hybrid_pattern_of(facts.args)
     if pattern is None:
@@ -283,16 +297,36 @@ def hybrid_stack(facts: BlockFacts) -> Iterator[BlockLayout]:
             keys=census.stacked_keys(),
             hint="check that the arguments belong to this checkpoint",
         ).to_error()
-    count = len(pattern.main)
+    evidence = f"hybrid layer pattern {pattern.text!r} ({_count(len(pattern.main), 'layer')})"
+    _check_num_layers(facts.args, len(pattern.main), evidence)
+    shortcut = bool(facts.args.get("moe_shortcut_connection", False))
+    modules = group_modules(pattern.main, shortcut=shortcut, stage_starts=pattern.stage_starts)
+    if shortcut:
+        evidence += (
+            f" grouped into {_count(len(modules), 'module')} by "
+            "args.moe_shortcut_connection=True (each E joins the layer before it unless that "
+            "layer is paired)"
+        )
     yield BlockLayout(
         prefix=prefix,
         kind=HYBRID_STACK,
-        num_modules=count,
+        num_modules=len(modules),
         td_layout=PER_LAYER,
-        dense_to_td=tuple(range(count)),
-        symbols=tuple(pattern.main),
-        evidence=f"hybrid layer pattern {pattern.text!r} ({count} layers)",
+        dense_to_td=tuple(position for position, _ in modules),
+        symbols=tuple(symbols for _, symbols in modules),
+        evidence=evidence,
     )
+
+
+def _check_num_layers(args: ArgsView, count: int, evidence: str) -> None:
+    """``args.num_layers`` is the hybrid decoder's number of layers (FC-R11)."""
+    num_layers = args.get("num_layers", None)
+    if num_layers is not None and num_layers != count:
+        raise Refusal(
+            errors.FC_R11,
+            f"args.num_layers={num_layers} but {evidence}",
+            hint="check that the source checkpoint's arguments are intact",
+        ).to_error()
 
 
 def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[BlockLayout, ...]:
@@ -308,8 +342,8 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
 
     Raises:
         RefusedError: A block's stored layer indices or ``args.num_layers``
-            disagree with its layout (FC-R11), or its stacking is
-            inconsistent (FC-R12).
+            disagree with its layout, or a hybrid pattern cannot be grouped
+            into modules (FC-R11), or a block's stacking is inconsistent (FC-R12).
         AmbiguousError: A block's torch_dist layout cannot be decided (FC-A02).
         UsageError: ``facts.layouts`` names a block that is not a
             ``TransformerBlock`` of the model.
@@ -324,7 +358,6 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
     )
     _check_requested_layouts(blocks, facts.layouts)
     for block in blocks:
-        _check_num_layers(block, facts.args)
         if facts.source == FSDP_DTENSOR or not block.stacked:
             _check_stored_indices(block, facts.model, facts.source)
     return tuple(sorted(blocks, key=lambda block: block.prefix))
@@ -342,18 +375,6 @@ def _check_requested_layouts(blocks: list[BlockLayout], layouts: Mapping[str, st
             )
 
 
-def _check_num_layers(block: BlockLayout, args: ArgsView) -> None:
-    if block.kind != HYBRID_STACK:
-        return
-    num_layers = args.get("num_layers", None)
-    if num_layers is not None and num_layers != block.num_modules:
-        raise Refusal(
-            errors.FC_R11,
-            f"args.num_layers={num_layers} but {block.evidence}",
-            hint="check that the source checkpoint's arguments are intact",
-        ).to_error()
-
-
 def _check_stored_indices(block: BlockLayout, model: Mapping[str, Any], source: str) -> None:
     """The layer indices under the block's own layer segment (nested blocks' keys included)."""
     stored: set[int] = set()
@@ -367,13 +388,23 @@ def _check_stored_indices(block: BlockLayout, model: Mapping[str, Any], source: 
     expected = set(block.stored_indices(source))
     if stored != expected:
         missing, unexpected = sorted(expected - stored), sorted(stored - expected)
+        table = (
+            ""
+            if block.symbols is None
+            else f"; its modules (dense: torch_dist index, symbols) are {block.index_table()}"
+        )
         raise Refusal(
             errors.FC_R11,
             f"{block.prefix}: {block.evidence} means {source} layer indices "
             f"{index_ranges(sorted(expected))}, but the store has {index_ranges(sorted(stored))} "
-            f"(missing {missing or 'none'}, unexpected {unexpected or 'none'})",
+            f"(missing {missing or 'none'}, unexpected {unexpected or 'none'}){table}",
             hint="check that the arguments belong to this checkpoint",
         ).to_error()
+
+
+def _count(count: int, noun: str) -> str:
+    """``1 layer``, ``2 layers``, ``0 layers``."""
+    return f"{count} {noun}" + ("" if count == 1 else "s")
 
 
 def index_ranges(indices: list[int] | tuple[int, ...]) -> str:

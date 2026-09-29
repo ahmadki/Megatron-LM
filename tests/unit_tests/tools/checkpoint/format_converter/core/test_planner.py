@@ -356,3 +356,45 @@ def test_the_registered_rules_plan_a_hybrid_model():
     )
     assert plan.claims == {"identity": 3}
     assert [p.key for p in plan.pieces] == ["model.module." + k for k in sorted([QKV, FC2, NORM])]
+
+
+SHORTCUT_KEYS = {
+    "decoder.layers.0.mlp.router.weight": "decoder.layers.0.mlp.router.weight",
+    "decoder.layers.1.attn_layer.self_attention.linear_qkv.weight": (
+        "decoder.layers.1.attn_layer.self_attention.linear_qkv.weight"
+    ),
+    "decoder.layers.1.moe_layer.mlp.router.weight": "decoder.layers.1.moe_layer.mlp.router.weight",
+    "decoder.layers.3.mlp.linear_fc1.weight": "decoder.layers.2.mlp.linear_fc1.weight",
+    "decoder.layers.3.mlp.linear_fc2.weight": "decoder.layers.2.mlp.linear_fc2.weight",
+    "decoder.layers.4.attn_layer.self_attention.linear_qkv.weight": (
+        "decoder.layers.3.attn_layer.self_attention.linear_qkv.weight"
+    ),
+    "decoder.layers.4.moe_layer.mlp.router.weight": "decoder.layers.3.moe_layer.mlp.router.weight",
+    "decoder.layers.4.shortcut_pre_mlp_layernorm.weight": (
+        "decoder.layers.3.shortcut_pre_mlp_layernorm.weight"
+    ),
+    "decoder.layers.6.mlp.router.weight": "decoder.layers.4.mlp.router.weight",
+    "decoder.final_norm.weight": "decoder.final_norm.weight",
+}
+"""A shortcut-MoE hybrid ``E*E-*EE`` (modules ``E``, ``*E``, ``-``, ``*E``, ``E``): each torch_dist
+key (its module's first layer's position) and its fsdp_dtensor key (the module's list index)."""
+
+
+@pytest.mark.parametrize("direction", [(TORCH_DIST, FSDP_DTENSOR), (FSDP_DTENSOR, TORCH_DIST)])
+def test_shortcut_moe_modules_are_renumbered_between_the_formats(direction):
+    src, dst = direction
+    pairs = [
+        (td, "model.module." + fsdp) if src == TORCH_DIST else ("model.module." + fsdp, td)
+        for td, fsdp in SHORTCUT_KEYS.items()
+    ]
+    model = {key.removeprefix("model.module."): entry(key, (4,)) for key, _ in pairs}
+    args = ArgsView(
+        argparse.Namespace(
+            hybrid_layer_pattern="E*E-*EE", num_layers=7, moe_shortcut_connection=True
+        )
+    )
+    ctx = build_arch_context(source=src, target=dst, args=args, model=model)
+    adapter = FsdpMfsdpV1Adapter() if dst == FSDP_DTENSOR else TorchDistAdapter()
+    plan = plan_model(ctx, model, adapter, rules=[IdentityRule()], max_chunk_bytes=64)
+    written = {piece.key: {op.src.key for op in piece.ops} for piece in plan.pieces}
+    assert written == {dst_key: {src_key} for src_key, dst_key in pairs}

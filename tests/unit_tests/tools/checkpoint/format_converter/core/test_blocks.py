@@ -135,6 +135,130 @@ def test_num_layers_must_match_the_pattern():
     assert excinfo.value.refusal.message.startswith("args.num_layers=6 but hybrid layer pattern")
 
 
+SHORTCUT = "E*E-*EE"
+"""A shortcut-MoE hybrid pattern: a leading E, pairs, a dense MLP and an E after a pair."""
+SHORTCUT_MODULES = {0: "E", 1: "*E", 3: "-", 4: "*E", 6: "E"}
+"""Its modules by torch_dist index (the position of their first layer) and their symbols."""
+MODULE_KEYS = {
+    "E": ("mlp.router.weight", "pre_mlp_layernorm.weight"),
+    "*E": (
+        "attn_layer.self_attention.linear_qkv.weight",
+        "moe_layer.mlp.router.weight",
+        "shortcut_pre_mlp_layernorm.weight",
+    ),
+    "*": ("self_attention.linear_qkv.weight",),
+    "-": ("mlp.linear_fc1.weight", "mlp.linear_fc2.weight"),
+}
+"""Tensors of a module of each kind (ShortcutMoEBlock children for a pair)."""
+
+
+def _shortcut_keys(stored: dict[int, str], prefix: str = "decoder") -> dict[str, TensorEntry]:
+    """Model keys of the modules ``{stored index: symbols}`` of a shortcut-MoE hybrid decoder."""
+    keys = [
+        f"{prefix}.layers.{index}.{name}"
+        for index, sym in stored.items()
+        for name in MODULE_KEYS[sym]
+    ]
+    return {key: _entry(key) for key in keys}
+
+
+def _shortcut_args(pattern: str = SHORTCUT, **fields) -> ArgsView:
+    layers = len(pattern.replace("|", ""))
+    return _args(
+        **{
+            "hybrid_layer_pattern": pattern,
+            "num_layers": layers,
+            "moe_shortcut_connection": True,
+            **fields,
+        }
+    )
+
+
+def test_a_shortcut_decoder_numbers_its_modules_by_their_first_layer():
+    td = _shortcut_keys(SHORTCUT_MODULES)
+    fsdp = _shortcut_keys(dict(enumerate(SHORTCUT_MODULES.values())))
+    (block,) = classify_blocks_of(_shortcut_args(), td, TORCH_DIST)
+    assert classify_blocks_of(_shortcut_args(), fsdp, FSDP_DTENSOR) == (block,)
+    assert block.to_json() == {
+        "prefix": "decoder",
+        "kind": "hybrid_stack",
+        "num_modules": 5,
+        "td_layout": "per_layer",
+        "dense_to_td": [0, 1, 3, 4, 6],
+        "symbols": ["E", "*E", "-", "*E", "E"],
+        "evidence": "hybrid layer pattern 'E*E-*EE' (7 layers) grouped into 5 modules by "
+        "args.moe_shortcut_connection=True (each E joins the layer before it unless that layer "
+        "is paired)",
+    }
+    assert [block.dense_index(i, TORCH_DIST) for i in (0, 1, 3, 4, 6)] == [0, 1, 2, 3, 4]
+    assert [block.stored_index(i, TORCH_DIST) for i in range(5)] == [0, 1, 3, 4, 6]
+    assert [block.dense_index(i, FSDP_DTENSOR) for i in range(5)] == [0, 1, 2, 3, 4]
+    with pytest.raises(KeyGrammarError):
+        block.dense_index(2, TORCH_DIST)  # an E of a pair has no index of its own
+
+
+def test_a_vision_language_shortcut_decoder_is_renumbered_too():
+    model = _shortcut_keys(SHORTCUT_MODULES, "language_model.decoder")
+    (block,) = classify_blocks_of(_shortcut_args(), model, TORCH_DIST)
+    assert (block.prefix, block.dense_to_td) == ("language_model.decoder", (0, 1, 3, 4, 6))
+
+
+@pytest.mark.parametrize(
+    ("fmt", "stored", "message"),
+    [
+        (
+            TORCH_DIST,
+            dict(enumerate("E*E-*EE")),  # one index per layer, as without shortcut grouping
+            "means torch_dist layer indices 0-1, 3-4, 6, but the store has 0-6 "
+            "(missing none, unexpected [2, 5])",
+        ),
+        (
+            TORCH_DIST,
+            {0: "E", 1: "*E", 3: "-", 4: "*E"},
+            "means torch_dist layer indices 0-1, 3-4, 6, but the store has 0-1, 3-4 "
+            "(missing [6], unexpected none)",
+        ),
+        (
+            FSDP_DTENSOR,
+            SHORTCUT_MODULES,  # torch_dist numbering in an fsdp_dtensor store
+            "means fsdp_dtensor layer indices 0-4, but the store has 0-1, 3-4, 6 "
+            "(missing [2], unexpected [6])",
+        ),
+    ],
+)
+def test_stored_indices_must_be_the_module_starts(fmt, stored, message):
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(_shortcut_args(), _shortcut_keys(stored), fmt)
+    refusal = excinfo.value.refusal
+    assert refusal.code == errors.FC_R11
+    assert message in refusal.message
+    assert refusal.message.endswith(
+        "; its modules (dense: torch_dist index, symbols) are 0: 0 E, 1: 1 *E, 2: 3 -, 3: 4 *E, "
+        "4: 6 E"
+    )
+
+
+def test_num_layers_counts_the_layers_of_a_shortcut_pattern():
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(
+            _shortcut_args(num_layers=5), _shortcut_keys(SHORTCUT_MODULES), TORCH_DIST
+        )
+    assert excinfo.value.refusal.code == errors.FC_R11
+    assert excinfo.value.refusal.message == (
+        "args.num_layers=5 but hybrid layer pattern 'E*E-*EE' (7 layers)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "reason"), [("*-E", "follows layer 1 ('-')"), ("*|E*E", "begins a pipeline stage")]
+)
+def test_a_pattern_megatron_cannot_group_is_refused(pattern, reason):
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(_shortcut_args(pattern), {}, TORCH_DIST)
+    assert excinfo.value.refusal.code == errors.FC_R11
+    assert reason in excinfo.value.refusal.message
+
+
 def test_a_layout_needs_one_distinct_stored_index_per_module():
     with pytest.raises(InternalError):
         BlockLayout("decoder", "hybrid_stack", 2, "per_layer", (0, 0), None, "")
