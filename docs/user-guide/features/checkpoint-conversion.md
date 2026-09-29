@@ -59,9 +59,10 @@ checkpoints (`FC-R13`).
 | Model family | `torch_dist` to `fsdp_dtensor` | `fsdp_dtensor` to `torch_dist` | Optimizer state | Tensor parallelism | Tested by |
 |---|---|---|---|---|---|
 | Hybrid attention and MLP layers (`--hybrid-layer-pattern` with `*` and `-`) | yes | yes | dropped | any source size; the output holds full tensors | synthetic stores; real-save chain at TP 1 and 2 |
-| GPT with non-gated MLP layers (dense here, mixture-of-experts in the row below; no SwiGLU, MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
+| GPT with dense MLP layers (plain or gated, see gated MLPs below; mixture-of-experts below; no MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
 | Vision-language models in the LLaVA layout (a GPT or hybrid language model above, a vision encoder `vision_model.decoder`, a projection) | yes | yes | dropped | as above | synthetic stores; real-save chain of a tiny LLaVA (GPT language model, CLIP encoder) at TP 1 and 2; hybrid language model on synthetic stores only |
-| Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E` without shortcut connections): routed experts that are not gated (no SwiGLU), grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
+| Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E` without shortcut connections): routed experts, plain or gated, grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
+| Gated MLPs of the models above (`--swiglu`, `--quick-geglu`, a gated vision encoder or projection): the `linear_fc1` of dense MLPs, shared experts and routed experts, split into SwiGLU halves or kept fused as Megatron-FSDP stores them | yes | yes | dropped | SwiGLU halves: as above; an `fsdp_dtensor` store with fused gated `linear_fc1` is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`, `--fsdp-etp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against halves and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4, expert tensor-parallel size 2); the SwiGLU split predicate pinned to Megatron-FSDP's; the rank-major pack pinned to live Megatron-FSDP models at TP 2 and expert TP 2; real-save chains of a GEGLU GPT at TP 2 and of a LLaVA whose vision encoder is gated under a plain language model (TP 1 and 2); real saves of a SwiGLU GPT (TP 1 and 2) and a SwiGLU mixture-of-experts GPT with shared experts at expert-parallel size 2, whose converted stores hold a Megatron-FSDP save's keys and whose Megatron-FSDP saves convert back and load strictly (see [Limitations](#limitations-and-non-claims)) |
 
 Model families that later versions add are refused before anything is read,
 with a pending-family code:
@@ -252,6 +253,54 @@ Megatron-FSDP does not support; `FC-R04`), the legacy `GroupedMLP`
 `singleton_local_shards` (`FC-R17`). Shortcut-connected mixture-of-experts
 layers are pending (`FC-P04`).
 
+### Gated MLPs (SwiGLU)
+
+A gated MLP (`--swiglu`, or GEGLU with `--quick-geglu`) holds the gate `W` and
+the value `V` projections in its `linear_fc1`, which then has twice the rows
+its `linear_fc2` has inputs. Every `linear_fc1` is classified from these
+shapes: of dense MLPs, shared experts, each routed expert, and MLPs outside
+the layer lists such as a vision-language projection. The MLPs of one layer
+must agree, and the language model is gated exactly when `--swiglu` or
+`--quick-geglu` is set (`FC-R12` otherwise); a vision encoder or a projection
+may have a configuration of its own. `plan` shows the counts (`gated_fc1`). A
+`linear_fc1` outside every layer with no `linear_fc2` beside it (the plain
+linear layer of a vision encoder's patch merger) is no MLP's and converts
+unchanged.
+
+`torch_dist` stores a gated `linear_fc1` whole, `[W; V]`, whatever the
+tensor-parallel size; Megatron saves each half as chunks of its own, one per
+tensor-parallel rank. Megatron-FSDP stores it in one of two ways:
+
+* **Split** (`handle_swiglu_in_state_dict`): when the job sets `--swiglu`, the
+  `linear_fc1` weight and bias of dense MLPs, shared experts and routed experts
+  in a gated layer are stored as the halves `<name>_w` (`W`) and `<name>_v`
+  (`V`), for grouped experts `linear_fc1.weight<e>_w` under the global expert
+  index. The halves hold full tensors.
+* **Fused**: every other gated `linear_fc1` (no `--swiglu`, a gated vision
+  encoder under a plain language model, a vision-language projection's
+  `encoder.linear_fc1`) is stored whole as the tensor-parallel ranks' local
+  tensors one after the other, `[W_0; V_0; W_1; V_1; ...]`: *packed* at the
+  job's tensor-parallel size (its expert tensor-parallel size for routed
+  experts), which is `[W; V]` only at size 1.
+
+Converting to `fsdp_dtensor` writes each `linear_fc1` as the loading job's
+Megatron-FSDP stores it: split under the source's `--swiglu`, otherwise
+packed (see [Tensor parallelism](#tensor-parallelism)); `plan` shows which
+(`swiglu_split`). `--target-swiglu on|off` converts for a job that sets
+`--swiglu` or not. `--swiglu` also makes the MLPs SiLU-gated, and a job
+without it gates them only with `--quick-geglu` (quick-GELU), so for a
+language model with MLPs the flag must say what the source's arguments say:
+another value describes a job that builds another model and is refused (to
+load a GEGLU store at another tensor-parallel size, convert it with that
+`--fsdp-tp`). For a language model without MLPs, `on`
+splits a gated vision encoder's `linear_fc1` as a job with `--swiglu` does,
+`off` keeps it fused, and the store's arguments get the job's `swiglu` (and
+`quick_geglu`), which a conversion back restores. Converting to `torch_dist`
+merges the halves, or unpacks a fused tensor, into `[W; V]`, one chunk per
+half (as Megatron saves it at tensor-parallel size 1). An `fsdp_dtensor` source must be split
+exactly as Megatron-FSDP splits (`FC-R12`), and every half needs its pair
+(`FC-R20`).
+
 ### Vision-language models
 
 A model whose keys are under `language_model.`, `vision_model.` and
@@ -275,7 +324,39 @@ buffers such as a router's `expert_bias`, integer buffers such as
 ### Tensor parallelism
 
 Converted stores hold full tensors (tensor-parallel shards of the source are
-read into place), so they load at any tensor-parallel size the model allows.
+read into place), so they load at any tensor-parallel size the model allows,
+with one exception.
+
+```{warning}
+An `fsdp_dtensor` store that holds fused gated `linear_fc1` (see
+[Gated MLPs](#gated-mlps-swiglu)) is **tensor-parallel-bound**: each such
+tensor is packed per tensor-parallel rank (per expert tensor-parallel rank for
+routed experts) and loads right only at the size it was packed at. The
+Megatron-FSDP loader does not check the tensor-parallel size, so a job at
+another size loads it without an error and mixes gate and value rows.
+```
+
+The converter packs at `--fsdp-tp` and `--fsdp-etp`, the sizes of the job
+that will load the store. They default to the source's sizes only when those
+are 1; a source saved at a larger size needs the flag (`FC-A01`). Routed
+experts need `--fsdp-etp` also when `--fsdp-tp` is not the source's
+tensor-parallel size (`FC-A01`): a job's expert tensor-parallel size follows
+its tensor-parallel size unless it sets `--expert-tensor-parallel-size`. The
+store's arguments record the sizes (`tensor_model_parallel_size`,
+`expert_tensor_parallel_size`) and `plan` shows them (`pack_tp`, `pack_etp`).
+When `--fsdp-tp` changes the tensor-parallel size, the store keeps the
+source's padded vocabulary, which must divide by it (`FC-R10`); a job at that
+size that pads its vocabulary itself may pad it otherwise (a warning says
+when), so load with `--use-checkpoint-args`, which takes `padded_vocab_size`
+from the store.
+Load such a store with `--use-checkpoint-args --use-mp-args-from-checkpoint-args`,
+which take the tensor-parallel size from the store (pass
+`--expert-tensor-parallel-size` yourself: Megatron does not take it from a
+checkpoint), or with the same `--tensor-model-parallel-size` and
+`--expert-tensor-parallel-size`. Converting such a store back to `torch_dist`
+unpacks it at the sizes its arguments give; a conversion manifest that records
+other sizes is refused (`FC-R10`). A store whose gated MLPs are all split, or
+that has none, loads at any size.
 
 ### Common state and arguments
 
@@ -286,8 +367,10 @@ they describe the converted store, changing only existing fields:
 `no_save_optim` and `no_save_rng` are set, `ckpt_format` and
 `use_megatron_fsdp` name the target format, and an `fsdp_dtensor` store gets
 one pipeline stage (the pipeline and virtual-pipeline fields reset, `|`
-removed from the hybrid pattern). Transformer Engine `_extra_state` is
-dropped: `fsdp_dtensor` does not store it.
+removed from the hybrid pattern), the tensor-parallel sizes it is packed at
+if it packs tensors, and the `swiglu` and `quick_geglu` that `--target-swiglu`
+asks for (a language model without MLPs only). Transformer Engine `_extra_state` is dropped: `fsdp_dtensor` does
+not store it.
 
 ### Conversion manifest
 
@@ -320,6 +403,9 @@ Megatron-FSDP job cannot load a store without optimizer state, see
 ```bash
 --use-megatron-fsdp --ckpt-format fsdp_dtensor --no-load-optim --no-load-rng
 ```
+
+A store packed per tensor-parallel rank also needs the tensor-parallel sizes
+it was packed at (see [Tensor parallelism](#tensor-parallelism)).
 
 ## Fail-Closed Validation
 
@@ -391,6 +477,18 @@ directory, the target iteration and the tracker is ever changed.
   multi-token prediction, multi-latent attention and shortcut-connected
   mixture-of-experts layers are refused until the versions that add them
   (see the [Support Matrix](#support-matrix)).
+- **Tensor-parallel-bound `fsdp_dtensor` stores.** A store with fused gated
+  `linear_fc1` loads right only at the tensor-parallel sizes it was packed at,
+  and the Megatron-FSDP loader does not check them (see
+  [Tensor parallelism](#tensor-parallelism)).
+- **SwiGLU and Megatron-FSDP.** On current Megatron, a Megatron-FSDP job
+  with `--swiglu` and fp32 parameters cannot build its checkpoint state dict
+  (`handle_swiglu_in_state_dict` looks its parameters up under one `module.`
+  level too many without `Float16Module`), and a bf16 or fp16 one cannot load
+  a store without optimizer state (below). A weights-only `fsdp_dtensor`
+  store of a SwiGLU model is written as a bf16 job saves it (its keys are
+  checked against real saves), but loads only once either is fixed; stores
+  from Megatron-FSDP jobs convert to `torch_dist` as usual.
 - **Grouped expert biases.** Megatron-FSDP keeps them under
   expert-parallel-local indices: an `fsdp_dtensor` store with them loads
   correctly only at expert-parallel size 1 (see
@@ -428,6 +526,14 @@ Convert a mixture-of-experts GPT checkpoint trained with grouped experts
 ```bash
 python -m tools.checkpoint.format_converter convert \
     /checkpoints/moe_run /checkpoints/moe_run_fsdp --to fsdp_dtensor --expert-naming sequential
+```
+
+Convert a GEGLU checkpoint (`--quick-geglu`, whose MLPs Megatron-FSDP keeps
+fused) saved at tensor-parallel size 4 for a Megatron-FSDP job at size 2:
+
+```bash
+python -m tools.checkpoint.format_converter convert \
+    /checkpoints/geglu_run /checkpoints/geglu_run_fsdp --to fsdp_dtensor --fsdp-tp 2
 ```
 
 Convert a Megatron-FSDP save to `torch_dist` with every block per layer, and
