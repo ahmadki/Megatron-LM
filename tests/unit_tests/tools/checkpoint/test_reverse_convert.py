@@ -23,17 +23,19 @@ sys.path.insert(0, _INSPECTOR_DIR)
 
 from checkpoint_inspector import (  # noqa: E402  (import after sys.path tweak)
     _assert_supported_scope,
+    _gdp_heads_from_conv_width,
+    _gdp_split_names,
+    _homogeneous_layer_prefixes,
     _is_keep_fp32_key,
     _layers_are_homogeneous,
     _merge_swiglu,
     _model_param_dtype,
+    _output_group_id,
+    _plan_model_downcast,
     _rebuild_param_groups_from_meta,
     _restack_experts,
     _reverse_mtp_keys,
     _reverse_optimizer_state_key,
-    _gdp_heads_from_conv_width,
-    _gdp_split_names,
-    _output_group_id,
     _split_deltaproduct_projections,
     _split_gdn_projections,
     _split_mamba_projections,
@@ -549,6 +551,144 @@ class TestKeepFp32Keys:
     def test_substring_expert_bias_not_falsely_matched(self):
         # only a whole trailing ``.expert_bias`` segment matches, not a substring.
         assert not _is_keep_fp32_key("decoder.layers.0.mlp.router.expert_bias_extra")
+
+
+class TestPlanModelDowncast:
+    """fp32 model params are preserved unless the source is an FSDP master store.
+
+    Regression: a name allow-list (``expert_bias`` only) downcast every other fp32
+    model tensor to bf16 on a mixed-precision source, silently losing precision on
+    ``A_log``, retention/mixing ``logit`` and — worst — the router's
+    ``qb_bin_bounds``, whose perturbation changes routing decisions.
+    """
+
+    # A mixed-precision source: bf16 weights next to genuinely-fp32 params.
+    MIXED = {
+        "decoder.layers.0.self_attention.linear_qkv.weight": torch.bfloat16,
+        "decoder.layers.0.mixer.A_log": torch.float32,
+        "decoder.layers.0.mlp.router.qb_bin_bounds": torch.float32,
+        "decoder.layers.0.mlp.router.expert_bias": torch.float32,
+    }
+    # A native Megatron-FSDP store: every trainable param is fp32 (it *is* the
+    # master); ``expert_bias`` is a buffer and carries no optimizer moments.
+    MASTERS = {
+        "decoder.layers.0.self_attention.linear_qkv.weight": torch.float32,
+        "decoder.layers.0.mixer.A_log": torch.float32,
+        "decoder.layers.0.mlp.router.expert_bias": torch.float32,
+    }
+    MASTER_MOMENTS = {
+        "decoder.layers.0.self_attention.linear_qkv.weight",
+        "decoder.layers.0.mixer.A_log",
+    }
+
+    def test_mixed_precision_source_downcasts_nothing(self):
+        assert _plan_model_downcast(self.MIXED, set(), torch.bfloat16) == set()
+
+    def test_fp32_model_param_survives_the_round_trip(self):
+        # Apply the plan the way the converter does and check the dtypes out.
+        tensors = {k: torch.zeros(2, dtype=d) for k, d in self.MIXED.items()}
+        for key in _plan_model_downcast(self.MIXED, set(), torch.bfloat16):
+            tensors[key] = tensors[key].to(torch.bfloat16)
+        assert {k: v.dtype for k, v in tensors.items()} == self.MIXED
+
+    def test_master_store_downcasts_trainable_params_only(self):
+        assert (
+            _plan_model_downcast(self.MASTERS, self.MASTER_MOMENTS, torch.bfloat16)
+            == self.MASTER_MOMENTS
+        )
+
+    def test_master_store_without_optimizer_falls_back_to_allow_list(self):
+        # No moments at all (weights-only FSDP store) -> no trainability signal.
+        assert _plan_model_downcast(self.MASTERS, set(), torch.bfloat16) == {
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            "decoder.layers.0.mixer.A_log",
+        }
+
+    def test_fp32_training_and_unknown_dtype_downcast_nothing(self):
+        assert _plan_model_downcast(self.MASTERS, self.MASTER_MOMENTS, torch.float32) == set()
+        assert _plan_model_downcast(self.MASTERS, self.MASTER_MOMENTS, None) == set()
+
+    def test_all_half_source_downcasts_nothing(self):
+        halves = {"decoder.layers.0.mlp.linear_fc1.weight": torch.bfloat16}
+        assert _plan_model_downcast(halves, set(), torch.bfloat16) == set()
+
+
+class TestPerNamespaceStacking:
+    """Stacking is decided per ``...layers`` namespace, not globally.
+
+    Regression: a VLM pairs a uniform vision block (stored *stacked* by
+    ``TransformerBlock.sharded_state_dict``) with a hybrid language decoder (stored
+    per-layer). A single global decision emitted the vision block per-layer, so the
+    model could not find the stacked key it asks for.
+    """
+
+    def _mixed_store_keys(self):
+        keys = []
+        for i in range(3):  # homogeneous vision block
+            keys.append(f"vision_model.decoder.layers.{i}.self_attention.linear_qkv.weight")
+            keys.append(f"vision_model.decoder.layers.{i}.mlp.linear_fc1.weight")
+        # heterogeneous language decoder: layer 1 is a linear-attention layer
+        keys.append("language_model.decoder.layers.0.self_attention.linear_qkv.weight")
+        keys.append("language_model.decoder.layers.1.self_attention.in_proj.weight")
+        return keys
+
+    def test_only_the_homogeneous_namespace_is_selected(self):
+        assert _homogeneous_layer_prefixes(self._mixed_store_keys()) == {
+            "vision_model.decoder.layers"
+        }
+
+    def test_global_detector_still_reports_the_mixed_store_as_non_homogeneous(self):
+        assert not _layers_are_homogeneous(self._mixed_store_keys())
+
+    def test_stack_layers_stacks_only_the_selected_namespace(self):
+        tensors = {k: torch.zeros(2) for k in self._mixed_store_keys()}
+        out, n = _stack_layers(tensors, stack_prefixes={"vision_model.decoder.layers"})
+        assert n == 2  # the two vision params, stacked over 3 layers
+        assert out["vision_model.decoder.layers.self_attention.linear_qkv.weight"].shape == (3, 2)
+        assert out["vision_model.decoder.layers.mlp.linear_fc1.weight"].shape == (3, 2)
+        # the heterogeneous decoder is untouched (and does not raise)
+        assert out["language_model.decoder.layers.0.self_attention.linear_qkv.weight"].shape == (2,)
+        assert "language_model.decoder.layers.1.self_attention.in_proj.weight" in out
+
+    def test_optimizer_state_follows_its_model_namespace(self):
+        # ``stack_prefixes`` is keyed by bare model namespace, but optimizer keys
+        # carry an ``optimizer.state.<subkey>.`` prefix. They must stack with the
+        # param they mirror, not silently fall through to per-layer.
+        tensors = {}
+        for i in range(2):
+            for sub in ("exp_avg", "exp_avg_sq"):
+                tensors[f"optimizer.state.{sub}.decoder.layers.{i}.mlp.linear_fc1.weight"] = (
+                    torch.zeros(2)
+                )
+            tensors[f"decoder.layers.{i}.mlp.linear_fc1.weight"] = torch.zeros(2)
+        out, n = _stack_layers(tensors, stack_prefixes={"decoder.layers"})
+        assert n == 3  # the model param plus both optimizer moments
+        assert out["decoder.layers.mlp.linear_fc1.weight"].shape == (2, 2)
+        for sub in ("exp_avg", "exp_avg_sq"):
+            stacked = out[f"optimizer.state.{sub}.decoder.layers.mlp.linear_fc1.weight"]
+            assert stacked.shape == (2, 2)
+
+    def test_empty_prefix_set_keeps_everything_per_layer(self):
+        tensors = {k: torch.zeros(2) for k in self._mixed_store_keys()}
+        out, n = _stack_layers(tensors, stack_prefixes=set())
+        assert n == 0 and set(out) == set(tensors)
+
+    def test_default_still_stacks_every_namespace(self):
+        # Back-compat with the global ``--stack-layers`` override.
+        keys = [f"decoder.layers.{i}.mlp.linear_fc1.weight" for i in range(2)]
+        out, n = _stack_layers({k: torch.zeros(2) for k in keys})
+        assert n == 1 and out["decoder.layers.mlp.linear_fc1.weight"].shape == (2, 2)
+
+    def test_sharding_group_id_collapses_only_selected_namespaces(self):
+        prefixes = {"vision_model.decoder.layers"}
+        v0 = "vision_model.decoder.layers.0.mlp.linear_fc1.weight"
+        v1 = "vision_model.decoder.layers.1.mlp.linear_fc1.weight"
+        l0 = "language_model.decoder.layers.0.mlp.linear_fc1.weight"
+        l1 = "language_model.decoder.layers.1.mlp.linear_fc1.weight"
+        # stacked namespace: every layer must land on one rank
+        assert _output_group_id(v0, prefixes) == _output_group_id(v1, prefixes)
+        # per-layer namespace: layers stay independent
+        assert _output_group_id(l0, prefixes) != _output_group_id(l1, prefixes)
 
 
 class TestSplitMambaProjections:

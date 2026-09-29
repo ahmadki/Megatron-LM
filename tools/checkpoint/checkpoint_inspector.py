@@ -997,6 +997,9 @@ _LOCAL_EXPERT_RE = re.compile(
 )
 # A per-layer parameter with an explicit layer index.
 _LAYER_RE = re.compile(r"^(.*\.layers)\.(\d+)\.(.+)$")
+# ``optimizer.state.<subkey>.`` in front of a bare fqn; stripped so an optimizer
+# key resolves to the same ``...layers`` namespace as the param it mirrors.
+_OPT_STATE_PREFIX_RE = re.compile(r"^optimizer\.state\.[^.]+\.")
 
 # Key patterns the reverse converter cannot faithfully invert. Emitting a
 # checkpoint for one of these would silently corrupt it, so fail loudly instead.
@@ -1050,6 +1053,49 @@ def _is_dropped_key(key):
     return (
         "_extra_state" in key or key.startswith("rng_state") or key.startswith("rerun_state_machine")
     )
+
+def _plan_model_downcast(source_dtypes, trainable_fqns, model_dtype):
+    """Decide which model keys to downcast from fp32 to the compute dtype.
+
+    A native Megatron-FSDP checkpoint keeps *every* trainable parameter in fp32
+    (the weight **is** the optimizer master) while a classic torch_dist model
+    section holds compute-dtype weights with fp32 masters alongside, so that case
+    needs a downcast. But the source store is not always a native FSDP one: the
+    forward converter writes a mixed-precision store that already records each
+    parameter's true model dtype, including the parameters mcore genuinely keeps
+    in fp32 (``A_log``, router ``qb_bin_bounds``, retention/mixing ``logit``, ...).
+    Downcasting those loses precision and, for the router boundaries, changes
+    routing decisions.
+
+    The two cases are told apart by the source itself rather than by a name
+    allow-list (which can never be complete):
+
+    * Any half-precision model tensor in the source ⇒ the store preserves compute
+      dtype, so every dtype is already correct: downcast nothing.
+    * Otherwise (a uniformly-fp32 model section) ⇒ a native FSDP master store:
+      downcast the parameters that carry optimizer moments (those are the masters)
+      and leave the rest — non-trainable fp32 buffers — alone.
+    * A uniformly-fp32 store with no optimizer state at all carries no trainability
+      signal; fall back to the :data:`_KEEP_FP32_KEY_RES` name allow-list.
+
+    Args:
+        source_dtypes: bare model fqn -> dtype, read from the source metadata.
+        trainable_fqns: bare fqns that have optimizer moments in the source.
+        model_dtype: training compute dtype, or ``None`` when unknown.
+
+    Returns:
+        The set of bare model fqns to cast to ``model_dtype``.
+    """
+    if model_dtype is None or model_dtype == torch.float32:
+        return set()
+    fp32_keys = {k for k, dtype in source_dtypes.items() if dtype == torch.float32}
+    if not fp32_keys:
+        return set()
+    if any(dtype in (torch.bfloat16, torch.float16) for dtype in source_dtypes.values()):
+        return set()  # mixed-precision source: its dtypes are already the model's.
+    if trainable_fqns:
+        return fp32_keys & trainable_fqns
+    return {k for k in fp32_keys if not _is_keep_fp32_key(k)}
 
 
 def _strip_fsdp_model_prefix(key, configured_prefix=_FSDP_MODEL_PREFIX_DEFAULT):
@@ -1178,13 +1224,19 @@ def _restack_experts(tensors):
     return out, restacked
 
 
-def _stack_layers(tensors):
+def _stack_layers(tensors, stack_prefixes=None):
     """Stack per-layer ``...layers.{i}.<param>`` into one ``...layers.<param>``.
 
     Inverts ``split_layers`` for dense/homogeneous blocks (global shape
-    ``(num_layers, *param)``). Raises if the block is heterogeneous (a param is
-    missing from some layers) so the caller can fall back to per-layer via
+    ``(num_layers, *param)``). Raises if a stacked block is heterogeneous (a param
+    is missing from some layers) so the caller can fall back to per-layer via
     ``--non-homogeneous-layers``.
+
+    Args:
+        tensors: mapping of model (and optimizer) keys to tensors.
+        stack_prefixes: optional set of ``...layers`` namespaces to stack. Keys
+            under any other namespace are passed through per-layer. ``None``
+            stacks every namespace (and raises on a heterogeneous one).
     """
     groups = {}
     out = {}
@@ -1197,6 +1249,13 @@ def _stack_layers(tensors):
             out[key] = value
             continue
         prefix, idx, suffix = m.group(1), int(m.group(2)), m.group(3)
+        # ``stack_prefixes`` is keyed by bare model namespace; an optimizer key
+        # carries an ``optimizer.state.<subkey>.`` prefix and must resolve to the
+        # namespace of the param it mirrors, not be passed through per-layer.
+        namespace = _OPT_STATE_PREFIX_RE.sub("", prefix)
+        if stack_prefixes is not None and namespace not in stack_prefixes:
+            out[key] = value  # namespace kept per-layer (heterogeneous block)
+            continue
         groups.setdefault((prefix, suffix), {})[idx] = value
         prefix_idxs.setdefault(prefix, set()).add(idx)
     stacked_count = 0
@@ -1217,8 +1276,42 @@ def _stack_layers(tensors):
     return out, stacked_count
 
 
+def _layer_suffix_sets(keys):
+    """Group model keys into ``{...layers namespace: {layer index: {param suffix}}}``.
+
+    MTP layers (``mtp.layers.``) are a separate block that mcore always stores
+    per-layer, so they never participate in a stacking decision.
+    """
+    per_prefix = {}
+    for key in keys:
+        if _MTP_LAYERS_RE.search(key):
+            continue
+        m = _LAYER_RE.match(key)
+        if m is None:
+            continue
+        prefix, idx, suffix = m.group(1), int(m.group(2)), m.group(3)
+        per_prefix.setdefault(prefix, {}).setdefault(idx, set()).add(suffix)
+    return per_prefix
+
+
+def _homogeneous_layer_prefixes(keys):
+    """Return the ``...layers`` namespaces whose layers are structurally identical.
+
+    Stacking is decided **per namespace**, not globally: a VLM can pair a uniform
+    vision block (stored stacked) with a hybrid language decoder (stored per-layer),
+    and a single global answer is wrong for one of them. See
+    :func:`_layers_are_homogeneous` for the per-namespace rule this applies.
+    """
+    homogeneous = set()
+    for prefix, by_idx in _layer_suffix_sets(keys).items():
+        suffix_sets = list(by_idx.values())
+        if all(s == suffix_sets[0] for s in suffix_sets[1:]):
+            homogeneous.add(prefix)
+    return homogeneous
+
+
 def _layers_are_homogeneous(keys):
-    """Whether the transformer block's decoder layers are stored *stacked*.
+    """Whether *every* transformer block's layers are stored *stacked*.
 
     Mirrors ``TransformerBlock.sharded_state_dict`` (transformer_block.py:727-746):
     a block is stored **per-layer** (non-homogeneous) only when its layers differ
@@ -1233,22 +1326,10 @@ def _layers_are_homogeneous(keys):
     layer ⇒ homogeneous ⇒ stack. MTP layers (``mtp.layers.``) are a separate
     block and never participate in the decoder-stacking decision.
     """
-    per_prefix = {}  # layer-prefix -> {layer_idx: set(param-suffix)}
-    for key in keys:
-        if _MTP_LAYERS_RE.search(key):
-            continue
-        m = _LAYER_RE.match(key)
-        if m is None:
-            continue
-        prefix, idx, suffix = m.group(1), int(m.group(2)), m.group(3)
-        per_prefix.setdefault(prefix, {}).setdefault(idx, set()).add(suffix)
+    per_prefix = _layer_suffix_sets(keys)
     if not per_prefix:
         return False  # nothing per-layer to stack (already stacked or no layers)
-    for by_idx in per_prefix.values():
-        suffix_sets = list(by_idx.values())
-        if any(s != suffix_sets[0] for s in suffix_sets[1:]):
-            return False  # layers differ in structure ⇒ non-homogeneous
-    return True
+    return _homogeneous_layer_prefixes(keys) == set(per_prefix)
 
 
 # Gated-DeltaNet fuses q/k/v/gate/beta/alpha into one ``in_proj.weight`` and
@@ -1650,6 +1731,11 @@ def _output_group_id(fqn, do_stack):
     its ``optimizer.state.*`` subkeys) all reduce to the same group id, so sharding
     by group keeps every transform group whole on a single rank. Over-grouping is
     safe (only balance suffers); splitting a real group would corrupt the output.
+
+    Args:
+        fqn: bare parameter FQN.
+        do_stack: ``True``/``False`` for a global stacking decision, or the set of
+            ``...layers`` namespaces that stack (per-namespace auto-detection).
     """
     g = re.sub(r"((?:weight|bias)\d*)_[wv](?=$|\.)", r"\1", fqn)  # SwiGLU _w/_v tag
     g = re.sub(
@@ -1666,7 +1752,14 @@ def _output_group_id(fqn, do_stack):
         g,
     )
     if do_stack:
-        g = re.sub(r"(\.layers)\.\d+(\.)", r"\1\2", g)  # homogeneous per-layer -> stacked
+        # ``do_stack`` is either ``True`` (every namespace stacks) or the set of
+        # ``...layers`` namespaces that do; collapse the index only for those.
+        def _collapse(m):
+            if do_stack is True or m.group(1) in do_stack:
+                return m.group(1) + m.group(2)
+            return m.group(0)
+
+        g = re.sub(r"(.*\.layers)\.\d+(\.)", _collapse, g)  # homogeneous per-layer -> stacked
     return g
 
 
@@ -1711,6 +1804,15 @@ def _ensure_cpu_process_group():
     )
 
 
+def _describe_layout(do_stack):
+    """Human-readable summary of the stacking decision for the convert log."""
+    if do_stack is True:
+        return "stacked"
+    if not do_stack:
+        return "per-layer"
+    return "stacked[" + ",".join(sorted(do_stack)) + "]"
+
+
 def reverse_convert_checkpoint(
     input_dir,
     output_dir,
@@ -1728,10 +1830,12 @@ def reverse_convert_checkpoint(
         swiglu_modules: optional list of module scopes to restrict SwiGLU
             ``_w``/``_v`` merging to (default: merge every fc1 pair found).
         stack_layers: tri-state layer-stacking control. ``None`` auto-detects
-            via :func:`_layers_are_homogeneous` (stack when every decoder layer is
-            structurally identical — all-dense or all-MoE — keep per-layer when
-            layers differ, e.g. interleaved MoE/dense or linear-attention/GDN);
-            ``True`` forces stacking; ``False`` forces per-layer.
+            **per ``...layers`` namespace** via :func:`_homogeneous_layer_prefixes`
+            (stack a block whose layers are structurally identical — all-dense or
+            all-MoE — keep a block per-layer when its layers differ, e.g.
+            interleaved MoE/dense or linear-attention/GDN), so a VLM with a uniform
+            vision block and a hybrid decoder gets the right layout for each;
+            ``True`` forces stacking everywhere; ``False`` forces per-layer.
         include_optimizer: also convert ``optimizer.state.*`` tensors.
         input_model_weight_prefix: fsdp model-weight prefix to strip.
         output_model_weight_prefix: prefix to write for model weights (bare "").
@@ -1750,17 +1854,29 @@ def reverse_convert_checkpoint(
     metadata = reader.read_metadata()
     md_items = metadata.state_dict_metadata
 
-    # Layer stacking is a global property of the model keys; compute it from the
-    # full key set so sharded ranks agree (never from a rank's partial subset).
+    # Layer stacking and the dtype plan are properties of the *whole* model key
+    # set; compute them from the full metadata so sharded ranks agree (never from
+    # a rank's partial subset).
     global_model_keys = []
+    source_dtypes = {}  # bare model fqn -> source dtype
+    trainable_fqns = set()  # bare model fqns that carry optimizer moments
     for k, md in md_items.items():
-        if isinstance(md, TensorStorageMetadata) and not _is_dropped_key(k):
-            bare = _strip_fsdp_model_prefix(k, input_model_weight_prefix)
-            if bare is not None:
-                global_model_keys.append(bare)
-    do_stack = (
-        stack_layers if stack_layers is not None else _layers_are_homogeneous(global_model_keys)
-    )
+        if not isinstance(md, TensorStorageMetadata) or _is_dropped_key(k):
+            continue
+        bare = _strip_fsdp_model_prefix(k, input_model_weight_prefix)
+        if bare is not None:
+            global_model_keys.append(bare)
+            source_dtypes[bare] = md.properties.dtype
+        elif k.startswith("optimizer.state.") and k.endswith(".exp_avg"):
+            rev = _reverse_optimizer_state_key(k)
+            trainable_fqns.add(rev[len("optimizer.state.exp_avg.") :])
+    # Stacking is decided per ``...layers`` namespace so a model that mixes a
+    # homogeneous block (stacked on disk) with a heterogeneous one (per-layer) is
+    # inverted correctly; the CLI flags stay available as global overrides.
+    if stack_layers is None:
+        do_stack = _homogeneous_layer_prefixes(global_model_keys)
+    else:
+        do_stack = stack_layers
 
     owned = _assign_tensor_keys_to_rank(
         md_items, input_model_weight_prefix, include_optimizer, do_stack, rank, world_size
@@ -1843,17 +1959,17 @@ def reverse_convert_checkpoint(
             if master is not None:
                 tensors[f"optimizer.state.param.{fqn}"] = master.detach().clone()
                 n_masters += 1
+    # The downcast is planned from the *source* dtypes (see
+    # :func:`_plan_model_downcast`): a mixed-precision source already records the
+    # model's true dtypes, so its genuinely-fp32 parameters are preserved.
     model_dtype = _model_param_dtype(common_flat.get("args"))
-    if model_dtype is not None and model_dtype != torch.float32:
-        for key in list(tensors):
-            value = tensors[key]
-            if (
-                not key.startswith("optimizer.")
-                and isinstance(value, torch.Tensor)
-                and value.dtype == torch.float32
-                and not _is_keep_fp32_key(key)
-            ):
-                tensors[key] = value.to(model_dtype)
+    downcast_keys = _plan_model_downcast(source_dtypes, trainable_fqns, model_dtype)
+    n_downcast = 0
+    for key in downcast_keys:
+        value = tensors.get(key)
+        if isinstance(value, torch.Tensor) and value.dtype == torch.float32:
+            tensors[key] = value.to(model_dtype)
+            n_downcast += 1
 
     # ---- 3. Apply the inverse transforms (order mirrors the forward split) -
     tensors, n_mtp = _reverse_mtp_keys(tensors, common_flat.get("args"))
@@ -1863,7 +1979,9 @@ def reverse_convert_checkpoint(
     # ``do_stack`` was decided globally at load time (a per-rank subset must not
     # re-derive homogeneity from its partial key set).
     if do_stack:
-        tensors, n_layers = _stack_layers(tensors)
+        tensors, n_layers = _stack_layers(
+            tensors, stack_prefixes=None if do_stack is True else do_stack
+        )
     else:
         n_layers = 0
 
@@ -1878,8 +1996,9 @@ def reverse_convert_checkpoint(
         f"[Convert] mtp={n_mtp} swiglu={n_swiglu} experts={n_experts} "
         f"layer-stacks={n_layers} gdn-splits={n_gdn} gdp-splits={n_gdp} "
         f"mamba-splits={n_mamba} "
-        f"masters={n_masters} extra_state-dropped={n_skipped_extra_state} "
-        f"layout={'stacked' if do_stack else 'per-layer'}"
+        f"masters={n_masters} downcast={n_downcast} "
+        f"extra_state-dropped={n_skipped_extra_state} "
+        f"layout={_describe_layout(do_stack)}"
     )
 
     # ---- 4. Rebuild common.pt (unflatten; drop rerun/rng; pin version) -----
@@ -1957,9 +2076,10 @@ def reverse_convert_checkpoint(
     "--stack-layers/--non-homogeneous-layers",
     "stack_layers",
     default=None,
-    help="Force a stacked or per-layer torch_dist layout. Default: auto-detect — "
-    "stack when every decoder layer is structurally identical (all-dense or "
-    "all-MoE), keep per-layer when layers differ (interleaved MoE/dense or GDN).",
+    help="Force a stacked or per-layer torch_dist layout for every layer block. "
+    "Default: auto-detect per layer namespace — stack a block whose layers are "
+    "structurally identical (all-dense or all-MoE), keep a block per-layer when "
+    "its layers differ (interleaved MoE/dense or GDN).",
 )
 @click.option(
     "--no-optimizer", is_flag=True, help="Convert model weights only; skip optimizer state."
