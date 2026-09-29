@@ -74,6 +74,7 @@ __all__ = [
     "build_llava",
     "build_moe_gpt",
     "build_te_gpt",
+    "convert_store",
     "full_params",
     "live_params",
     "load_weights_only",
@@ -90,6 +91,7 @@ __all__ = [
     "set_format",
     "set_moe_format",
     "training_args",
+    "verify_store",
 ]
 
 HYBRID_HIDDEN = 64
@@ -201,7 +203,8 @@ def load_weights_only(model, optimizer, args, load_dir: Path) -> int:
 def hybrid_provider(
     pre_process: bool = True, post_process: bool = True, *, seed: int, pattern: str, **kwargs
 ) -> HybridModel:
-    """A tiny hybrid model of ``pattern`` with the default (Transformer Engine) stack spec.
+    """A tiny hybrid model of ``pattern`` with the default (Transformer Engine) stack spec (and
+    multi-token prediction layers of its ``/`` parts).
 
     Linear layers have biases, the MLP is not gated, and the output layer is
     untied from the embedding, so every kind of tensor these layers have is
@@ -214,7 +217,7 @@ def hybrid_provider(
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     config = TransformerConfig(
-        num_layers=len(pattern.replace("|", "")),
+        num_layers=main_layers(pattern),
         hidden_size=HYBRID_HIDDEN,
         num_attention_heads=HYBRID_HEADS,
         use_cpu_initialization=True,
@@ -482,6 +485,11 @@ def build_llava(
     )
 
 
+def main_layers(pattern: str) -> int:
+    """The number of layers of the main decoder of the hybrid layer pattern ``pattern``."""
+    return len(pattern.split("/")[0].replace("|", ""))
+
+
 def set_format(args, *, fsdp: bool, pattern: str | None = None, bf16: bool = True) -> None:
     """Point the mocked arguments at a classic torch_dist or a Megatron-FSDP fsdp_dtensor job.
 
@@ -494,7 +502,8 @@ def set_format(args, *, fsdp: bool, pattern: str | None = None, bf16: bool = Tru
     args.data_parallel_sharding_strategy = "optim_grads_params" if fsdp else "no_shard"
     args.use_distributed_optimizer = True
     args.hybrid_layer_pattern = pattern
-    args.num_layers = GPT_LAYERS if pattern is None else len(pattern.replace("|", ""))
+    args.num_layers = GPT_LAYERS if pattern is None else main_layers(pattern)
+    args.mtp_num_layers = (pattern or "").count("/") or None
     args.hidden_size = HYBRID_HIDDEN
     args.num_attention_heads = HYBRID_HEADS
 
@@ -602,15 +611,21 @@ def on_rank_zero(function: Callable, *args, **kwargs):
     return outcome[0]["ok"]
 
 
-def _convert(src: Path, dst: Path, to_format: str, **options) -> dict:
+def convert_store(src: Path, dst: Path, to_format: str, **options) -> dict:
+    """Convert ``src`` into the checkpoint root ``dst`` (in the driver); the report as JSON."""
     return convert_checkpoint(
         src, dst, ConvertOptions(to_format=to_format, workers=0, **options)
     ).to_json()
 
 
-def _verify(
+def verify_store(
     a: Path, b: Path, contract: str, *, jobs_differ: bool = False, mode: str = "full"
 ) -> list[str]:
+    """The findings of verifying ``a`` against ``b`` under ``contract`` (none: it holds).
+
+    ``jobs_differ`` also ignores the arguments the chain's jobs set otherwise
+    (:data:`JOB_FIELDS`).
+    """
     ignored = [re.compile(rf"^args\.{name}$") for name in JOB_FIELDS] if jobs_differ else []
     options = VerifyOptions(
         expected_diff=contract, ignore_keys=tuple(ignored), mode=CompareMode.parse(mode)
@@ -719,7 +734,7 @@ def run_chain(
         expected_buffers = persistent_buffers(model_a) if buffers else {}
         save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
         torch.distributed.barrier()
-        on_rank_zero(_convert, s1, c1, "fsdp_dtensor", **dict(options or {}))
+        on_rank_zero(convert_store, s1, c1, "fsdp_dtensor", **dict(options or {}))
 
         configure(args, fsdp=True, bf16=False)
         model_b, optimizer_b = build(3, use_megatron_fsdp=True, bf16=False)
@@ -729,7 +744,7 @@ def run_chain(
         save_weights_only(model_b, optimizer_b, args, s2, iteration=ITERATION)
         torch.distributed.barrier()
         assert_one_module_level(s2)
-        on_rank_zero(_convert, s2, c2, "torch_dist")
+        on_rank_zero(convert_store, s2, c2, "torch_dist")
 
         configure(args, fsdp=False)
         model_c, optimizer_c = build(4)
@@ -738,20 +753,22 @@ def run_chain(
         _assert_buffers(model_c, expected_buffers)
         save_weights_only(model_c, optimizer_c, args, s3, iteration=ITERATION)
         if per_layer:
-            on_rank_zero(_convert, s2, c2_per_layer, "torch_dist", torch_dist_layout="per-layer")
+            on_rank_zero(
+                convert_store, s2, c2_per_layer, "torch_dist", torch_dist_layout="per-layer"
+            )
             model_d, optimizer_d = build(5)
             assert load_weights_only(model_d, optimizer_d, args, c2_per_layer) == ITERATION
             assert_params(full_params(model_d), expected, dtype=torch.bfloat16)
             _assert_buffers(model_d, expected_buffers)
         torch.distributed.barrier()
-        on_rank_zero(_convert, c1, back, "torch_dist")
+        on_rank_zero(convert_store, c1, back, "torch_dist")
         return on_rank_zero(
             lambda: {
-                "C1 vs S2 (A)": _verify(c1, s2, "A"),
-                "S2 vs C1 (C)": _verify(s2, c1, "C", jobs_differ=True),
-                "C2 vs S3 (B)": _verify(c2, s3, "B"),
-                "S3 vs S1 (C)": _verify(s3, s1, "C", jobs_differ=True),
-                "back vs S1 (D)": _verify(back, s1, "D"),
+                "C1 vs S2 (A)": verify_store(c1, s2, "A"),
+                "S2 vs C1 (C)": verify_store(s2, c1, "C", jobs_differ=True),
+                "C2 vs S3 (B)": verify_store(c2, s3, "B"),
+                "S3 vs S1 (C)": verify_store(s3, s1, "C", jobs_differ=True),
+                "back vs S1 (D)": verify_store(back, s1, "D"),
             }
         )
 
@@ -793,7 +810,7 @@ def run_bf16_fsdp_chain(
         model_a, optimizer_a = build(2)
         save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
         torch.distributed.barrier()
-        on_rank_zero(_convert, s1, c1, "fsdp_dtensor", **dict(options or {}))
+        on_rank_zero(convert_store, s1, c1, "fsdp_dtensor", **dict(options or {}))
 
         configure(args, fsdp=True)
         model_b, optimizer_b = build(3, use_megatron_fsdp=True)
@@ -801,7 +818,7 @@ def run_bf16_fsdp_chain(
         save_weights_only(model_b, optimizer_b, args, s2, iteration=ITERATION)
         torch.distributed.barrier()
         assert_one_module_level(s2)
-        on_rank_zero(_convert, s2, c2, "torch_dist")
+        on_rank_zero(convert_store, s2, c2, "torch_dist")
 
         configure(args, fsdp=False)
         model_c, optimizer_c = build(4)
@@ -809,11 +826,11 @@ def run_bf16_fsdp_chain(
         assert_params(full_params(model_c), expected, dtype=torch.bfloat16)
         save_weights_only(model_c, optimizer_c, args, s3, iteration=ITERATION)
         torch.distributed.barrier()
-        on_rank_zero(_convert, c1, back, "torch_dist")
+        on_rank_zero(convert_store, c1, back, "torch_dist")
         return on_rank_zero(
             lambda: {
-                "C1 vs S2 (A, keys)": _verify(c1, s2, "A", mode="meta"),
-                "C2 vs S3 (B)": _verify(c2, s3, "B"),
-                "back vs S1 (D)": _verify(back, s1, "D"),
+                "C1 vs S2 (A, keys)": verify_store(c1, s2, "A", mode="meta"),
+                "C2 vs S3 (B)": verify_store(c2, s3, "B"),
+                "back vs S1 (D)": verify_store(back, s1, "D"),
             }
         )
