@@ -9,7 +9,11 @@ import re
 import pytest
 
 from tools.checkpoint.format_converter import cli, options
-from tools.checkpoint.format_converter.core.names import EXPERT_NAMINGS, TORCH_DIST_LAYOUTS
+from tools.checkpoint.format_converter.core.names import (
+    EXPERT_NAMINGS,
+    TARGET_SWIGLU,
+    TORCH_DIST_LAYOUTS,
+)
 from tools.checkpoint.format_converter.engine.staging import RESUME_MODES
 from tools.checkpoint.format_converter.errors import UsageError
 from tools.checkpoint.format_converter.formats.detect import FORMATS
@@ -108,8 +112,16 @@ def test_output_fields_cover_what_shapes_the_output():
         "expert_naming": "auto",
         "fsdp_tp": None,
         "fsdp_etp": None,
+        "target_swiglu": "auto",
         "copy_sidecars": True,
     }
+
+
+def test_target_swiglu_is_validated():
+    assert cli.TARGET_SWIGLU == TARGET_SWIGLU
+    assert options.PlanOptions(target_swiglu="on").output_fields()["target_swiglu"] == "on"
+    with pytest.raises(UsageError, match="must be one of auto, on, off"):
+        options.PlanOptions(target_swiglu="yes")
 
 
 @pytest.mark.parametrize("flag", ["fsdp_tp", "fsdp_etp"])

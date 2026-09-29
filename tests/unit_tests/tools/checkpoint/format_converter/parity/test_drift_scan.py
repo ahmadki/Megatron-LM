@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.checkpoint.format_converter.core.glu import GLU_ARGS
+from tools.checkpoint.format_converter.core.format_args import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
 from tools.checkpoint.format_converter.core.keys import SWIGLU_KEYS
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS

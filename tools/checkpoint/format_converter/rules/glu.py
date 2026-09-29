@@ -1,17 +1,25 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""The GLU rule: gated ``linear_fc1`` that fsdp_dtensor stores as SwiGLU halves.
+"""The GLU rule: the gated ``linear_fc1`` that the two formats store differently.
 
-torch_dist stores a gated first projection whole, ``[W; V]``; Megatron-FSDP
-stores the ones its SwiGLU predicate splits (``core/glu.py``) as two tensors,
-the gate half ``W`` and the value half ``V``, both TP-canonical. The rule
-takes the weight and bias of every such first projection and writes each half
-as an output of its own: cut out of the whole tensor (rows ``[0, F)`` and
-``[F, 2F)``), or copied as they are from an fsdp_dtensor source. The target
-format places them (``core/structure.py``): fsdp_dtensor as ``<name>_w`` and
-``<name>_v``, torch_dist as the two row blocks of the whole tensor, each
-written as a chunk of its own (Megatron's SwiGLU factory saves each half as
-chunks of its own, one per tensor-parallel rank).
+torch_dist stores a gated first projection whole and TP-canonical,
+``[W; V]`` (Megatron's SwiGLU factory saves each half as chunks of its own,
+one per tensor-parallel rank; the converter writes one chunk per half).
+Megatron-FSDP (``core/glu.py``) stores it
+
+* *split*, where its SwiGLU predicate holds: the gate half ``W`` and the value
+  half ``V`` as two tensors, both TP-canonical; or
+* *packed*: whole, as the concatenation of the tensor-parallel ranks' local
+  tensors, ``[W_0; V_0; W_1; V_1; ...]``, at the context's pack size (the
+  expert pack size for a routed expert; ``[W; V]`` at size 1).
+
+The rule takes the weight and bias of every such first projection. Each half
+is an output of its own wherever a format stores it by halves: fsdp_dtensor
+names a split one ``<name>_w``/``<name>_v``, and torch_dist places each half at
+its rows of the whole tensor (``core/structure.py``). The copies follow the
+halves' :class:`~..core.part_layout.PartLayout`: cutting the halves out of a
+tensor packed at some size (the canonical tensor is packed at 1), or packing
+the canonical tensor at the pack size.
 """
 
 from __future__ import annotations
@@ -20,69 +28,113 @@ import dataclasses
 from collections.abc import Iterator, Sequence
 
 from ..core.context import ArchContext
-from ..core.keys import GLU_PARTS
+from ..core.glu import Fc1
 from ..core.logical import LogicalCopy, LogicalId, LogicalOutput, LogicalSlice
-from ..core.part_layout import PartLayout
+from ..core.names import FSDP_DTENSOR
 from ..core.registry import REGISTRY
 from ..core.rule import FamilyInstance, LeafRule, LogicalPool, Stage
 from ..engine.regions import Region
+from ..errors import InternalError
 
 
 @REGISTRY.rule
 class GluRule(LeafRule):
-    """Write the weight and bias of a SwiGLU-split ``linear_fc1`` as its two halves."""
+    """Split, merge, pack and unpack the weight and bias of gated ``linear_fc1``."""
 
     name = "glu"
     stage = Stage.GLU
 
     def claim(self, pool: LogicalPool, ctx: ArchContext) -> Iterator[FamilyInstance]:
-        """Take every tensor (or half) of a split first projection, grouped by whole tensor."""
+        """Take every tensor (or half) of a split or packed first projection, grouped by whole
+        tensor."""
 
-        def split(piece: LogicalSlice) -> bool:
+        def handled(piece: LogicalSlice) -> bool:
             fc1 = ctx.glu.of(piece.lid)
-            return fc1 is not None and fc1.split
+            return fc1 is not None and (fc1.split or fc1.packed)
 
         tensors: dict[LogicalId, list[LogicalSlice]] = {}
-        for piece in pool.take(self.name, split):
+        for piece in pool.take(self.name, handled):
             tensors.setdefault(piece.lid.whole, []).append(piece)
         for whole, pieces in tensors.items():
-            yield FamilyInstance(self.name, tuple(pieces), _halves(whole, pieces, ctx))
+            fc1 = ctx.glu.of(whole)
+            assert fc1 is not None  # taken by ``handled``
+            yield FamilyInstance(self.name, tuple(pieces), _outputs(whole, pieces, fc1, ctx))
 
 
-def _halves(
-    whole: LogicalId, pieces: Sequence[LogicalSlice], ctx: ArchContext
+def _outputs(
+    whole: LogicalId, pieces: Sequence[LogicalSlice], fc1: Fc1, ctx: ArchContext
 ) -> tuple[LogicalOutput, ...]:
-    """The two halves of ``whole``: cut out of the whole tensor, or its stored halves as is."""
-    if len(pieces) == 1 and pieces[0].lid.part is None:
-        (piece,) = pieces
-        rows, rest = piece.shape[0], piece.shape[1:]
-        layout = PartLayout(GLU_PARTS, (rows // len(GLU_PARTS),) * len(GLU_PARTS))
-        return tuple(
-            LogicalOutput(
-                dataclasses.replace(whole, part=run.part),
-                (run.rows, *rest),
-                ctx.dtype_policy.output_dtype(piece.dtype),
-                (
-                    LogicalCopy(
-                        piece.lid,
-                        _row_box(run.fused_start, run.rows, rest),
-                        _row_box(run.part_start, run.rows, rest),
-                    ),
-                ),
+    """The output tensors of one weight or bias of ``fc1``, stored as ``pieces`` in the source."""
+    if len(pieces) > 1 or pieces[0].lid.part is not None:
+        return tuple(_copied(piece, ctx) for piece in pieces)  # fsdp_dtensor halves
+    (piece,) = pieces
+    if ctx.target[0] == FSDP_DTENSOR and fc1.packed:
+        return (_packed(whole, piece, fc1, _pack_size(fc1, ctx), ctx),)
+    source_pack = 1 if ctx.target[0] == FSDP_DTENSOR else _pack_size(fc1, ctx)
+    return _unpacked(whole, piece, fc1, source_pack, ctx)
+
+
+def _pack_size(fc1: Fc1, ctx: ArchContext) -> int:
+    """The size fsdp_dtensor packs ``fc1`` at: the expert size for a routed expert."""
+    size = ctx.pack_size(fc1.lid)
+    if size is None:
+        raise InternalError(f"{fc1.lid} is packed, but the context has no pack size for it")
+    return size
+
+
+def _copied(piece: LogicalSlice, ctx: ArchContext) -> LogicalOutput:
+    """A stored half as it is."""
+    full = Region.full(piece.shape)
+    dtype = ctx.dtype_policy.output_dtype(piece.dtype)
+    return LogicalOutput(piece.lid, piece.shape, dtype, (LogicalCopy(piece.lid, full, full),))
+
+
+def _unpacked(
+    whole: LogicalId, piece: LogicalSlice, fc1: Fc1, pack: int, ctx: ArchContext
+) -> tuple[LogicalOutput, ...]:
+    """The two halves cut out of the whole tensor ``piece`` packed at ``pack``."""
+    rest = piece.shape[1:]
+    copies: dict[str, list[LogicalCopy]] = {part: [] for part in fc1.parts.parts}
+    for run in fc1.parts.rank_major_map(pack):
+        copies[run.part].append(
+            LogicalCopy(
+                piece.lid,
+                _rows(run.fused_start, run.rows, rest),
+                _rows(run.part_start, run.rows, rest),
             )
-            for run in layout.rank_major_map(1)
         )
+    dtype = ctx.dtype_policy.output_dtype(piece.dtype)
     return tuple(
         LogicalOutput(
-            piece.lid,
-            piece.shape,
-            ctx.dtype_policy.output_dtype(piece.dtype),
-            (LogicalCopy(piece.lid, Region.full(piece.shape), Region.full(piece.shape)),),
+            dataclasses.replace(whole, part=part),
+            (fc1.parts.size(part), *rest),
+            dtype,
+            tuple(part_copies),
         )
-        for piece in pieces
+        for part, part_copies in copies.items()
     )
 
 
-def _row_box(start: int, rows: int, rest: tuple[int, ...]) -> Region:
+def _packed(
+    whole: LogicalId, piece: LogicalSlice, fc1: Fc1, pack: int, ctx: ArchContext
+) -> LogicalOutput:
+    """The canonical whole tensor ``piece`` packed at ``pack``."""
+    rest = piece.shape[1:]
+    return LogicalOutput(
+        whole,
+        piece.shape,
+        ctx.dtype_policy.output_dtype(piece.dtype),
+        tuple(
+            LogicalCopy(
+                piece.lid,
+                _rows(move.src_start, move.rows, rest),
+                _rows(move.dst_start, move.rows, rest),
+            )
+            for move in fc1.parts.repack_map(1, pack)
+        ),
+    )
+
+
+def _rows(start: int, rows: int, rest: tuple[int, ...]) -> Region:
     """Rows ``[start, start + rows)`` of a tensor whose other dimensions are ``rest``."""
     return Region((start,) + (0,) * len(rest), (rows, *rest))

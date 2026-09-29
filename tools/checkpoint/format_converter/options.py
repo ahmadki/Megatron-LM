@@ -14,11 +14,13 @@ from typing import Any
 
 from .core.names import (
     AUTO_EXPERT_NAMING,
+    AUTO_SWIGLU,
     EXPERT_NAMINGS,
     FORMATS,
     NATIVE_LAYOUT,
     PER_LAYER_LAYOUT,
     STACKED,
+    TARGET_SWIGLU,
     TD_LAYOUTS,
     TORCH_DIST,
     TORCH_DIST_LAYOUTS,
@@ -264,6 +266,8 @@ class PlanOptions:
             (torch_dist to fsdp_dtensor; ``None``: the source's, if it is 1).
         fsdp_etp: The expert tensor-parallel size fsdp_dtensor packs routed
             experts' fused tensors at (likewise).
+        target_swiglu: Whether the job that loads an fsdp_dtensor target sets
+            ``--swiglu``: ``auto`` (as the source's arguments say), ``on`` or ``off``.
     """
 
     to_format: str = TORCH_DIST
@@ -285,12 +289,15 @@ class PlanOptions:
     expert_naming: str = AUTO_EXPERT_NAMING
     fsdp_tp: int | None = None
     fsdp_etp: int | None = None
+    target_swiglu: str = AUTO_SWIGLU
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
             raise UsageError(f"--to must be one of {', '.join(FORMATS)}, got {self.to_format!r}")
         if self.expert_naming not in EXPERT_NAMINGS:
             raise UsageError(f"--expert-naming must be one of {', '.join(EXPERT_NAMINGS)}")
+        if self.target_swiglu not in TARGET_SWIGLU:
+            raise UsageError(f"--target-swiglu must be one of {', '.join(TARGET_SWIGLU)}")
         object.__setattr__(self, "block_layouts", _block_layouts(self.block_layouts))
         self._check_torch_dist_layout()
         if self.optimizer not in OPTIMIZER_CHOICES:
@@ -342,6 +349,7 @@ class PlanOptions:
             "expert_naming": self.expert_naming,
             "fsdp_tp": self.fsdp_tp,
             "fsdp_etp": self.fsdp_etp,
+            "target_swiglu": self.target_swiglu,
         }
 
     def _check_torch_dist_layout(self) -> None:

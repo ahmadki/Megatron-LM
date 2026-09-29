@@ -269,20 +269,6 @@ CASES = {
         facts(args={"spec": ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]}),
     ),
     "P05 parts": (errors.FC_P05, facts(keys={"decoder.layers.0.mixer.in_proj.weight.V0": (H, H)})),
-    "P06 gated fused": (
-        errors.FC_P06,
-        facts(keys={"decoder.layers.1.mlp.linear_fc1.weight": (2 * F, H)}),
-    ),
-    "P06 projection swiglu does not split": (
-        errors.FC_P06,
-        facts(
-            args={"swiglu": True},
-            keys={
-                "vision_projection.encoder.linear_fc1.weight": (2 * F, H),
-                "vision_projection.encoder.linear_fc2.weight": (H, F),
-            },
-        ),
-    ),
     "P08 symbol": (errors.FC_P08, facts(args={"hybrid_layer_pattern": "M-*-"})),
     "P08 keys": (
         errors.FC_P08,
@@ -361,29 +347,22 @@ def test_mixture_of_experts_models_pass():
 
 
 @pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
-def test_gated_experts_kept_fused_are_fenced_in_every_expert_naming(source):
-    """Without args.swiglu, Megatron-FSDP keeps gated experts fused (pending); with it, it splits
-    them into SwiGLU halves, in every expert naming."""
+@pytest.mark.parametrize("swiglu", [True, False])
+def test_gated_linear_units_pass_the_fence_split_or_fused(source, swiglu):
+    """Megatron-FSDP splits gated experts into SwiGLU halves with args.swiglu and keeps them fused
+    without it; both convert (the architecture context checks them, ``core/glu.py``)."""
     if source == FSDP_DTENSOR:
         fc1 = {k: (2 * F, H) for k in GROUPED_EXPERTS if "linear_fc1" in k}
         gated, target = {**GROUPED_EXPERTS, **fc1}, TORCH_DIST
     else:
         fc1 = {k: (E, 2 * F, H) for k in TORCH_DIST_EXPERTS if k.endswith("linear_fc1.weight")}
         gated, target = {**TORCH_DIST_EXPERTS, **fc1}, FSDP_DTENSOR
-    direction = {"source": source, "target": target}
-    moe = {"num_experts": E, "moe_grouped_gemm": True}
-    (unsplit,) = detect_refusals(facts(args=moe, keys=gated, **direction))
-    assert unsplit.code == errors.FC_P06 and unsplit.keys == tuple(sorted(fc1))
-    assert codes(facts(args={**moe, "swiglu": True}, keys=gated, **direction)) == []
-
-
-def test_swiglu_halves_pass_the_fence_whatever_the_arguments_say():
-    """The architecture context checks them against the arguments (``core/glu.py``)."""
-    for swiglu in (True, False):
-        found = facts(
-            args={"swiglu": swiglu}, keys=FSDP_SWIGLU_KEYS, source=FSDP_DTENSOR, target=TORCH_DIST
-        )
-        assert codes(found) == []
+    moe = {"num_experts": E, "moe_grouped_gemm": True, "swiglu": swiglu}
+    assert codes(facts(args=moe, keys=gated, source=source, target=target)) == []
+    halves = facts(
+        args={"swiglu": swiglu}, keys=FSDP_SWIGLU_KEYS, source=FSDP_DTENSOR, target=TORCH_DIST
+    )
+    assert codes(halves) == []
 
 
 def test_escape_hatches_and_harmless_values_pass():
@@ -469,7 +448,7 @@ def test_grouped_tensor_parallelism_names_its_arguments():
 
 
 def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses():
-    """A shortcut-MoE hybrid language model with a stacked GLU vision encoder."""
+    """A shortcut-MoE hybrid language model with a stacked GLU vision encoder (which converts)."""
     args = {
         "hybrid_layer_pattern": "M-*E/*E",
         "moe_shortcut_connection": True,
@@ -490,7 +469,7 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     found = facts(args=args, keys=keys)
-    assert codes(found) == [errors.FC_P04, errors.FC_P05, errors.FC_P06]
+    assert codes(found) == [errors.FC_P04, errors.FC_P05]
 
 
 def test_refusals_carry_the_evidence():

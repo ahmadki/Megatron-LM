@@ -44,7 +44,7 @@ from . import __version__, errors
 from .core.args_view import ArgsView
 from .core.context import ArchContext, build_arch_context
 from .core.manifest import MANIFEST_FILE, Manifest
-from .core.names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
+from .core.names import AUTO_EXPERT_NAMING, AUTO_SWIGLU, FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
 from .core.planner import plan_model
 from .core.refusals import Facts, detect_refusals
 from .core.registry import REGISTRY
@@ -297,7 +297,7 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
     if (detection.fmt, opts.to_format) != (FSDP_DTENSOR, TORCH_DIST):
         _refuse_torch_dist_layouts(opts)
     if (detection.fmt, opts.to_format) != (TORCH_DIST, FSDP_DTENSOR):
-        _refuse_fsdp_layouts(opts)
+        _refuse_fsdp_target_flags(opts)
     if detection.fmt == opts.to_format == TORCH_DIST:
         if opts.optimizer != "drop":
             raise UsageError(
@@ -319,18 +319,22 @@ def build_plan(src: Path, opts: PlanOptions, *, dry_run: bool) -> ConversionPlan
     return _plan_cross_format(store, detection, opts, dry_run=dry_run)
 
 
-def _refuse_fsdp_layouts(opts: PlanOptions) -> None:
-    """The pack-size flags only apply to fsdp_dtensor targets of torch_dist sources."""
+def _refuse_fsdp_target_flags(opts: PlanOptions) -> None:
+    """The flags that describe the job loading an fsdp_dtensor target need such a target."""
     flags = [
         flag
-        for flag, value in (("--fsdp-tp", opts.fsdp_tp), ("--fsdp-etp", opts.fsdp_etp))
-        if value is not None
+        for flag, given in (
+            ("--fsdp-tp", opts.fsdp_tp is not None),
+            ("--fsdp-etp", opts.fsdp_etp is not None),
+            ("--target-swiglu", opts.target_swiglu != AUTO_SWIGLU),
+        )
+        if given
     ]
     if flags:
         raise UsageError(
-            f"only torch_dist to fsdp_dtensor conversions take {' and '.join(flags)} (the pack "
-            "size of the fsdp_dtensor target)",
-            hint="drop them: an fsdp_dtensor source is unpacked at the sizes its arguments give",
+            f"only torch_dist to fsdp_dtensor conversions take {' and '.join(flags)} (they "
+            "describe the job that loads the fsdp_dtensor target)",
+            hint="drop them: an fsdp_dtensor source is read as its own arguments describe it",
         )
 
 
@@ -431,6 +435,7 @@ def _plan_cross_format(
         expert_naming=opts.expert_naming,
         fsdp_tp=opts.fsdp_tp,
         fsdp_etp=opts.fsdp_etp,
+        target_swiglu=opts.target_swiglu,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:
@@ -584,7 +589,11 @@ def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], 
     if ctx.target[0] == FSDP_DTENSOR:
         grouped_gemm = None if ctx.experts is None else ctx.experts.grouped_gemm
         return lambda args: sanitize_for_fsdp_dtensor(
-            args, grouped_gemm=grouped_gemm, pack_tp=ctx.pack_tp, pack_etp=ctx.pack_etp
+            args,
+            grouped_gemm=grouped_gemm,
+            pack_tp=ctx.pack_tp,
+            pack_etp=ctx.pack_etp,
+            glu_args=ctx.fsdp_glu_args,
         )
     restore = {} if ctx.manifest is None else ctx.manifest.original_args()
     return lambda args: sanitize_for_torch_dist(args, restore)

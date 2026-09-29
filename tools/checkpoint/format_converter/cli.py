@@ -35,6 +35,7 @@ EXPECTED_DIFF_CHOICES = ("A", "B", "C", "D", "E")
 RESUME_CHOICES = ("auto", "never")
 TORCH_DIST_LAYOUTS = ("native", "per-layer")
 EXPERT_NAMINGS = ("auto", "grouped", "sequential")
+TARGET_SWIGLU = ("auto", "on", "off")
 MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
@@ -376,6 +377,17 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "target is always grouped); an fsdp_dtensor source must name them so",
     )
     parser.add_argument(
+        "--target-swiglu",
+        choices=TARGET_SWIGLU,
+        default="auto",
+        help="torch_dist to fsdp_dtensor: whether the job that will load the store sets --swiglu, "
+        "which makes Megatron-FSDP split gated linear_fc1 into SwiGLU halves: auto as the "
+        "source's arguments say (default), on or off; --swiglu also makes the MLPs SiLU-gated, "
+        "so for a language model with MLPs on/off must match the source's arguments (another "
+        "value is refused: that job builds another model); for one without MLPs they describe "
+        "the job, and the store's arguments record it",
+    )
+    parser.add_argument(
         "--fsdp-tp",
         type=int,
         metavar="N",
@@ -444,6 +456,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "expert_naming": args.expert_naming,
         "fsdp_tp": args.fsdp_tp,
         "fsdp_etp": args.fsdp_etp,
+        "target_swiglu": args.target_swiglu,
     }
     for name in (
         "workers",

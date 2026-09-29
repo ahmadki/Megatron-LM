@@ -55,6 +55,7 @@ from ..errors import Refusal, RefusalError
 from .args_view import ArgsView
 from .blocks import BlockLayout
 from .experts import ExpertLayout
+from .format_args import GLU_ARGS
 from .keys import GLU_PARTS, LINEAR_FC, KeyGrammarError, fc2_path_of, is_fc1_path, is_swiglu_key
 from .logical import LogicalId
 from .names import FSDP_DTENSOR
@@ -62,8 +63,6 @@ from .part_layout import PartLayout
 from .structure import compose, decompose
 
 WEIGHT, BIAS = "weight", "bias"
-GLU_ARGS = ("swiglu", "quick_geglu")
-"""Arguments that make Megatron build the language model's MLPs gated."""
 
 GATED, PLAIN, SPLIT, FUSED = "gated", "plain", "split", "fused"
 _ARGUMENTS_HINT = "check that the arguments belong to this checkpoint"
@@ -123,6 +122,10 @@ class GluLayout:
         if lid.leaf not in (WEIGHT, BIAS) or not is_fc1_path(lid.path):
             return None
         return self.fc1s.get(LogicalId(lid.block, lid.layer, lid.path, WEIGHT, lid.expert))
+
+    def language_model(self, decoder: str) -> list[Fc1]:
+        """The first projections of the language model's decoder ``decoder``."""
+        return [fc1 for fc1 in self.fc1s.values() if fc1.lid.block == decoder]
 
     def gated_json(self) -> dict[str, dict[str, int]]:
         """The number of gated and plain first projections of each block (or module)."""

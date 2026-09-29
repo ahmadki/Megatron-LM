@@ -95,9 +95,6 @@ FC_P04 = "FC-P04"
 FC_P05 = "FC-P05"
 """Pending: Gated DeltaProduct mixers."""
 
-FC_P06 = "FC-P06"
-"""Pending: gated ``linear_fc1`` that fsdp_dtensor keeps fused (not split into SwiGLU halves)."""
-
 FC_P08 = "FC-P08"
 """Pending: Mamba-2 mixers."""
 

@@ -32,17 +32,20 @@ from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
+from .format_args import GLU_ARGS
 from .glu import Fc1, GluLayout, glu_layout, swiglu_split
 from .keys import root_of
 from .logical import LogicalId
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
     AUTO_EXPERT_NAMING,
+    AUTO_SWIGLU,
     DIALECTS,
     FSDP_DTENSOR,
     FSDP_MODEL_PREFIX,
     FSDP_OPTIMIZER_STATE,
     PER_LAYER,
+    SWIGLU_ON,
     TORCH_DIST,
 )
 from .stacking import requested_layout_warnings, transformer_block
@@ -145,6 +148,8 @@ class ArchContext:
             tensors at (``None``: it packs none).
         pack_etp: The expert tensor-parallel size it packs the fused tensors
             of routed experts at (``None``: it packs none).
+        fsdp_glu_args: The gated-MLP arguments an fsdp_dtensor target's job
+            has where they differ from the source's (``--target-swiglu``).
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -174,6 +179,7 @@ class ArchContext:
     glu: GluLayout
     pack_tp: int | None
     pack_etp: int | None
+    fsdp_glu_args: Mapping[str, bool]
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     dtype_policy: DtypePolicy
@@ -206,6 +212,7 @@ def build_arch_context(
     expert_naming: str = AUTO_EXPERT_NAMING,
     fsdp_tp: int | None = None,
     fsdp_etp: int | None = None,
+    target_swiglu: str = AUTO_SWIGLU,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -232,10 +239,14 @@ def build_arch_context(
             tensors at (``--fsdp-tp``; ``None``: the source's, if it is 1).
         fsdp_etp: The expert tensor-parallel size it packs routed experts'
             fused tensors at (``--fsdp-etp``; likewise).
+        target_swiglu: Whether the job that loads an fsdp_dtensor target sets
+            ``--swiglu`` (``--target-swiglu``: ``auto``, ``on`` or ``off``).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
-            or ``block_layouts`` names a block that is not a TransformerBlock.
+            ``block_layouts`` names a block that is not a TransformerBlock, or
+            ``target_swiglu`` differs from the source's ``args.swiglu`` for a
+            language model with MLPs (a job with another activation).
         RefusedError: A derivation is contradictory (FC-R13 for both ``bf16``
             and ``fp16``, or routed experts that disagree with
             ``args.num_experts``; FC-R11 for layer indices the blocks do not
@@ -286,7 +297,9 @@ def build_arch_context(
     log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
     glu, evidence = glu_layout(args, model, blocks, source, facts.lm_decoder)
     log.append(Derivation("gated_fc1", glu.gated_json(), evidence))
-    fsdp_swiglu = _fsdp_swiglu(args, direction, log)
+    fsdp_swiglu, fsdp_glu_args = _fsdp_swiglu(
+        args, direction, target_swiglu, glu.language_model(facts.lm_decoder), log
+    )
     glu, evidence = swiglu_split(glu, fsdp_swiglu, blocks, source, experts)
     log.append(Derivation("swiglu_split", glu.split_json(), evidence))
     warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
@@ -318,6 +331,7 @@ def build_arch_context(
         glu=glu,
         pack_tp=pack_tp,
         pack_etp=pack_etp,
+        fsdp_glu_args=fsdp_glu_args,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         dtype_policy=DtypePolicy.PRESERVE,
@@ -684,16 +698,73 @@ def _check_divisible(packed: list[Fc1], size: int, given: str, hint: str) -> Non
         ).to_error()
 
 
-def _fsdp_swiglu(args: ArgsView, direction: str, log: list[Derivation]) -> bool:
-    """Whether the fsdp_dtensor side's job splits SwiGLU ``linear_fc1`` (its ``args.swiglu``).
+def _fsdp_swiglu(
+    args: ArgsView,
+    direction: str,
+    target_swiglu: str,
+    language_model: list[Fc1],
+    log: list[Derivation],
+) -> tuple[bool, dict[str, bool]]:
+    """Whether the fsdp_dtensor side's job splits SwiGLU ``linear_fc1`` (its ``args.swiglu``), and
+    the gated-MLP arguments an fsdp_dtensor target's job has where they differ from the source's.
 
-    The fsdp_dtensor target is written for a job with the source's arguments;
-    an fsdp_dtensor source was saved by a job with its own.
+    An fsdp_dtensor source was saved by a job with its own arguments; a target
+    is written for a job with the source's, unless ``--target-swiglu`` says
+    otherwise: ``on`` is a job with ``--swiglu``, ``off`` one without it.
+    ``--swiglu`` also makes the MLPs SiLU-gated, and a job without it gates
+    them only with ``--quick-geglu`` (quick-GELU), so a job whose
+    ``args.swiglu`` differs from the source's builds another activation for a
+    language model with MLPs: ``--target-swiglu`` may differ from the source
+    only for a language model without MLPs (whose arguments then record it).
+
+    Raises:
+        UsageError: ``--target-swiglu`` differs from the source's
+            ``args.swiglu`` for a language model with MLPs (``on`` for plain
+            or GEGLU MLPs, ``off`` for SwiGLU ones).
     """
     swiglu = bool(args.get("swiglu", False))
-    job = "loads the fsdp_dtensor target" if direction == TD_TO_FSDP else "saved the source"
-    log.append(Derivation("fsdp_swiglu", swiglu, f"args.swiglu={swiglu} of the job that {job}"))
-    return swiglu
+    if direction != TD_TO_FSDP or target_swiglu == AUTO_SWIGLU:
+        job = "loads the fsdp_dtensor target" if direction == TD_TO_FSDP else "saved the source"
+        log.append(Derivation("fsdp_swiglu", swiglu, f"args.swiglu={swiglu} of the job that {job}"))
+        return swiglu, {}
+    split = target_swiglu == SWIGLU_ON
+    gated = any(fc1.gated for fc1 in language_model)
+    if language_model and split != swiglu:
+        raise errors.UsageError(_activation_change(args, split, gated), hint="drop --target-swiglu")
+    swiglu_arg, geglu_arg = GLU_ARGS
+    job_args = {swiglu_arg: split, geglu_arg: gated and not split}
+    log.append(
+        Derivation(
+            "fsdp_swiglu",
+            split,
+            f"--target-swiglu {target_swiglu} (args.swiglu={swiglu} of the source): the job that "
+            "loads the fsdp_dtensor target has "
+            + ", ".join(f"{name}={value}" for name, value in job_args.items()),
+        )
+    )
+    return split, job_args
+
+
+def _activation_change(args: ArgsView, split: bool, gated: bool) -> str:
+    """Why a job with (``split``) or without ``--swiglu`` does not build the language model's
+    MLPs (``gated`` or not) with the source's activation."""
+    if not split:
+        return (
+            "--target-swiglu off: a job without --swiglu gates MLPs only with --quick-geglu "
+            "(quick-GELU), but the language model's MLPs are SwiGLU (args.swiglu=True), so it "
+            "builds another model; a job of this model sets --swiglu and loads the halves"
+        )
+    if not gated:
+        return (
+            "--target-swiglu on: a job with --swiglu builds gated MLPs, but the language model's "
+            "linear_fc1 are not gated"
+        )
+    return (
+        "--target-swiglu on: a job with --swiglu builds SiLU-gated MLPs, but the language "
+        f"model's are gated otherwise (args.swiglu=False, args.quick_geglu="
+        f"{args.get('quick_geglu', False)}), so it builds another model; a job of this model "
+        "keeps them fused"
+    )
 
 
 def _params_dtype(

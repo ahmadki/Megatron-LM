@@ -45,6 +45,10 @@ job saves as many of (``validate_args``: one per tensor-parallel rank)."""
 PACK_ETP_FIELDS = ("expert_tensor_parallel_size", "expert_tensor_parallel_num_weight_shards")
 """The same for the expert tensor-parallel size (routed experts)."""
 
+GLU_ARGS = ("swiglu", "quick_geglu")
+"""Arguments that make Megatron build the language model's MLPs gated (SwiGLU or GEGLU); an
+fsdp_dtensor job splits gated ``linear_fc1`` into SwiGLU halves under the first only."""
+
 EXPERT_FORM_FIELD = "moe_grouped_gemm"
 """Whether Megatron's GPT builders build ``TEGroupedMLP`` experts (else ``SequentialMLP``),
 which fsdp_dtensor stores name differently."""
@@ -57,6 +61,7 @@ SANITIZED_FIELDS = frozenset(
         *PATTERN_FIELDS,
         *PACK_TP_FIELDS,
         *PACK_ETP_FIELDS,
+        *GLU_ARGS,
         EXPERT_FORM_FIELD,
     }
 )

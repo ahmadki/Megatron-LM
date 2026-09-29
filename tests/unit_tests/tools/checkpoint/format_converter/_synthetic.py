@@ -585,9 +585,9 @@ _FC1_TENSOR = re.compile(r"\.linear_fc1\.(?:weight|bias)\d*$")
 
 
 def gated_units(
-    tensors: Mapping[str, torch.Tensor], seed: int = 17
+    tensors: Mapping[str, torch.Tensor], seed: int = 17, *, prefix: str = ""
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-    """``tensors`` with every ``linear_fc1`` weight and bias made a gated linear unit.
+    """``tensors`` with every ``linear_fc1`` weight and bias under ``prefix`` made a gated unit.
 
     Each ``[F, ...]`` tensor is replaced by a gate ``W`` and a value ``V`` of its shape and dtype,
     drawn independently from ``seed``. Returns them twice: as SwiGLU halves (``<key>_w`` and
@@ -597,7 +597,7 @@ def gated_units(
     generator = torch.Generator().manual_seed(seed)
     halves, fused = {}, {}
     for key, tensor in tensors.items():
-        if _FC1_TENSOR.search(key) is None:
+        if not key.startswith(prefix) or _FC1_TENSOR.search(key) is None:
             halves[key] = fused[key] = tensor
             continue
         gate, value = (
@@ -624,3 +624,25 @@ def swiglu_grids(tensors: Mapping[str, torch.Tensor]) -> dict[str, tuple[Region,
         ]
         grids[key] = product_grid(tuple(tensor.shape), cuts)
     return grids
+
+
+def pack_by_ranks(gate: torch.Tensor, value: torch.Tensor, tp: int) -> torch.Tensor:
+    """What ``tp`` column-parallel ranks of a gated linear unit hold, concatenated rank after rank:
+    rank ``r`` holds ``[W_r; V_r]``, its chunk of the gate and of the value."""
+    return torch.cat([torch.cat([gate.chunk(tp)[r], value.chunk(tp)[r]]) for r in range(tp)])
+
+
+def packed_units(halves: Mapping[str, torch.Tensor], sizes: Callable[[str], int]):
+    """The fused tensors Megatron-FSDP saves without splitting: every pair of SwiGLU halves
+    ``<key>_w``/``<key>_v`` of ``halves`` packed rank after rank (:func:`pack_by_ranks`) at
+    ``sizes(key)`` ranks, as ``<key>``; every other tensor is kept."""
+    packed = {}
+    for key, tensor in halves.items():
+        if key.endswith("_v"):
+            continue
+        if key.endswith("_w"):
+            fused = key[: -len("_w")]
+            packed[fused] = pack_by_ranks(tensor, halves[f"{fused}_v"], sizes(fused))
+        else:
+            packed[key] = tensor
+    return packed

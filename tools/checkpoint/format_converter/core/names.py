@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Names of the supported checkpoint formats, their dialects, the fsdp_dtensor key envelope,
-the torch_dist block layouts and the fsdp_dtensor names of routed experts.
+the torch_dist block layouts, the fsdp_dtensor names of routed experts and the SwiGLU choice.
 
 This module imports nothing, so the command line can validate format flags
 without importing torch.
@@ -53,3 +53,8 @@ AUTO_EXPERT_NAMING = "auto"
 
 EXPERT_NAMINGS = (AUTO_EXPERT_NAMING, *EXPERT_FORMS)
 """Values of ``--expert-naming``."""
+
+AUTO_SWIGLU, SWIGLU_ON, SWIGLU_OFF = "auto", "on", "off"
+TARGET_SWIGLU = (AUTO_SWIGLU, SWIGLU_ON, SWIGLU_OFF)
+"""Values of ``--target-swiglu``: whether the job that loads an fsdp_dtensor target sets
+``--swiglu`` (``auto``: as the source's arguments say)."""

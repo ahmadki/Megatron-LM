@@ -200,7 +200,7 @@ refusal fence: a model part no rule is verified for is refused with an `FC-R`
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
 from attention (`*`), MLP (`-`) and mixture-of-experts (`E`) layers, and GPT
 models (no hybrid pattern; `TransformerBlock` layers of attention and a dense
-MLP or mixture-of-experts layer), with SwiGLU MLPs or plain ones, in both
+MLP or mixture-of-experts layer), with gated (SwiGLU, GEGLU) or plain MLPs, in both
 directions, with a single model root (`embedding`, `decoder`, `output_layer`)
 or as the language model of a vision-language model (LLaVA layout:
 `language_model.`, `vision_model.` with a `TransformerBlock` encoder
@@ -298,9 +298,33 @@ refused (`FC-R13`) unless `--allow-root PREFIX` converts them unchanged.
   under the global index), in a gated layer. Converting to `fsdp_dtensor`
   splits them, and converting back writes each half as its rows of the whole
   tensor, one chunk per half. An `fsdp_dtensor` source must be split exactly
-  so (`FC-R12`), with every half paired (`FC-R20`). Gated `linear_fc1` that
-  Megatron-FSDP keeps fused (without `--swiglu`, or a vision projection's
-  `encoder.linear_fc1`) are pending (`FC-P06`).
+  so (`FC-R12`), with every half paired (`FC-R20`). Megatron-FSDP keeps every
+  other gated `linear_fc1` fused (without `--swiglu`, e.g. GEGLU, a vision
+  encoder of its own configuration under a plain language model, or a vision
+  projection's `encoder.linear_fc1`) and stores the concatenation of the
+  tensor-parallel ranks' local tensors, `[W_0; V_0; W_1; V_1; ...]`: *packed*
+  at the tensor-parallel size of the job (the expert tensor-parallel size for
+  routed experts), which is the canonical `[W; V]` only at size 1. Converting
+  to `fsdp_dtensor` packs these at `--fsdp-tp` and `--fsdp-etp` (default: the
+  source's size, only if it is 1, else `FC-A01`; routed experts need
+  `--fsdp-etp` also when `--fsdp-tp` is not the source's tensor-parallel
+  size, as a job's expert size follows its tensor-parallel size unless it sets
+  `--expert-tensor-parallel-size`), and converting back unpacks
+  them at the `fsdp_dtensor` store's own `tensor_model_parallel_size` and
+  `expert_tensor_parallel_size` into one chunk per half (`FC-R10` for halves
+  that do not divide by the size, or a manifest that records another size).
+  Such a store is *TP-bound*: it loads right only at the size it was packed
+  at, and Megatron-FSDP's loader does not check it, so load it with
+  `--use-checkpoint-args` (the store's arguments record the pack sizes) or
+  with the same `--tensor-model-parallel-size` and
+  `--expert-tensor-parallel-size`. `--target-swiglu on|off` converts for a job
+  that sets `--swiglu` or not. `--swiglu` also makes a job's MLPs SiLU-gated,
+  and a job without it gates them only with `--quick-geglu` (quick-GELU), so
+  for a language model with MLPs it must say what the source's arguments say
+  (anything else is a usage error: such a job builds another model). For a
+  language model without MLPs, `on` splits the other gated `linear_fc1` that
+  Megatron-FSDP splits under `--swiglu` (a vision encoder's), `off` packs
+  them, and the store's arguments get the job's `swiglu` (and `quick_geglu`).
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
@@ -330,9 +354,15 @@ refused (`FC-R13`) unless `--allow-root PREFIX` converts them unchanged.
 * **Arguments.** `no_save_optim` and `no_save_rng` are set; `fsdp_dtensor`
   stores get `ckpt_format='fsdp_dtensor'`, `use_megatron_fsdp=True`, one
   pipeline stage (the pipeline and virtual-pipeline fields are reset and `|` is
-  removed from the hybrid pattern); `torch_dist` stores get
-  `ckpt_format='torch_dist'` and `use_megatron_fsdp=False`. Only existing
-  fields change; every change is reported.
+  removed from the hybrid pattern), the pack sizes as
+  `tensor_model_parallel_size` and `expert_tensor_parallel_size` (with the
+  weight-shard counts `tensor_parallel_num_weight_shards` and
+  `expert_tensor_parallel_num_weight_shards` a job saves one per rank) if they
+  pack tensors, and `swiglu`/`quick_geglu` as `--target-swiglu` asks for a
+  language model without MLPs;
+  `torch_dist` stores get `ckpt_format='torch_dist'` and
+  `use_megatron_fsdp=False`. Only existing fields change; every change is
+  reported.
 * **Conversion manifest.** The output gets `conversion_manifest.json`: the
   source, the options, the derived architecture, the sanitized argument fields
   with their original values, the source's `content_metadata` (in its key
@@ -436,6 +466,7 @@ codec) and still reports everything.
 | `--block-layout PREFIX=stacked\|per_layer` | store the block `PREFIX` of a `torch_dist` target stacked over its layers or one layer per key (repeatable; `fsdp_dtensor` source only) |
 | `--torch-dist-layout {native,per-layer}` | `per-layer` stores every `TransformerBlock` of a `torch_dist` target one layer per key and marks it in the `content_metadata`; `native` as Megatron would (default; `fsdp_dtensor` source only) |
 | `--expert-naming {auto,grouped,sequential}` | how `fsdp_dtensor` names routed experts: `auto` as the model's builder does (default), or as given, for a source or a GPT target (whose `moe_grouped_gemm` is set to match; a hybrid target is always `grouped`) |
+| `--target-swiglu {auto,on,off}` | whether the job that loads an `fsdp_dtensor` target sets `--swiglu`, under which Megatron-FSDP splits gated `linear_fc1` into SwiGLU halves: `auto` as the source's arguments say (default), `on` or `off`; for a language model with MLPs only as its arguments say (`--swiglu` also sets the MLPs' activation), for one without MLPs as the job sets it, which the store's arguments then record (`torch_dist` source only) |
 | `--fsdp-tp N`, `--fsdp-etp N` | the tensor-parallel and expert tensor-parallel sizes of the job that loads an `fsdp_dtensor` target, which packs its fused tensors per rank at them and records them in its arguments (default: the source's, if it is 1; `FC-A01` without it when the source's is above 1 and there are such tensors, and without `--fsdp-etp` when routed experts are packed and `--fsdp-tp` is not the source's tensor-parallel size; a padded vocabulary that `--fsdp-tp` does not divide is refused, `FC-R10`, and one a job at that size would pad otherwise is warned about; `torch_dist` source only) |
 | `--max-output-chunk-bytes SIZE` | largest chunk of an `fsdp_dtensor` output tensor (default `1GiB`) |
 | `--allow-missing-fp8-extra-state` | write a `torch_dist` store for an FP8 delayed-scaling model without its scaling state (`FC-R07` otherwise) |
@@ -495,7 +526,6 @@ arguments and the model keys before any tensor is read.
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones; or an `fsdp_dtensor` SwiGLU half (`linear_fc1.weight_w`) without its pair, of another shape than its pair, or stored beside the whole tensor |
 | `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
 | `FC-P05` | pending: Gated DeltaProduct mixers (its spec or its `in_proj`/`conv1d` parts) |
-| `FC-P06` | pending: gated `linear_fc1` that `fsdp_dtensor` keeps fused: without `swiglu` (e.g. `quick_geglu`), or under a name Megatron-FSDP does not split (a vision-language projection's `encoder.linear_fc1`) |
 | `FC-P08` | pending: Mamba-2 mixers (symbol `M` without the Gated DeltaProduct spec) |
 | `FC-P09` | pending: Gated DeltaNet and linear attention (symbol `G`, a Gated DeltaNet `experimental_attention_variant`) |
 | `FC-P10` | pending: GPT multi-token prediction and multi-latent attention (symbol `+`) |
@@ -723,10 +753,14 @@ only (`core/`, `rules/`):
   output tensor, and write each key once.
 
 This version has two rules, `glu` (the weight and bias of a gated
-`linear_fc1` that `fsdp_dtensor` stores as SwiGLU halves: each half is an
-output of its own, a `LogicalId` with `part` `w` or `v`, which `fsdp_dtensor`
-names `<name>_w`/`<name>_v` and `torch_dist` places at its rows of the whole
-tensor) and `identity` (tensors stored the same way in both formats), and two
+`linear_fc1` that the formats store differently, as `core/glu.py` decides:
+one that `fsdp_dtensor` stores as SwiGLU halves has each half as an output of
+its own, a `LogicalId` with `part` `w` or `v`, which `fsdp_dtensor` names
+`<name>_w`/`<name>_v` and `torch_dist` places at its rows of the whole tensor;
+one that `fsdp_dtensor` keeps fused is packed rank-major, canonical `[W; V]`
+to `[W_0; V_0; W_1; V_1; ...]` and back along its halves' `PartLayout`, at
+`pack_tp`, or `pack_etp` for a routed expert) and `identity` (tensors stored
+the same way in both formats), and two
 kinds of blocks. The blocks a store holds are found from its
 keys (each key's innermost layer list), and the model's roots from the keys'
 top-level modules: the language model's decoder is `decoder`, or

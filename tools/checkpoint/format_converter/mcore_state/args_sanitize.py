@@ -16,7 +16,8 @@ arguments must therefore describe the store:
   the experts module whose names the store uses (a GPT model's builder
   reads it); the (expert) tensor-parallel size set to the size its fused
   tensors are packed at, if it packs any (with the weight shards every job
-  saves as many of);
+  saves as many of); ``swiglu`` (and ``quick_geglu``) as ``--target-swiglu``
+  gives them;
 * torch_dist: ``ckpt_format='torch_dist'``, no ``use_megatron_fsdp``; values
   a previous conversion recorded in its manifest are restored, except that
   ``no_save_optim`` and ``no_save_rng`` are never cleared for a store without
@@ -79,6 +80,7 @@ def sanitize_for_fsdp_dtensor(
     grouped_gemm: bool | None = None,
     pack_tp: int | None = None,
     pack_etp: int | None = None,
+    glu_args: Mapping[str, bool] | None = None,
 ) -> SanitizedArgs:
     """Arguments of a weights-only fsdp_dtensor store written from a torch_dist checkpoint.
 
@@ -90,6 +92,9 @@ def sanitize_for_fsdp_dtensor(
             packed at (``None``: it packs none; left as is).
         pack_etp: The expert tensor-parallel size the fused tensors of its
             routed experts are packed at (likewise).
+        glu_args: The gated-MLP arguments (``swiglu``, ``quick_geglu``) of the
+            job that loads the store, if they differ from the checkpoint's
+            (``--target-swiglu``).
 
     Raises:
         IntegrityError: ``args`` is not a Namespace.
@@ -115,6 +120,7 @@ def sanitize_for_fsdp_dtensor(
             **unpiped,
             **experts,
             **packs,
+            **(glu_args or {}),
         },
     )
 

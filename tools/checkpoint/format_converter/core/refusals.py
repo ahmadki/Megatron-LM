@@ -38,7 +38,6 @@ from .experts import built_expert_form
 from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
     FACTORY_PART,
-    FC1_WEIGHT,
     FUSED_MIXER,
     GDN_PARAM,
     GDP_PART,
@@ -52,12 +51,7 @@ from .keys import (
     SINGLETON_EXPERT_SHARD,
     TE_OP_FUSER_MLP,
     TORCH_DIST_EXPERT_BIAS,
-    KeyGrammarError,
-    fc2_weight_of,
-    is_swiglu_key,
-    join_fsdp_expert,
     root_of,
-    split_torch_dist_expert,
 )
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
@@ -65,7 +59,6 @@ from .registry import REGISTRY, Allowlist, Sentinel
 PENDING_FAMILIES: Mapping[str, str] = {
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
-    errors.FC_P06: "gated linear_fc1 that fsdp_dtensor keeps fused",
     errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
     errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
@@ -568,47 +561,6 @@ def pending_mixers(facts: Facts) -> Iterator[Refusal]:
     if code == errors.FC_P05 and _is_gdp_spec(facts.args):
         evidence.append(f"args.spec={_spec_name(facts.args)!r}")
     yield from _pending(code, evidence, facts.keys_matching(MIXER_PARAM))
-
-
-def _gated_fc1(facts: Facts) -> tuple[str, ...]:
-    """``linear_fc1`` weights with twice the rows ``linear_fc2`` has inputs (gated units)."""
-    gated = []
-    for key in facts.keys_matching(FC1_WEIGHT):
-        fc2 = facts.model.get(fc2_weight_of(key))
-        fc1_shape = facts.model[key].shape
-        if fc2 is not None and len(fc1_shape) >= 2 and fc1_shape[-2] == 2 * fc2.shape[-1]:
-            gated.append(key)
-    return tuple(gated)
-
-
-def _split_by_megatron_fsdp(key: str, source: str) -> bool:
-    """Whether a gated ``linear_fc1`` key has a name Megatron-FSDP splits into SwiGLU halves
-    (a torch_dist expert tensor's experts do, whatever their fsdp_dtensor naming)."""
-    if source == TORCH_DIST:
-        try:
-            expert = split_torch_dist_expert(key)
-        except KeyGrammarError:
-            return False
-        if expert is not None:
-            key = join_fsdp_expert(expert.path, expert.leaf, 0, GROUPED)
-    return is_swiglu_key(key)
-
-
-@REGISTRY.detector
-def pending_unsplit_glu(facts: Facts) -> Iterator[Refusal]:
-    """FC-P06: gated linear units that fsdp_dtensor keeps fused.
-
-    Megatron-FSDP splits a gated ``linear_fc1`` into SwiGLU halves only with
-    ``args.swiglu`` and for the names of ``handle_swiglu_in_state_dict``; it
-    keeps every other one fused, packed per tensor-parallel rank.
-    """
-    swiglu = facts.args.get("swiglu", False)
-    kept = tuple(
-        key
-        for key in _gated_fc1(facts)
-        if not (swiglu and _split_by_megatron_fsdp(key, facts.source))
-    )
-    yield from _pending(errors.FC_P06, [], kept)
 
 
 @REGISTRY.detector
