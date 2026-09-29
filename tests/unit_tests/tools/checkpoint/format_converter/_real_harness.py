@@ -23,9 +23,10 @@ import contextlib
 import copy
 import re
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from functools import partial
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import torch
@@ -60,9 +61,10 @@ from tests.unit_tests.dist_checkpointing.utils import (
 from tests.unit_tests.test_utilities import Utils
 from tools.checkpoint.format_converter.api import convert_checkpoint, verify_checkpoint
 from tools.checkpoint.format_converter.engine.metadata import MetadataView
-from tools.checkpoint.format_converter.options import ConvertOptions, VerifyOptions
+from tools.checkpoint.format_converter.options import CompareMode, ConvertOptions, VerifyOptions
 
 __all__ = [
+    "BF16_CHAIN_CHECKS",
     "CHAIN_CHECKS",
     "MOE_CONFIG",
     "MOE_EXPERTS",
@@ -82,6 +84,7 @@ __all__ = [
     "randomize_parameters",
     "real_save",
     "resolve_weight_shards",
+    "run_bf16_fsdp_chain",
     "run_chain",
     "save_weights_only",
     "set_format",
@@ -303,8 +306,8 @@ def build_hybrid(
 
 
 def _transformer_config(num_layers: int, hidden: int, heads: int, **kwargs) -> TransformerConfig:
-    """A TransformerConfig of linear layers with biases (unless ``kwargs`` says otherwise) and
-    no gated linear unit."""
+    """A TransformerConfig of linear layers with biases and no gated linear unit (unless
+    ``kwargs`` says otherwise)."""
     for extra in ("pg_collection", "config", "vp_stage"):
         kwargs.pop(extra, None)
     return TransformerConfig(
@@ -312,8 +315,7 @@ def _transformer_config(num_layers: int, hidden: int, heads: int, **kwargs) -> T
         hidden_size=hidden,
         num_attention_heads=heads,
         use_cpu_initialization=True,
-        gated_linear_unit=False,
-        **{"add_bias_linear": True, **kwargs},
+        **{"add_bias_linear": True, "gated_linear_unit": False, **kwargs},
     )
 
 
@@ -341,20 +343,32 @@ def te_gpt_provider(
 
 
 def llava_provider(
-    pre_process: bool = True, post_process: bool = True, *, seed: int, **kwargs
+    pre_process: bool = True,
+    post_process: bool = True,
+    *,
+    seed: int,
+    gated: Mapping[str, Mapping[str, Any]] | None = None,
+    **kwargs,
 ) -> LLaVAModel:
     """A tiny LLaVA: a GPT language model, a CLIP vision encoder and an MLP projection.
 
     All three use Transformer Engine layers with biases and no gated linear
-    unit, and every parameter holds distinct values (:func:`randomize_parameters`).
+    unit, except the parts ``gated`` gives configuration fields of their own
+    (``language``, ``vision``, ``projection``: e.g. a gated linear unit), and
+    every parameter holds distinct values (:func:`randomize_parameters`).
     """
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
-    language = _transformer_config(GPT_LAYERS, HYBRID_HIDDEN, HYBRID_HEADS, **kwargs)
+    own = {part: dict((gated or {}).get(part, {})) for part in ("language", "vision", "projection")}
+    language = _transformer_config(
+        GPT_LAYERS, HYBRID_HIDDEN, HYBRID_HEADS, **{**kwargs, **own["language"]}
+    )
     language.language_model_type = "dummy"
-    vision = _transformer_config(VISION_LAYERS, VISION_HIDDEN, 2, **kwargs)
+    vision = _transformer_config(VISION_LAYERS, VISION_HIDDEN, 2, **{**kwargs, **own["vision"]})
     vision.vision_model_type = "clip"
-    projection = _transformer_config(1, HYBRID_HIDDEN, 2, ffn_hidden_size=32, **kwargs)
+    projection = _transformer_config(
+        1, HYBRID_HIDDEN, 2, ffn_hidden_size=32, **{**kwargs, **own["projection"]}
+    )
     submodules = get_gpt_layer_with_transformer_engine_submodules()
     model = LLaVAModel(
         language_transformer_config=language,
@@ -417,9 +431,11 @@ def build_moe_gpt(
     grouped: bool,
     use_megatron_fsdp: bool = False,
     bf16: bool = True,
+    etp: int = 1,
     **config,
 ):
-    """A tiny MoE GPT (classic or Megatron-FSDP v1) with its optimizer, ``ep`` expert-parallel ranks."""
+    """A tiny MoE GPT (classic or Megatron-FSDP v1) with its optimizer, ``ep`` expert-parallel
+    and ``etp`` expert tensor-parallel ranks."""
     return setup_model_and_optimizer(
         seed=seed,
         tp=tp,
@@ -428,28 +444,39 @@ def build_moe_gpt(
         use_megatron_fsdp=use_megatron_fsdp,
         bf16=bf16,
         ep=ep,
+        etp=etp,
     )
 
 
-def build_te_gpt(seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True):
-    """A tiny GPT (Transformer Engine spec; classic or Megatron-FSDP v1) with its optimizer."""
+def build_te_gpt(
+    seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True, **config
+):
+    """A tiny GPT (Transformer Engine spec; classic or Megatron-FSDP v1) with its optimizer.
+
+    ``config`` adds TransformerConfig fields (e.g. a gated linear unit).
+    """
     return setup_model_and_optimizer(
         seed=seed,
         tp=tp,
         pp=1,
-        initialize_fn=te_gpt_provider,
+        initialize_fn=partial(te_gpt_provider, **config),
         use_megatron_fsdp=use_megatron_fsdp,
         bf16=bf16,
     )
 
 
-def build_llava(seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True):
-    """A tiny LLaVA (classic or Megatron-FSDP v1) with a distributed optimizer."""
+def build_llava(
+    seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True, **config
+):
+    """A tiny LLaVA (classic or Megatron-FSDP v1) with a distributed optimizer.
+
+    ``config`` goes to :func:`llava_provider` (e.g. ``gated``).
+    """
     return setup_model_and_optimizer(
         seed=seed,
         tp=tp,
         pp=1,
-        initialize_fn=llava_provider,
+        initialize_fn=partial(llava_provider, **config),
         use_megatron_fsdp=use_megatron_fsdp,
         bf16=bf16,
     )
@@ -581,11 +608,14 @@ def _convert(src: Path, dst: Path, to_format: str, **options) -> dict:
     ).to_json()
 
 
-def _verify(a: Path, b: Path, contract: str, *, jobs_differ: bool = False) -> list[str]:
+def _verify(
+    a: Path, b: Path, contract: str, *, jobs_differ: bool = False, mode: str = "full"
+) -> list[str]:
     ignored = [re.compile(rf"^args\.{name}$") for name in JOB_FIELDS] if jobs_differ else []
-    report = verify_checkpoint(
-        a, b, VerifyOptions(expected_diff=contract, ignore_keys=tuple(ignored))
+    options = VerifyOptions(
+        expected_diff=contract, ignore_keys=tuple(ignored), mode=CompareMode.parse(mode)
     )
+    report = verify_checkpoint(a, b, options)
     return [f"{f.kind.value} {f.key}: {f.detail}" for f in report.findings]
 
 
@@ -643,6 +673,7 @@ def run_chain(
     configure: Callable[..., None],
     per_layer: bool = False,
     buffers: bool = False,
+    options: Mapping[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     """The real-save chain through torch_dist -> fsdp_dtensor -> torch_dist, in ``root``.
 
@@ -671,6 +702,8 @@ def run_chain(
         per_layer: Also run step 6.
         buffers: Also require the persistent floating-point buffers of models
             B and C (and D) to equal A's, bit for bit in fp32, after their loads.
+        options: Conversion options of C1 (e.g. the pack sizes of a job at
+            another tensor-parallel size than 1).
 
     Returns:
         The findings of each check of :data:`CHAIN_CHECKS` (all empty when the
@@ -686,7 +719,7 @@ def run_chain(
         expected_buffers = persistent_buffers(model_a) if buffers else {}
         save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
         torch.distributed.barrier()
-        on_rank_zero(_convert, s1, c1, "fsdp_dtensor")
+        on_rank_zero(_convert, s1, c1, "fsdp_dtensor", **dict(options or {}))
 
         configure(args, fsdp=True, bf16=False)
         model_b, optimizer_b = build(3, use_megatron_fsdp=True, bf16=False)
@@ -718,6 +751,69 @@ def run_chain(
                 "S2 vs C1 (C)": _verify(s2, c1, "C", jobs_differ=True),
                 "C2 vs S3 (B)": _verify(c2, s3, "B"),
                 "S3 vs S1 (C)": _verify(s3, s1, "C", jobs_differ=True),
+                "back vs S1 (D)": _verify(back, s1, "D"),
+            }
+        )
+
+
+BF16_CHAIN_CHECKS = ("C1 vs S2 (A, keys)", "C2 vs S3 (B)", "back vs S1 (D)")
+"""The expected-difference checks of :func:`run_bf16_fsdp_chain`."""
+
+
+def run_bf16_fsdp_chain(
+    root: Path,
+    *,
+    tp: int,
+    build: Callable[..., tuple],
+    configure: Callable[..., None],
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, list[str]]:
+    """The real-save checks of :func:`run_chain` that a bf16 Megatron-FSDP job permits, in ``root``.
+
+    For models whose Megatron-FSDP state dicts only a bf16 (or fp16) job can
+    build (SwiGLU: ``handle_swiglu_in_state_dict`` resolves ``module.`` + key,
+    which misses an fp32 job's parameters, as it has no ``Float16Module``),
+    while a bf16 job cannot load a store without optimizer state:
+
+    1. S1: model A (classic, bf16) saved as torch_dist, model only;
+       C1 = convert(S1) to fsdp_dtensor.
+    2. S2: model B (Megatron-FSDP, bf16, other seed) saved as fsdp_dtensor.
+       C1 must hold S2's keys, shapes and dtypes (the values are B's).
+    3. C2 = convert(S2) to torch_dist; model C (classic, another seed) loads
+       it strictly, and its parameters equal B's; S3: C saved as torch_dist.
+    4. back = convert(C1) to torch_dist.
+
+    Returns:
+        The findings of each check of :data:`BF16_CHAIN_CHECKS` (all empty
+        when the chain holds).
+    """
+    s1, c1, s2, c2, s3, back = (root / name for name in ("s1", "c1", "s2", "c2", "s3", "back"))
+    with training_args(s1, tp=tp) as args:
+        configure(args, fsdp=False)
+        model_a, optimizer_a = build(2)
+        save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
+        torch.distributed.barrier()
+        on_rank_zero(_convert, s1, c1, "fsdp_dtensor", **dict(options or {}))
+
+        configure(args, fsdp=True)
+        model_b, optimizer_b = build(3, use_megatron_fsdp=True)
+        expected = full_params(model_b)
+        save_weights_only(model_b, optimizer_b, args, s2, iteration=ITERATION)
+        torch.distributed.barrier()
+        assert_one_module_level(s2)
+        on_rank_zero(_convert, s2, c2, "torch_dist")
+
+        configure(args, fsdp=False)
+        model_c, optimizer_c = build(4)
+        assert load_weights_only(model_c, optimizer_c, args, c2) == ITERATION
+        assert_params(full_params(model_c), expected, dtype=torch.bfloat16)
+        save_weights_only(model_c, optimizer_c, args, s3, iteration=ITERATION)
+        torch.distributed.barrier()
+        on_rank_zero(_convert, c1, back, "torch_dist")
+        return on_rank_zero(
+            lambda: {
+                "C1 vs S2 (A, keys)": _verify(c1, s2, "A", mode="meta"),
+                "C2 vs S3 (B)": _verify(c2, s3, "B"),
                 "back vs S1 (D)": _verify(back, s1, "D"),
             }
         )
