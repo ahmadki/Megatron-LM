@@ -20,7 +20,9 @@ it belongs to, its *dense* layer index in that block (the ``nn.ModuleList``
 position, whatever the stored index), the module path inside the layer and
 the leaf (parameter or buffer) name, and for a tensor of one routed expert its
 global expert index (``core/keys.py`` gives the one module path of an
-expert's linear layer for every way the formats name it).
+expert's linear layer for every way the formats name it). A tensor one format
+stores in parts (the SwiGLU halves of a gated ``linear_fc1`` that
+fsdp_dtensor splits) has one id per part, which names the part.
 """
 
 from __future__ import annotations
@@ -47,10 +49,12 @@ class LogicalId:
         leaf: Parameter or buffer name.
         expert: Global index of the routed expert the tensor belongs to
             (``None`` for every other tensor).
+        part: The part of the tensor this id names, for a tensor stored in
+            parts (``None``: the whole tensor).
 
     Raises:
         InternalError: Exactly one of ``block`` and ``layer`` is set, the
-            layer or expert index is negative, or the leaf is empty.
+            layer or expert index is negative, or the leaf or part is empty.
     """
 
     block: str | None
@@ -58,6 +62,7 @@ class LogicalId:
     path: str
     leaf: str
     expert: int | None = None
+    part: str | None = None
 
     def __post_init__(self) -> None:
         if (self.block is None) != (self.layer is None):
@@ -68,15 +73,26 @@ class LogicalId:
             raise InternalError(f"{self}: negative expert index")
         if not self.leaf:
             raise InternalError(f"logical id at {self.path!r} has no leaf")
+        if self.part == "":
+            raise InternalError(f"{self.path}.{self.leaf}: empty part name")
 
     @property
     def name(self) -> str:
         """``<path>.<leaf>`` (the name inside the layer, or from the model root)."""
         return join_leaf(self.path, self.leaf)
 
+    @property
+    def whole(self) -> LogicalId:
+        """The id of the whole tensor this id is a part of (itself if it names no part)."""
+        if self.part is None:
+            return self
+        return LogicalId(self.block, self.layer, self.path, self.leaf, self.expert)
+
     def __str__(self) -> str:
         where = self.name if self.block is None else f"{self.block}[{self.layer}].{self.name}"
-        return where if self.expert is None else f"{where}[expert {self.expert}]"
+        if self.expert is not None:
+            where += f"[expert {self.expert}]"
+        return where if self.part is None else f"{where}[part {self.part}]"
 
 
 @dataclass(frozen=True, slots=True)

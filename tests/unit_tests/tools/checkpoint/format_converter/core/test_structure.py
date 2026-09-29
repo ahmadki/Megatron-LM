@@ -312,3 +312,74 @@ def test_fsdp_names_each_expert_by_its_global_index(key, form):
 def test_malformed_fsdp_expert_names_are_grammar_errors(key):
     with pytest.raises(KeyGrammarError, match="fsdp_dtensor names routed-expert tensors"):
         decompose(key, entry(key), [STACKED], FSDP_DTENSOR)
+
+
+@pytest.mark.parametrize(
+    ("key", "lid", "form"),
+    [
+        (
+            "decoder.layers.1.mlp.linear_fc1.weight_w",
+            LogicalId("decoder", 1, "mlp.linear_fc1", "weight", None, "w"),
+            GROUPED,
+        ),
+        (
+            "decoder.layers.1.mlp.shared_experts.linear_fc1.bias_v",
+            LogicalId("decoder", 1, "mlp.shared_experts.linear_fc1", "bias", None, "v"),
+            GROUPED,
+        ),
+        (
+            "decoder.layers.1.mlp.experts.linear_fc1.weight3_v",
+            LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 3, "v"),
+            GROUPED,
+        ),
+        (
+            "decoder.layers.1.mlp.experts.local_experts.3.linear_fc1.bias_w",
+            LogicalId("decoder", 1, "mlp.experts.linear_fc1", "bias", 3, "w"),
+            SEQUENTIAL,
+        ),
+    ],
+)
+def test_an_fsdp_swiglu_half_is_a_part_of_its_fused_tensor(key, lid, form):
+    assert decompose_one(key, [STACKED], FSDP_DTENSOR) == lid
+    assert compose(lid, (4,), [STACKED], FSDP_DTENSOR, ExpertLayout(4, form)) == OutputSlice(
+        key, (4,), Region.full((4,))
+    )
+    assert lid.whole == LogicalId(lid.block, lid.layer, lid.path, lid.leaf, lid.expert)
+
+
+def test_a_torch_dist_swiglu_half_is_placed_at_its_rows_of_the_fused_tensor():
+    """``[W; V]``: the gate half at rows ``[0, F)``, the value half at ``[F, 2F)``."""
+    gate = LogicalId("decoder", 2, "mlp.linear_fc1", "weight", None, "w")
+    value = LogicalId("decoder", 2, "mlp.linear_fc1", "weight", None, "v")
+    key = "decoder.layers.mlp.linear_fc1.weight"
+    assert compose(gate, (6, 4), [STACKED], TORCH_DIST) == OutputSlice(
+        key, (3, 12, 4), Region((2, 0, 0), (1, 6, 4)), 1
+    )
+    placed = compose(value, (6, 4), [STACKED], TORCH_DIST)
+    assert placed == OutputSlice(key, (3, 12, 4), Region((2, 6, 0), (1, 6, 4)), 1)
+    assert placed.logical_box(Region((2, 8, 0), (1, 2, 4))) == Region((2, 0), (2, 4))
+    expert = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "bias", 3, "v")
+    assert compose(expert, (6,), [HYBRID], TORCH_DIST, FOUR_EXPERTS) == OutputSlice(
+        "decoder.layers.1.mlp.experts.experts.linear_fc1.bias", (4, 12), Region((3, 6), (1, 6)), 1
+    )
+
+
+def test_torch_dist_names_are_never_swiglu_halves():
+    """torch_dist stores gated linear_fc1 whole; ``_w`` there is only a leaf name."""
+    key = "decoder.layers.1.mlp.linear_fc1.weight_w"
+    assert decompose_one(key, [HYBRID], TORCH_DIST) == LogicalId(
+        "decoder", 1, "mlp.linear_fc1", "weight_w"
+    )
+
+
+@pytest.mark.parametrize(
+    "lid",
+    [
+        LogicalId("decoder", 1, "mlp.linear_fc1", "weight", None, "z"),
+        LogicalId("decoder", 1, "mlp.linear_fc2", "weight", None, "w"),
+    ],
+)
+@pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
+def test_composing_a_part_no_format_stores_is_a_bug(lid, fmt):
+    with pytest.raises(InternalError):
+        compose(lid, (4, 4), [HYBRID], fmt)

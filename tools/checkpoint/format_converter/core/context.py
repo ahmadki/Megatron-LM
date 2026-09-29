@@ -31,7 +31,7 @@ from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
-from .glu import GluLayout, glu_layout
+from .glu import GluLayout, glu_layout, swiglu_split
 from .keys import root_of
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
@@ -105,8 +105,8 @@ class ArchContext:
             stacks their layers.
         experts: How each format stores the model's routed experts (``None``
             without mixture-of-experts layers).
-        glu: The model's MLP first projections (``linear_fc1``) and which
-            are gated linear units.
+        glu: The model's MLP first projections (``linear_fc1``): which are
+            gated linear units, and which fsdp_dtensor stores as SwiGLU halves.
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -232,7 +232,10 @@ def build_arch_context(
     experts, evidence = expert_layout(args, model, source, expert_naming)
     log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
     glu, evidence = glu_layout(args, model, blocks, source, facts.lm_decoder)
-    log.append(Derivation("gated_fc1", glu.to_json(), evidence))
+    log.append(Derivation("gated_fc1", glu.gated_json(), evidence))
+    fsdp_swiglu = _fsdp_swiglu(args, direction, log)
+    glu, evidence = swiglu_split(glu, fsdp_swiglu, blocks, source, experts)
+    log.append(Derivation("swiglu_split", glu.split_json(), evidence))
     warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
         experts, model, source
     )
@@ -403,6 +406,18 @@ def _block_summary(block: BlockLayout) -> dict[str, Any]:
     summary = block.to_json()
     del summary["prefix"], summary["evidence"]
     return summary
+
+
+def _fsdp_swiglu(args: ArgsView, direction: str, log: list[Derivation]) -> bool:
+    """Whether the fsdp_dtensor side's job splits SwiGLU ``linear_fc1`` (its ``args.swiglu``).
+
+    The fsdp_dtensor target is written for a job with the source's arguments;
+    an fsdp_dtensor source was saved by a job with its own.
+    """
+    swiglu = bool(args.get("swiglu", False))
+    job = "loads the fsdp_dtensor target" if direction == TD_TO_FSDP else "saved the source"
+    log.append(Derivation("fsdp_swiglu", swiglu, f"args.swiglu={swiglu} of the job that {job}"))
+    return swiglu
 
 
 def _params_dtype(

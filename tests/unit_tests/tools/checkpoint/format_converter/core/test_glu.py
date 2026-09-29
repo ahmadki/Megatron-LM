@@ -12,9 +12,10 @@ import torch
 from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.blocks import BlockLayout
-from tools.checkpoint.format_converter.core.glu import glu_layout
+from tools.checkpoint.format_converter.core.experts import ExpertLayout
+from tools.checkpoint.format_converter.core.glu import glu_layout, swiglu_split
 from tools.checkpoint.format_converter.core.logical import LogicalId
-from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
+from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, GROUPED, TORCH_DIST
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 from tools.checkpoint.format_converter.errors import RefusedError
 
@@ -55,7 +56,7 @@ def test_a_stacked_swiglu_decoder_is_gated_layer_by_layer():
         fc1("decoder", layer, "mlp.linear_fc1"): ("decoder.layers.mlp.linear_fc1.weight", 12, True)
         for layer in (0, 1)
     }
-    assert layout.to_json() == {"decoder": {"gated": 2}}
+    assert layout.gated_json() == {"decoder": {"gated": 2}}
     assert evidence == (
         "2 linear_fc1 weights against their linear_fc2 inputs (gated: twice as many rows); "
         "args.swiglu=True, args.quick_geglu=False make the language model's MLPs (in decoder) gated"
@@ -73,7 +74,7 @@ def test_quick_geglu_gates_the_language_model_too():
         "decoder.layers.1.self_attention.linear_proj.weight": (H, H),
     }
     layout, _ = derive(shapes, [PER_LAYER], swiglu=False, quick_geglu=True)
-    assert layout.to_json() == {"decoder": {"gated": 1}}
+    assert layout.gated_json() == {"decoder": {"gated": 1}}
 
 
 def test_every_routed_expert_and_the_shared_experts_are_classified():
@@ -104,7 +105,7 @@ def test_a_torch_dist_expert_tensor_is_classified_per_expert():
         "decoder.layers.mlp.experts.experts.linear_fc2.weight": (2, 3, H, F),
     }
     layout, _ = derive(shapes, [STACKED], swiglu=True)
-    assert layout.to_json() == {"decoder": {"gated": 6}}
+    assert layout.gated_json() == {"decoder": {"gated": 6}}
     assert fc1("decoder", 1, "mlp.experts.linear_fc1", 2) in layout.fc1s
 
 
@@ -119,7 +120,7 @@ def test_a_vision_encoder_and_projection_have_configurations_of_their_own():
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     layout, _ = derive(shapes, [LANGUAGE, VISION], lm="language_model.decoder", swiglu=False)
-    assert layout.to_json() == {
+    assert layout.gated_json() == {
         "language_model.decoder": {"plain": 1},
         "vision_model.decoder": {"gated": 1},
         "vision_projection.encoder": {"gated": 1},
@@ -191,7 +192,166 @@ def test_a_linear_fc1_outside_every_layer_without_a_linear_fc2_is_a_plain_linear
     )
 
 
+def test_a_lone_linear_fc1_under_a_swiglu_name_is_refused_outside_layers_too():
+    """Megatron-FSDP splits a first projection outside every layer by its name alone: one under
+    a SwiGLU name with no linear_fc2 cannot be told gated or plain."""
+    shapes = {"encoder.mlp.linear_fc1.weight": (2 * F, H)}
+    with pytest.raises(RefusedError) as caught:
+        derive(shapes, [PER_LAYER], swiglu=True)
+    assert caught.value.refusal.code == errors.FC_R12
+    assert caught.value.refusal.keys == ("encoder.mlp.linear_fc1.weight",)
+
+
 def test_a_model_without_mlps_has_no_first_projections():
     shapes = {"decoder.layers.0.self_attention.linear_qkv.weight": (3 * H, H)}
     layout, evidence = derive(shapes, [PER_LAYER])
     assert layout.fc1s == {} and evidence.startswith("0 linear_fc1 weights")
+
+
+FOUR = ExpertLayout(4, GROUPED)
+MOE = {
+    **{f"decoder.layers.1.mlp.experts.linear_fc1.weight{e}": (2 * F, H) for e in range(4)},
+    **{f"decoder.layers.1.mlp.experts.linear_fc2.weight{e}": (H, F) for e in range(4)},
+    "decoder.layers.1.mlp.shared_experts.linear_fc1.weight": (2 * S, H),
+    "decoder.layers.1.mlp.shared_experts.linear_fc2.weight": (H, S),
+    "decoder.layers.0.mlp.linear_fc1.weight": (2 * F, H),
+    "decoder.layers.0.mlp.linear_fc2.weight": (H, F),
+}
+"""A dense SwiGLU layer and a SwiGLU MoE layer with shared experts, one tensor per expert."""
+MOE_TD = {
+    "decoder.layers.1.mlp.experts.experts.linear_fc1.weight": (4, 2 * F, H),
+    "decoder.layers.1.mlp.experts.experts.linear_fc2.weight": (4, H, F),
+    **{k: v for k, v in MOE.items() if ".mlp.experts." not in k},
+}
+"""The same model as torch_dist stores it (every expert in one tensor)."""
+
+
+def split(shapes, blocks, *, fsdp_swiglu, source=TORCH_DIST, lm="decoder", experts=None, **args):
+    layout, _ = derive(shapes, blocks, source=source, lm=lm, **args)
+    return swiglu_split(layout, fsdp_swiglu, blocks, source, experts)
+
+
+def test_the_split_predicate_on_a_torch_dist_source():
+    layout, evidence = split(MOE_TD, [PER_LAYER], fsdp_swiglu=True, experts=FOUR, swiglu=True)
+    assert {str(lid): fc1.split for lid, fc1 in layout.fc1s.items()} == {
+        "decoder[0].mlp.linear_fc1.weight": True,
+        **{f"decoder[1].mlp.experts.linear_fc1.weight[expert {e}]": True for e in range(4)},
+        "decoder[1].mlp.shared_experts.linear_fc1.weight": True,
+    }
+    assert layout.split_json() == {"decoder": {"split": 6}}
+    assert evidence.endswith(": 6 split, 0 gated kept fused")
+    kept, _ = split(MOE_TD, [PER_LAYER], fsdp_swiglu=False, experts=FOUR, quick_geglu=True)
+    assert kept.split_json() == {"decoder": {"fused": 6}}
+
+
+def test_only_the_swiglu_names_of_gated_layers_are_split():
+    """A gated projection's ``encoder.linear_fc1`` is no SwiGLU name; a plain vision encoder's
+    layers are not gated; an MLP outside every layer has no owner and is split."""
+    shapes = {
+        "language_model.decoder.layers.0.mlp.linear_fc1.weight": (2 * F, H),
+        "language_model.decoder.layers.0.mlp.linear_fc2.weight": (H, F),
+        "vision_model.decoder.layers.0.mlp.linear_fc1.weight": (S, H),
+        "vision_model.decoder.layers.0.mlp.linear_fc2.weight": (H, S),
+        "vision_projection.encoder.linear_fc1.weight": (2 * H, S),
+        "vision_projection.encoder.linear_fc2.weight": (H, H),
+        "vision_projection.head.mlp.linear_fc1.weight": (S, H),
+        "vision_projection.head.mlp.linear_fc2.weight": (H, S),
+    }
+    layout, _ = split(
+        shapes, [LANGUAGE, VISION], fsdp_swiglu=True, lm="language_model.decoder", swiglu=True
+    )
+    assert {str(lid): (fc1.gated, fc1.split) for lid, fc1 in layout.fc1s.items()} == {
+        "language_model.decoder[0].mlp.linear_fc1.weight": (True, True),
+        "vision_model.decoder[0].mlp.linear_fc1.weight": (False, False),
+        "vision_projection.encoder.linear_fc1.weight": (True, False),
+        "vision_projection.head.mlp.linear_fc1.weight": (False, True),
+    }
+    assert layout.split_json() == {
+        "language_model.decoder": {"split": 1},
+        "vision_projection.encoder": {"fused": 1},
+        "vision_projection.head.mlp": {"split": 1},
+    }
+
+
+def test_an_odd_first_projection_to_split_is_refused():
+    shapes = {"head.mlp.linear_fc1.weight": (5, H), "head.mlp.linear_fc2.weight": (H, 5)}
+    with pytest.raises(RefusedError) as caught:
+        split(shapes, [PER_LAYER], fsdp_swiglu=True)
+    assert caught.value.refusal.code == errors.FC_R12
+    assert "has 5 rows" in caught.value.refusal.message
+
+
+def halves(shapes: dict[str, tuple[int, ...]]) -> dict[str, tuple[int, ...]]:
+    """``shapes`` with every gated linear_fc1 weight and bias stored as SwiGLU halves."""
+    stored = {}
+    for key, shape in shapes.items():
+        if "linear_fc1" in key and key.rsplit(".", 1)[1].startswith(("weight", "bias")):
+            half = (shape[0] // 2, *shape[1:])
+            stored[f"{key}_w"], stored[f"{key}_v"] = half, half
+        else:
+            stored[key] = shape
+    return stored
+
+
+def test_an_fsdp_source_stores_what_the_predicate_says():
+    stored = halves(MOE)
+    layout, _ = split(
+        stored, [PER_LAYER], fsdp_swiglu=True, source=FSDP_DTENSOR, experts=FOUR, swiglu=True
+    )
+    assert all(fc1.halves and fc1.split for fc1 in layout.fc1s.values())
+    expert = layout.of(LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 3, "v"))
+    assert (expert.key, expert.rows, expert.gated, expert.halves, expert.split) == (
+        "decoder.layers.1.mlp.experts.linear_fc1.weight3_w",
+        2 * F,
+        True,
+        True,
+        True,
+    )
+    with pytest.raises(RefusedError) as caught:
+        split(
+            stored,
+            [PER_LAYER],
+            fsdp_swiglu=False,
+            source=FSDP_DTENSOR,
+            experts=FOUR,
+            quick_geglu=True,
+        )
+    assert caught.value.refusal.code == errors.FC_R12
+    assert caught.value.refusal.message.startswith(
+        "the store holds SwiGLU halves that Megatron-FSDP does not write"
+    )
+    with pytest.raises(RefusedError) as caught:
+        split(MOE, [PER_LAYER], fsdp_swiglu=True, source=FSDP_DTENSOR, experts=FOUR, swiglu=True)
+    assert caught.value.refusal.message.startswith(
+        "the store holds gated linear_fc1 whole that Megatron-FSDP splits into SwiGLU halves"
+    )
+    assert len(caught.value.refusal.keys) == 6
+
+
+GATE = "decoder.layers.0.mlp.linear_fc1.weight"
+DENSE = {GATE: (2 * F, H), "decoder.layers.0.mlp.linear_fc2.weight": (H, F)}
+
+
+@pytest.mark.parametrize(
+    ("stored", "code", "message"),
+    [
+        ({f"{GATE}_w": (F, H)}, errors.FC_R20, "half w (6, 8)"),
+        ({f"{GATE}_w": (F, H), f"{GATE}_v": (F - 1, H)}, errors.FC_R20, "half v (5, 8)"),
+        ({GATE: (2 * F, H), f"{GATE}_v": (F, H)}, errors.FC_R20, "the whole tensor (12, 8)"),
+        (
+            {
+                f"{GATE}_w": (F, H),
+                f"{GATE}_v": (F, H),
+                "decoder.layers.0.mlp.linear_fc1.bias": (2 * F,),
+            },
+            errors.FC_R12,
+            "and its bias are not both stored as SwiGLU halves",
+        ),
+    ],
+)
+def test_swiglu_halves_come_in_pairs_that_replace_the_whole_tensor(stored, code, message):
+    shapes = {**{k: v for k, v in DENSE.items() if k != GATE}, **stored}
+    with pytest.raises(RefusedError) as caught:
+        derive(shapes, [PER_LAYER], source=FSDP_DTENSOR, swiglu=True)
+    assert caught.value.refusal.code == code
+    assert message in caught.value.refusal.message

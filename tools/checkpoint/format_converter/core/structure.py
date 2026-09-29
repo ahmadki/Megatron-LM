@@ -10,12 +10,15 @@ index axes, each giving one logical tensor per index: a torch_dist key
 stacked over the layers of a block has a layer axis, and a torch_dist
 routed-expert tensor an expert axis after it, so ``[L, E, ...]`` becomes one
 slice per (layer, expert), ``[l:l+1, e:e+1, ...]``, whose logical tensor has
-one expert's shape. Keys outside every block keep their path.
-:func:`compose` is the inverse for the target format: it places each layer of
-a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the stacked
-tensor ``<block>.layers.<name>``, and each expert at its index of the expert
-axis (fsdp_dtensor names each expert's tensor in the model's expert
-naming instead).
+one expert's shape. Keys outside every block keep their path. An fsdp_dtensor
+SwiGLU half (``linear_fc1.weight_w``) is the id of that part of the fused
+tensor. :func:`compose` is the inverse for the target format: it places each
+layer of a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the
+stacked tensor ``<block>.layers.<name>``, and each expert at its index of the
+expert axis (fsdp_dtensor names each expert's tensor in the model's expert
+naming instead). A SwiGLU half is a tensor of its own in fsdp_dtensor, and in
+torch_dist its rows of the fused ``linear_fc1`` tensor, ``[W; V]`` (the gate
+half first, as Megatron's SwiGLU factory saves it).
 """
 
 from __future__ import annotations
@@ -28,14 +31,18 @@ from ..errors import InternalError
 from .blocks import BlockLayout
 from .experts import ExpertLayout
 from .keys import (
+    GLU_PARTS,
     ExpertName,
     KeyGrammarError,
     LayerKey,
     attribute_layer_key,
+    is_fc1_path,
     join_fsdp_expert,
+    join_glu_half,
     join_layer_key,
     join_torch_dist_expert,
     split_expert_name,
+    split_glu_half,
     split_leaf,
 )
 from .logical import LogicalId, LogicalSlice, OutputSlice
@@ -75,6 +82,7 @@ def decompose(
     layer_key = attribute_layer_key(relative, by_prefix)
     block = None if layer_key is None else by_prefix[layer_key.block]
     name = relative if layer_key is None else layer_key.inner
+    name, part = (name, None) if fmt == TORCH_DIST else split_glu_half(name)
     expert = split_expert_name(name, fmt)
     path, leaf = (expert.path, expert.leaf) if expert is not None else split_leaf(name)
     layers = _layer_axis(relative, entry, block, layer_key, fmt)
@@ -85,7 +93,7 @@ def decompose(
     prefix = None if block is None else block.prefix
     return [
         LogicalSlice(
-            LogicalId(prefix, layer, path, leaf, index),
+            LogicalId(prefix, layer, path, leaf, index, part),
             entry.key,
             Region(
                 tuple(p for p in (layer_at, index_at) if p is not None) + (0,) * len(rest),
@@ -158,13 +166,16 @@ def compose(
         of a tensor with leading index axes: ``[l:l+1, ...]`` of a tensor
         stacked over the layers of a block that torch_dist stores stacked
         (``l`` its torch_dist index), and ``[..., e:e+1, ...]`` of a torch_dist
-        routed-expert tensor.
+        routed-expert tensor; a torch_dist SwiGLU half is further the box of
+        its rows of the fused tensor.
 
     Raises:
-        InternalError: ``lid`` names a block that is not in ``blocks``, or a
-            routed expert that ``experts`` does not place.
+        InternalError: ``lid`` names a block that is not in ``blocks``, a
+            routed expert that ``experts`` does not place, or a part that is
+            not a SwiGLU half of a ``linear_fc1``.
     """
     name, expert_axis = _output_name(lid, fmt, experts)
+    tensor_shape, offsets = _part_box(lid, shape, fmt)
     leading: list[tuple[int, int]] = []  # (index, axis length) of each leading axis
     if lid.block is None or lid.layer is None:
         key = name
@@ -181,12 +192,25 @@ def compose(
         leading.append(expert_axis)
     return OutputSlice(
         key,
-        tuple(length for _, length in leading) + shape,
-        Region(
-            tuple(index for index, _ in leading) + (0,) * len(shape), (1,) * len(leading) + shape
-        ),
+        tuple(length for _, length in leading) + tensor_shape,
+        Region(tuple(index for index, _ in leading) + offsets, (1,) * len(leading) + shape),
         squeezed=len(leading),
     )
+
+
+def _part_box(
+    lid: LogicalId, shape: tuple[int, ...], fmt: str
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """The shape of the tensor (after its leading index axes) that holds ``lid``, and the offsets
+    of ``lid``'s box in it: the tensor itself, or for a SwiGLU half in torch_dist, its rows of the
+    fused tensor."""
+    if lid.part is not None and (lid.part not in GLU_PARTS or not is_fc1_path(lid.path)):
+        raise InternalError(f"{lid}: no format stores part {lid.part!r} of this tensor")
+    if lid.part is None or fmt != TORCH_DIST:
+        return shape, (0,) * len(shape)
+    rows = shape[0]
+    fused = (len(GLU_PARTS) * rows,) + shape[1:]
+    return fused, (GLU_PARTS.index(lid.part) * rows,) + (0,) * (len(shape) - 1)
 
 
 def _output_name(
@@ -198,9 +222,14 @@ def _output_name(
     expert's tensor that ``fmt`` stores in one tensor with the others.
     """
     if lid.expert is None:
-        return lid.name, None
-    if experts is None or lid.expert >= experts.num_experts:
+        name, axis = lid.name, None
+    elif experts is None or lid.expert >= experts.num_experts:
         raise InternalError(f"{lid} is not an expert of the model's expert layout {experts}")
-    if fmt == TORCH_DIST:
-        return join_torch_dist_expert(lid.path, lid.leaf), (lid.expert, experts.num_experts)
-    return join_fsdp_expert(lid.path, lid.leaf, lid.expert, experts.fsdp_form), None
+    elif fmt == TORCH_DIST:
+        name = join_torch_dist_expert(lid.path, lid.leaf)
+        axis = (lid.expert, experts.num_experts)
+    else:
+        name, axis = join_fsdp_expert(lid.path, lid.leaf, lid.expert, experts.fsdp_form), None
+    if lid.part is not None and fmt != TORCH_DIST:
+        name = join_glu_half(name, lid.part)
+    return name, axis

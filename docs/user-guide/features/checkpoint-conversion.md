@@ -70,7 +70,7 @@ with a pending-family code:
 |---|---|
 | `FC-P04` | shortcut-MoE layer numbering and hybrid multi-token prediction |
 | `FC-P05` | Gated DeltaProduct mixers |
-| `FC-P06`, `FC-P07` | gated `linear_fc1` (SwiGLU), kept fused or split into halves |
+| `FC-P06` | gated `linear_fc1` that `fsdp_dtensor` keeps fused (not split into SwiGLU halves) |
 | `FC-P08` | Mamba-2 mixers |
 | `FC-P09` | Gated DeltaNet and linear attention |
 | `FC-P10` | GPT multi-token prediction and multi-latent attention |
@@ -250,9 +250,9 @@ Refused as well: single grouped expert parameters
 (`--moe-single-grouped-weight`, `--moe-single-grouped-bias`, which
 Megatron-FSDP does not support; `FC-R04`), the legacy `GroupedMLP`
 (`weight1`/`weight2`; `FC-R13`) and checkpoints saved with
-`singleton_local_shards` (`FC-R17`). Gated experts (SwiGLU) are pending
-(`FC-P06`, `FC-P07`), and so are shortcut-connected mixture-of-experts layers
-(`FC-P04`).
+`singleton_local_shards` (`FC-R17`). Gated experts that `fsdp_dtensor` keeps
+fused are pending (`FC-P06`), and so are shortcut-connected mixture-of-experts
+layers (`FC-P04`).
 
 ### Vision-language models
 
@@ -356,10 +356,10 @@ condition of every code.
 | `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), layers that differ where they would be stacked, or gated MLPs that contradict the arguments (`--swiglu`, `--quick-geglu`) or one another |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
 | `FC-R14` | the legacy N-D reformulated layout (load with current Megatron and save again) |
-| `FC-R17` | a store saved with `singleton_local_shards` |
+| `FC-R17` | a store saved with `singleton_local_shards` (its `content_metadata` says so, or its keys show it: experts saved one key per expert, gated `linear_fc1` saved as SwiGLU halves) |
 | `FC-R18` | a ModelOpt state |
 | `FC-R19` | an `fsdp_dtensor` store with split fused-projection keys |
-| `FC-R20` | hybrid layer symbols or attention variants no rule is verified for |
+| `FC-R20` | hybrid layer symbols or attention variants no rule is verified for, or a SwiGLU half without its pair |
 | `FC-A02` | a layer list of unknown kind converted to `torch_dist` (`--block-layout`) |
 | `FC-A04` | an `fsdp_dtensor` source names its routed experts otherwise than its arguments build them (`--expert-naming`) |
 | `FC-A05` | `--from` disagrees with the detected format |
@@ -388,7 +388,7 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** SwiGLU, state-space mixers, Gated DeltaNet,
+- **Pending families.** Gated MLPs that `fsdp_dtensor` keeps fused, state-space mixers, Gated DeltaNet,
   multi-token prediction, multi-latent attention and shortcut-connected
   mixture-of-experts layers are refused until the versions that add them
   (see the [Support Matrix](#support-matrix)).

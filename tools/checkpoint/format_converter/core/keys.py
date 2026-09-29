@@ -43,6 +43,11 @@ the global one (``handle_experts_in_state_dict``): *grouped*
 :class:`ExpertName` names such a tensor by the module path
 ``<...>.mlp.experts.linear_fc<n>`` (and one expert of it by its global index),
 whatever the format.
+
+Megatron-FSDP may store the weight and bias of a gated MLP's ``linear_fc1``
+as two SwiGLU halves, ``<name>_w`` and ``<name>_v`` (``linear_fc1.weight<e>_w``
+for a grouped expert): :func:`split_glu_half` names the whole tensor and the
+half, and :data:`SWIGLU_KEYS` are the names it splits.
 """
 
 from __future__ import annotations
@@ -341,7 +346,8 @@ FACTORY_PART = re.compile(r"\.(?:weight|bias)\.[A-Za-z_][A-Za-z0-9_]*$")
 """A torch_dist factory sub-key: one part of a parameter stored as parts (``in_proj.weight.z``)."""
 
 GLU_HALF = re.compile(r"\.(?:weight|bias)[0-9]*_[wv]$")
-"""An fsdp_dtensor SwiGLU half of ``linear_fc1`` (``weight_w``, ``weight3_v``, ``bias_w``)."""
+"""A SwiGLU half of ``linear_fc1`` (``weight_w``, ``weight3_v``, ``bias_w``): as Megatron-FSDP
+splits it, or as a torch_dist save with ``singleton_local_shards`` names it."""
 
 FUSED_MIXER = re.compile(
     r"\.(?:mixer|self_attention)\."
@@ -394,14 +400,70 @@ FC1 = "linear_fc1"
 FC2 = "linear_fc2"
 """An MLP's second projection, whose inputs are the first projection's (value) outputs."""
 
-LINEAR_FC_WEIGHT = re.compile(r"(?:^|\.)linear_fc[12]\.weight(?:0|[1-9][0-9]*)?$")
-"""The weight of an MLP's first or second projection: ``linear_fc<n>.weight``, or one expert's
-``linear_fc<n>.weight<e>`` of a grouped experts module in fsdp_dtensor."""
+LINEAR_FC = re.compile(
+    r"(?:^|\.)(?:linear_fc1\.(?:weight|bias)(?:0|[1-9][0-9]*)?(?:_[wv])?"
+    r"|linear_fc2\.weight(?:0|[1-9][0-9]*)?)$"
+)
+"""An MLP's first projection's weight or bias (``linear_fc1.<leaf>``, one expert's
+``linear_fc1.<leaf><e>`` of a grouped experts module in fsdp_dtensor, and their SwiGLU halves
+``_w``/``_v``) or its second projection's weight."""
+
+GLU_PARTS = ("w", "v")
+"""The gate and value halves of a gated ``linear_fc1``, in their order along its first axis."""
+
+_GLU_HALF_NAME = re.compile(
+    r"(?P<tensor>(?:.+\.)?linear_fc1\.(?:weight|bias)(?:0|[1-9][0-9]*)?)_(?P<part>[wv])"
+)
+
+SWIGLU_KEYS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"(.*)\.mlp\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.linear_fc1\.bias$",
+        r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)$",
+        r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)$",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias$",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight$",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias$",
+    )
+)
+"""The ``linear_fc1`` names Megatron-FSDP splits into SwiGLU halves (``is_swiglu_key`` of
+``handle_swiglu_in_state_dict``), searched in the model's state-dict names (fsdp_dtensor model
+keys without ``model.module.``): of dense MLPs, grouped or sequential experts, shared experts."""
 
 
 def is_fc1_path(path: str) -> bool:
     """Whether ``path`` is the module path of an MLP's first projection (``<...>.linear_fc1``)."""
     return path == FC1 or path.endswith(f".{FC1}")
+
+
+def is_swiglu_key(name: str) -> bool:
+    """Whether Megatron-FSDP splits the tensor it stores as ``name`` into SwiGLU halves (if its
+    layer is gated; see :data:`SWIGLU_KEYS`)."""
+    return any(pattern.search(name) is not None for pattern in SWIGLU_KEYS)
+
+
+def split_glu_half(name: str) -> tuple[str, str | None]:
+    """The fused tensor and the half of an fsdp_dtensor SwiGLU half, e.g. ``linear_fc1.weight3_v``.
+
+    Returns:
+        ``(<...>.linear_fc1.<leaf>[<e>], "w" or "v")`` for a half, ``(name, None)`` for any other
+        name.
+    """
+    match = _GLU_HALF_NAME.fullmatch(name)
+    return (name, None) if match is None else (match.group("tensor"), match.group("part"))
+
+
+def join_glu_half(name: str, part: str) -> str:
+    """The fsdp_dtensor name of half ``part`` of the fused ``linear_fc1`` tensor ``name``.
+
+    Raises:
+        InternalError: ``part`` is not a SwiGLU half.
+    """
+    if part not in GLU_PARTS:
+        raise InternalError(f"{part!r} is not a SwiGLU half of {name}")
+    return f"{name}_{part}"
 
 
 def fc2_path_of(fc1_path: str) -> str:

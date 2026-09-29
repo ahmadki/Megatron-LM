@@ -200,7 +200,7 @@ refusal fence: a model part no rule is verified for is refused with an `FC-R`
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
 from attention (`*`), MLP (`-`) and mixture-of-experts (`E`) layers, and GPT
 models (no hybrid pattern; `TransformerBlock` layers of attention and a dense
-MLP or mixture-of-experts layer whose experts are not gated), in both
+MLP or mixture-of-experts layer), with SwiGLU MLPs or plain ones, in both
 directions, with a single model root (`embedding`, `decoder`, `output_layer`)
 or as the language model of a vision-language model (LLaVA layout:
 `language_model.`, `vision_model.` with a `TransformerBlock` encoder
@@ -285,6 +285,22 @@ refused (`FC-R13`) unless `--allow-root PREFIX` converts them unchanged.
   has that length, and every `fsdp_dtensor` expert tensor is stored for
   exactly the experts `0..E-1` (`FC-R12` for indices that are not contiguous
   from 0, `FC-R13` for another number).
+* **SwiGLU.** A gated MLP's `linear_fc1` (`--swiglu`, or GEGLU with
+  `--quick-geglu`) holds the gate `W` and value `V` projections, twice the
+  rows its `linear_fc2` has inputs; every first projection is classified from
+  these shapes, per layer and per routed expert (the MLPs of a layer agree,
+  and the language model is gated iff `swiglu` or `quick_geglu` is set;
+  `FC-R12` otherwise). `torch_dist` stores it whole, `[W; V]`, each half
+  saved as chunks of its own (one per tensor-parallel rank). Megatron-FSDP splits it into `<name>_w` and `<name>_v`, both
+  TP-canonical, exactly where `handle_swiglu_in_state_dict` does: with
+  `args.swiglu`, for the `linear_fc1` of dense MLPs, shared experts and
+  routed experts (`linear_fc1.weight<e>_w`, `local_experts.<e>.linear_fc1.weight_w`
+  under the global index), in a gated layer. Converting to `fsdp_dtensor`
+  splits them, and converting back writes each half as its rows of the whole
+  tensor, one chunk per half. An `fsdp_dtensor` source must be split exactly
+  so (`FC-R12`), with every half paired (`FC-R20`). Gated `linear_fc1` that
+  Megatron-FSDP keeps fused (without `--swiglu`, or a vision projection's
+  `encoder.linear_fc1`) are pending (`FC-P06`).
 * **Values and dtypes.** Every tensor is copied bit for bit with its dtype:
   Megatron's loaders cast on load, so bfloat16 weights load exactly into
   Megatron-FSDP's fp32 main weights, and the fp32 main weights of an
@@ -469,17 +485,16 @@ arguments and the model keys before any tensor is read.
 | `FC-R07` | an `fsdp_dtensor` source of an FP8 delayed-scaling model converted to `torch_dist`, whose loader needs the scaling state (`--allow-missing-fp8-extra-state` writes the store without it) |
 | `FC-R10` | a tensor packed per tensor-parallel rank (rank-major) cannot be laid out: a part of the fused tensor does not divide by the tensor-parallel size it is packed at |
 | `FC-R11` | the layer indices a store holds contradict the hybrid layer pattern (or `args.num_layers`); the message lists the expected and stored indices |
-| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`); or an `fsdp_dtensor` expert tensor is stored for expert indices that are not `0..n-1` (such as `0-1, 3`); or gated linear units contradict one another or the arguments: the `linear_fc1` weights of one layer are both gated (twice the rows `linear_fc2` has inputs) and plain, the language model's are gated while neither `swiglu` nor `quick_geglu` is set or plain while one is, or a `linear_fc1` in a layer has no `linear_fc2` beside it (one outside every layer, such as a vision encoder's patch merger, is a plain linear layer and converts unchanged) |
-| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`) or under both single-model and vision-language roots, model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts, SwiGLU halves or a fused mixer projection, and the pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor`, parameters of the legacy `GroupedMLP` (`<...>.mlp.experts.weight1`/`weight2`: every local expert in one tensor), routed-expert tensors while `args.num_experts` is unset, or expert tensors of another number of experts than `args.num_experts` |
+| `FC-R12` | a block's layers are stored inconsistently: tensors stacked over its layers disagree on the number of layers (or it contradicts `args.num_layers`, or `args.decoder_num_layers` of a vision-language model, for the decoder), a block holds both stacked and per-layer keys, per-layer indices are not `0..L-1`, an `fsdp_dtensor` store or a hybrid decoder holds stacked tensors; or layers that differ would be stacked (the arguments make Megatron stack the decoder or the vision encoder, or `--block-layout PREFIX=stacked`); or an `fsdp_dtensor` expert tensor is stored for expert indices that are not `0..n-1` (such as `0-1, 3`); or gated linear units contradict one another or the arguments: the `linear_fc1` weights of one layer are both gated (twice the rows `linear_fc2` has inputs) and plain, the language model's are gated while neither `swiglu` nor `quick_geglu` is set or plain while one is, or a `linear_fc1` has no `linear_fc2` beside it (one outside every layer under a name Megatron-FSDP never splits, such as a vision encoder's patch merger's, is a plain linear layer and converts unchanged); or an `fsdp_dtensor` store splits a `linear_fc1` into SwiGLU halves where Megatron-FSDP keeps it whole or the other way round, or splits its weight but not its bias |
+| `FC-R13` | unknown layout: another `sharded_backend`, no format markers (unless `--from`), mixed model prefixes, `model.module.module.` keys, a legacy `mp_rank_*` checkpoint, an unknown byte item, an unknown common-state key, model keys under an unknown top-level module (`--allow-root`) or under both single-model and vision-language roots, model keys that do not fit the key grammar or the layer layout, model tensors no rule handles (the message names the reason, e.g. a parameter stored as parts or a fused mixer projection, and the rule or pending code that owns it), `bf16` and `fp16` both set, a `content_metadata` the conversion manifest cannot record (`--drop-common-key content_metadata`), a common state without `args`, `iteration` or `checkpoint_version` converted to `fsdp_dtensor`, parameters of the legacy `GroupedMLP` (`<...>.mlp.experts.weight1`/`weight2`: every local expert in one tensor), routed-expert tensors while `args.num_experts` is unset, or expert tensors of another number of experts than `args.num_experts` |
 | `FC-R14` | model tensors stored in the legacy N-D reformulated layout (`mcore_data`); load with current Megatron and save again |
-| `FC-R17` | a store saved with `singleton_local_shards` (its `content_metadata` says so, or its experts are saved one key per expert, `<...>.mlp.experts.experts.<e>.<name>`) |
+| `FC-R17` | a store saved with `singleton_local_shards` (its `content_metadata` says so, or its experts are saved one key per expert, `<...>.mlp.experts.experts.<e>.<name>`, or its gated `linear_fc1` as SwiGLU halves `<key>_w`/`<key>_v`) |
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
-| `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones |
+| `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones; or an `fsdp_dtensor` SwiGLU half (`linear_fc1.weight_w`) without its pair, of another shape than its pair, or stored beside the whole tensor |
 | `FC-P04` | pending: shortcut-MoE layer numbering (`moe_shortcut_connection`) and hybrid multi-token prediction (`/` in the pattern) |
 | `FC-P05` | pending: Gated DeltaProduct mixers (its spec or its `in_proj`/`conv1d` parts) |
-| `FC-P06` | pending: gated `linear_fc1` that `fsdp_dtensor` keeps fused (`swiglu` off) |
-| `FC-P07` | pending: `linear_fc1` split into SwiGLU halves (`swiglu` on) |
+| `FC-P06` | pending: gated `linear_fc1` that `fsdp_dtensor` keeps fused: without `swiglu` (e.g. `quick_geglu`), or under a name Megatron-FSDP does not split (a vision-language projection's `encoder.linear_fc1`) |
 | `FC-P08` | pending: Mamba-2 mixers (symbol `M` without the Gated DeltaProduct spec) |
 | `FC-P09` | pending: Gated DeltaNet and linear attention (symbol `G`, a Gated DeltaNet `experimental_attention_variant`) |
 | `FC-P10` | pending: GPT multi-token prediction and multi-latent attention (symbol `+`) |
@@ -705,8 +720,12 @@ only (`core/`, `rules/`):
   of every consumed source tensor exactly once, tile every piece and every
   output tensor, and write each key once.
 
-This version has one rule, `identity` (tensors stored the same way in both
-formats), and two kinds of blocks. The blocks a store holds are found from its
+This version has two rules, `glu` (the weight and bias of a gated
+`linear_fc1` that `fsdp_dtensor` stores as SwiGLU halves: each half is an
+output of its own, a `LogicalId` with `part` `w` or `v`, which `fsdp_dtensor`
+names `<name>_w`/`<name>_v` and `torch_dist` places at its rows of the whole
+tensor) and `identity` (tensors stored the same way in both formats), and two
+kinds of blocks. The blocks a store holds are found from its
 keys (each key's innermost layer list), and the model's roots from the keys'
 top-level modules: the language model's decoder is `decoder`, or
 `language_model.decoder` in a vision-language model. The registered block

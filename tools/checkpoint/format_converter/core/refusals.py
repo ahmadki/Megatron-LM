@@ -52,8 +52,12 @@ from .keys import (
     SINGLETON_EXPERT_SHARD,
     TE_OP_FUSER_MLP,
     TORCH_DIST_EXPERT_BIAS,
+    KeyGrammarError,
     fc2_weight_of,
+    is_swiglu_key,
+    join_fsdp_expert,
     root_of,
+    split_torch_dist_expert,
 )
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
@@ -61,8 +65,7 @@ from .registry import REGISTRY, Allowlist, Sentinel
 PENDING_FAMILIES: Mapping[str, str] = {
     errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
-    errors.FC_P06: "gated linear_fc1 that fsdp_dtensor keeps fused (args.swiglu off)",
-    errors.FC_P07: "linear_fc1 split into SwiGLU halves (args.swiglu on)",
+    errors.FC_P06: "gated linear_fc1 that fsdp_dtensor keeps fused",
     errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
     errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
@@ -134,7 +137,7 @@ REGISTRY.sentinel(
         "swiglu_halves",
         FSDP_DTENSOR,
         GLU_HALF,
-        (errors.FC_P07,),
+        ("glu",),
         "SwiGLU halves must be merged back into linear_fc1 by the GLU rule",
     )
 )
@@ -493,17 +496,26 @@ def singleton_local_shards_refusal(
     Args:
         content_metadata: The checkpoint's ``content_metadata``, whose flag says so.
         keys: Model keys in the singleton form (experts saved as
-            ``experts.experts.<e>.<name>``), which say so too.
+            ``experts.experts.<e>.<name>``, gated ``linear_fc1`` saved as
+            SwiGLU halves ``<key>_w``/``<key>_v``), which say so too.
     """
     flagged = isinstance(content_metadata, Mapping) and bool(
         content_metadata.get(SINGLETON_LOCAL_SHARDS)
     )
     if not flagged and not keys:
         return None
+    forms = [
+        form
+        for pattern, form in (
+            (SINGLETON_EXPERT_SHARD, "its experts are saved one key per expert"),
+            (GLU_HALF, "its gated linear_fc1 are saved as SwiGLU halves <key>_w and <key>_v"),
+        )
+        if any(pattern.search(key) for key in keys)
+    ]
     return Refusal(
         errors.FC_R17,
         f"the checkpoint was saved with {SINGLETON_LOCAL_SHARDS}, which this tool does not read"
-        + ("" if flagged else " (its experts are saved one key per expert)"),
+        + ("" if flagged else f" ({'; '.join(forms)})"),
         keys=(("content_metadata",) if flagged else ()) + keys,
         hint="load it with current Megatron and save it again without that option",
     )
@@ -511,12 +523,14 @@ def singleton_local_shards_refusal(
 
 @REGISTRY.detector
 def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
-    """FC-R17: a torch_dist source saved with ``singleton_local_shards``."""
+    """FC-R17: a torch_dist source saved with ``singleton_local_shards``, as its
+    ``content_metadata`` says or keys only that option writes show: experts saved one key per
+    expert, or gated ``linear_fc1`` saved as SwiGLU halves (Megatron's SwiGLU factory names them
+    ``<key>_w``/``<key>_v`` only then; torch_dist otherwise stores them whole)."""
     if facts.source != TORCH_DIST:
         return
-    refusal = singleton_local_shards_refusal(
-        facts.content_metadata, facts.keys_matching(SINGLETON_EXPERT_SHARD)
-    )
+    keys = facts.keys_matching(SINGLETON_EXPERT_SHARD) + facts.keys_matching(GLU_HALF)
+    refusal = singleton_local_shards_refusal(facts.content_metadata, tuple(sorted(set(keys))))
     if refusal is not None:
         yield refusal
 
@@ -567,22 +581,34 @@ def _gated_fc1(facts: Facts) -> tuple[str, ...]:
     return tuple(gated)
 
 
-@REGISTRY.detector
-def pending_glu(facts: Facts) -> Iterator[Refusal]:
-    """FC-P06 / FC-P07: gated linear units, kept fused (swiglu off) or split (swiglu on).
+def _split_by_megatron_fsdp(key: str, source: str) -> bool:
+    """Whether a gated ``linear_fc1`` key has a name Megatron-FSDP splits into SwiGLU halves
+    (a torch_dist expert tensor's experts do, whatever their fsdp_dtensor naming)."""
+    if source == TORCH_DIST:
+        try:
+            expert = split_torch_dist_expert(key)
+        except KeyGrammarError:
+            return False
+        if expert is not None:
+            key = join_fsdp_expert(expert.path, expert.leaf, 0, GROUPED)
+    return is_swiglu_key(key)
 
-    SwiGLU halves (``linear_fc1.weight_w``/``_v``, fsdp_dtensor) are split
-    units whatever ``args.swiglu`` says.
+
+@REGISTRY.detector
+def pending_unsplit_glu(facts: Facts) -> Iterator[Refusal]:
+    """FC-P06: gated linear units that fsdp_dtensor keeps fused.
+
+    Megatron-FSDP splits a gated ``linear_fc1`` into SwiGLU halves only with
+    ``args.swiglu`` and for the names of ``handle_swiglu_in_state_dict``; it
+    keeps every other one fused, packed per tensor-parallel rank.
     """
     swiglu = facts.args.get("swiglu", False)
-    halves = facts.keys_matching(GLU_HALF)
-    fused = facts.keys_matching(FC1_WEIGHT) if swiglu else ()
-    evidence = ["args.swiglu=True"] if fused else []
-    if halves:
-        evidence.append("linear_fc1 stored as SwiGLU halves")
-    yield from _pending(errors.FC_P07, evidence, tuple(sorted(fused + halves)))
-    if not swiglu:
-        yield from _pending(errors.FC_P06, [], _gated_fc1(facts))
+    kept = tuple(
+        key
+        for key in _gated_fc1(facts)
+        if not (swiglu and _split_by_megatron_fsdp(key, facts.source))
+    )
+    yield from _pending(errors.FC_P06, [], kept)
 
 
 @REGISTRY.detector

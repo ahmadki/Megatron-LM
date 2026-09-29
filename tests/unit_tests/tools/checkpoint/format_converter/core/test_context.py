@@ -90,6 +90,18 @@ def test_torch_dist_to_fsdp_context_and_its_log():
             "many rows); args.swiglu=False, args.quick_geglu=False make the language model's MLPs "
             "(in decoder) plain",
         },
+        {
+            "field": "fsdp_swiglu",
+            "value": False,
+            "evidence": "args.swiglu=False of the job that loads the fsdp_dtensor target",
+        },
+        {
+            "field": "swiglu_split",
+            "value": {},
+            "evidence": "Megatron-FSDP splits a linear_fc1 into SwiGLU halves iff its job's "
+            "args.swiglu (here False) is set, its name is a SwiGLU name of "
+            "handle_swiglu_in_state_dict and its layer is gated: 0 split, 0 gated kept fused",
+        },
         {"field": "fsdp_model_prefix", "value": "model.module.", "evidence": "dialect mfsdp_v1"},
         {
             "field": "fsdp_optim_depth",

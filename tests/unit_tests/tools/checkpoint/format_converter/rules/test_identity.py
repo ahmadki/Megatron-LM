@@ -108,6 +108,6 @@ def test_sentinels_apply_to_their_source_format_only():
     half = _slice("model.module.decoder.layers.1.mlp.linear_fc1.weight_w", (8, 8))
     pool = LogicalPool([half])
     assert list(IdentityRule().claim(pool, _context(FSDP_DTENSOR, TORCH_DIST))) == []
-    assert "FC-P07" in pool.declined(half.lid)[0]
+    assert "(owned by glu)" in pool.declined(half.lid)[0]
     pool = LogicalPool([half])
     assert len(list(IdentityRule().claim(pool, _context(TORCH_DIST, FSDP_DTENSOR)))) == 1

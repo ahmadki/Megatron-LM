@@ -317,8 +317,7 @@ def _expect(capsys, code, *argv, lines):
 
 def test_refusals_are_all_reported_before_anything_is_read(tmp_path, capsys):
     fenced = write_torch_dist_source(
-        tmp_path / "fenced",
-        common={**COMMON, "args": hybrid_args(swiglu=True, spec=["x.y", "custom"])},
+        tmp_path / "fenced", common={**COMMON, "args": hybrid_args(spec=["x.y", "custom"])}
     )
     _expect(
         capsys,
@@ -330,7 +329,7 @@ def test_refusals_are_all_reported_before_anything_is_read(tmp_path, capsys):
         "fsdp_dtensor",
         "--optimizer",
         "convert",
-        lines=["error: FC-R03: args.spec='x.y.custom'", "error: FC-P07:", "error: FC-P12:"],
+        lines=["error: FC-R03: args.spec='x.y.custom'", "error: FC-P12:"],
     )
     assert not (tmp_path / "out").exists()
     extra = {"frontend.proj.weight": torch.ones(4)}
@@ -339,20 +338,6 @@ def test_refusals_are_all_reported_before_anything_is_read(tmp_path, capsys):
         capsys, 3, "plan", rooted, "--to", "fsdp_dtensor", lines=["FC-R13", "--allow-root frontend"]
     )
     assert run("plan", rooted, "--to", "fsdp_dtensor", "--allow-root", "frontend.") == 0
-
-
-def test_swiglu_halves_of_an_fsdp_dtensor_store_are_a_pending_family(tmp_path, capsys):
-    args = hybrid_args(
-        "*-*-", swiglu=True, ckpt_format="fsdp_dtensor", pipeline_model_parallel_size=1
-    )
-    model = {key: value for key, value in MODEL.items() if not key.endswith("linear_fc1.weight")}
-    for layer in (1, 3):
-        fc1 = f"decoder.layers.{layer}.mlp.linear_fc1.weight"
-        model[f"{fc1}_w"], model[f"{fc1}_v"] = MODEL[fc1], MODEL[fc1]
-    store = write_fsdp_store(tmp_path / "fsdp" / ITER, model, args=args)
-    assert run("plan", store, "--to", "torch_dist") == 3
-    err = capsys.readouterr().err
-    assert "error: FC-P07: not supported yet" in err and "FC-R13" not in err, err
 
 
 def test_fp8_delayed_scaling_into_torch_dist_needs_a_flag(tmp_path, capsys):

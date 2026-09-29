@@ -15,12 +15,18 @@ from pathlib import Path
 
 import pytest
 
+from tools.checkpoint.format_converter.core.glu import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
+from tools.checkpoint.format_converter.core.keys import SWIGLU_KEYS
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 
 from .._harness import REPO_ROOT
 
 CHECKPOINTING = REPO_ROOT / "megatron" / "training" / "checkpointing.py"
+ARGUMENT_UTILS = REPO_ROOT / "megatron" / "training" / "argument_utils.py"
+FSDP_DTENSOR_CHECKPOINT = (
+    REPO_ROOT / "megatron" / "core" / "transformer" / "fsdp_dtensor_checkpoint.py"
+)
 LAYER_UTILS = REPO_ROOT / "megatron" / "core" / "models" / "hybrid" / "layers" / "utils.py"
 TRANSFORMER_CONFIG = REPO_ROOT / "megatron" / "core" / "transformer" / "transformer_config.py"
 
@@ -164,3 +170,68 @@ def test_the_gated_deltanet_variants_exist():
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert GDN_VARIANTS <= variants, "experimental_attention_variant no longer names these"
+
+
+def _is_args_field(node: ast.AST, name: str | None = None) -> bool:
+    """Whether ``node`` reads ``args.<name>`` (any field if ``name`` is ``None``)."""
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+        and (name is None or node.attr == name)
+    )
+
+
+@pytest.mark.covers("glu", "parity")
+def test_the_swiglu_names_are_the_ones_megatron_fsdp_splits():
+    """``is_swiglu_key`` of ``handle_swiglu_in_state_dict``: its patterns, searched (``re.search``)."""
+    function = _definition(_module(FSDP_DTENSOR_CHECKPOINT), "is_swiglu_key")
+    patterns = [
+        element.value
+        for node in ast.walk(function)
+        if isinstance(node, ast.List)
+        for element in node.elts
+        if isinstance(element, ast.Constant)
+    ]
+    assert patterns == [
+        pattern.pattern for pattern in SWIGLU_KEYS
+    ], "Megatron-FSDP splits other linear_fc1 names into SwiGLU halves; update SWIGLU_KEYS"
+    calls = {ast.unparse(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)}
+    assert "re.search" in calls and "re.match" not in calls
+
+
+@pytest.mark.covers("glu", "parity")
+def test_megatron_fsdp_splits_only_with_swiglu_and_in_gated_or_ownerless_layers():
+    """The handler runs only under ``args.swiglu``, and a key without an owning
+    TransformerLayer counts as gated (``_key_in_glu_layer``)."""
+    preprocess = _definition(_module(CHECKPOINTING), "preprocess_fsdp_dtensor_state_dict")
+    (gate,) = [
+        node
+        for node in ast.walk(preprocess)
+        if isinstance(node, ast.If) and "handle_swiglu_in_state_dict" in ast.unparse(node)
+    ]
+    assert _is_args_field(gate.test, "swiglu") and not gate.orelse
+    owner = _definition(_module(FSDP_DTENSOR_CHECKPOINT), "_key_in_glu_layer")
+    (ownerless,) = [
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "best_glu is None"
+    ]
+    assert [ast.unparse(statement) for statement in ownerless.body] == ["return True"]
+
+
+@pytest.mark.covers("glu", "parity")
+def test_the_arguments_that_gate_the_language_model_are_the_mirrored_ones():
+    """``core_transformer_config_from_args`` sets ``gated_linear_unit`` under exactly these."""
+    function = _definition(_module(ARGUMENT_UTILS), "core_transformer_config_from_args")
+    gating = set()
+    for node in ast.walk(function):
+        if isinstance(node, ast.If) and _is_args_field(node.test):
+            sets_glu = any(
+                isinstance(statement, ast.Assign)
+                and "'gated_linear_unit'" in ast.unparse(statement.targets[0])
+                for statement in node.body
+            )
+            if sets_glu:
+                gating.add(node.test.attr)
+    assert gating == set(GLU_ARGS), "other arguments gate the MLPs now; update GLU_ARGS"

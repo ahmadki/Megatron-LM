@@ -244,6 +244,13 @@ CASES = {
         errors.FC_R17,
         facts(keys={"decoder.layers.1.mlp.experts.experts.3.linear_fc1.weight": (F, H)}),
     ),
+    "R17 singleton swiglu halves": (
+        errors.FC_R17,
+        facts(
+            args={"swiglu": True},
+            keys={f"decoder.layers.1.mlp.linear_fc1.weight_{part}": (F, H) for part in "wv"},
+        ),
+    ),
     "P04 shortcut": (errors.FC_P04, facts(args={"moe_shortcut_connection": True})),
     "P04 hybrid mtp": (errors.FC_P04, facts(args={"hybrid_layer_pattern": "*-*-/*-"})),
     "P04 legacy mtp": (
@@ -266,14 +273,15 @@ CASES = {
         errors.FC_P06,
         facts(keys={"decoder.layers.1.mlp.linear_fc1.weight": (2 * F, H)}),
     ),
-    "P07 swiglu": (errors.FC_P07, facts(args={"swiglu": True})),
-    "P07 fsdp halves": (
-        errors.FC_P07,
-        facts(args={"swiglu": True}, keys=FSDP_SWIGLU_KEYS, source=FSDP_DTENSOR, target=TORCH_DIST),
-    ),
-    "P07 halves without args.swiglu": (
-        errors.FC_P07,
-        facts(keys=FSDP_SWIGLU_KEYS, source=FSDP_DTENSOR, target=TORCH_DIST),
+    "P06 projection swiglu does not split": (
+        errors.FC_P06,
+        facts(
+            args={"swiglu": True},
+            keys={
+                "vision_projection.encoder.linear_fc1.weight": (2 * F, H),
+                "vision_projection.encoder.linear_fc2.weight": (H, F),
+            },
+        ),
     ),
     "P08 symbol": (errors.FC_P08, facts(args={"hybrid_layer_pattern": "M-*-"})),
     "P08 keys": (
@@ -302,6 +310,22 @@ def test_each_case_is_refused_with_exactly_its_code(case):
     assert codes(case_facts) == [code]
     (refusal,) = detect_refusals(case_facts)
     assert refusal.hint, refusal
+
+
+def test_swiglu_halves_in_a_torch_dist_store_are_its_singleton_form():
+    """Megatron's SwiGLU factory names the halves ``<key>_w``/``<key>_v`` only under
+    ``singleton_local_shards``; torch_dist otherwise stores a gated linear_fc1 whole."""
+    halves = {
+        f"decoder.layers.1.mlp.linear_fc1.{leaf}_{part}": shape
+        for leaf, shape in (("weight", (F, H)), ("bias", (F,)))
+        for part in "wv"
+    }
+    (refusal,) = detect_refusals(facts(args={"swiglu": True}, keys=halves))
+    assert refusal.code == errors.FC_R17 and refusal.keys == tuple(sorted(halves))
+    assert refusal.message == (
+        "the checkpoint was saved with singleton_local_shards, which this tool does not read "
+        "(its gated linear_fc1 are saved as SwiGLU halves <key>_w and <key>_v)"
+    )
 
 
 def test_every_detector_code_has_a_case():
@@ -337,8 +361,9 @@ def test_mixture_of_experts_models_pass():
 
 
 @pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
-def test_gated_experts_are_fenced_in_every_expert_naming(source):
-    """SwiGLU experts stay pending: gated linear_fc1 of grouped fsdp_dtensor experts too."""
+def test_gated_experts_kept_fused_are_fenced_in_every_expert_naming(source):
+    """Without args.swiglu, Megatron-FSDP keeps gated experts fused (pending); with it, it splits
+    them into SwiGLU halves, in every expert naming."""
     if source == FSDP_DTENSOR:
         fc1 = {k: (2 * F, H) for k in GROUPED_EXPERTS if "linear_fc1" in k}
         gated, target = {**GROUPED_EXPERTS, **fc1}, TORCH_DIST
@@ -349,15 +374,16 @@ def test_gated_experts_are_fenced_in_every_expert_naming(source):
     moe = {"num_experts": E, "moe_grouped_gemm": True}
     (unsplit,) = detect_refusals(facts(args=moe, keys=gated, **direction))
     assert unsplit.code == errors.FC_P06 and unsplit.keys == tuple(sorted(fc1))
-    split = codes(facts(args={**moe, "swiglu": True}, keys=GROUPED_EXPERTS, **direction))
-    assert split == [errors.FC_P07]
+    assert codes(facts(args={**moe, "swiglu": True}, keys=gated, **direction)) == []
 
 
-def test_swiglu_halves_are_pending_whatever_the_arguments_say():
-    for case in ("P07 fsdp halves", "P07 halves without args.swiglu"):
-        (refusal,) = detect_refusals(CASES[case][1])
-        assert "linear_fc1 stored as SwiGLU halves" in refusal.message, case
-        assert refusal.keys == tuple(sorted(k for k, v in FSDP_SWIGLU_KEYS.items() if v))
+def test_swiglu_halves_pass_the_fence_whatever_the_arguments_say():
+    """The architecture context checks them against the arguments (``core/glu.py``)."""
+    for swiglu in (True, False):
+        found = facts(
+            args={"swiglu": swiglu}, keys=FSDP_SWIGLU_KEYS, source=FSDP_DTENSOR, target=TORCH_DIST
+        )
+        assert codes(found) == []
 
 
 def test_escape_hatches_and_harmless_values_pass():

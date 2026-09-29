@@ -85,7 +85,8 @@ FC_R19 = "FC-R19"
 """The ``fsdp_dtensor`` store holds split fused-projection sub-keys (unknown layout)."""
 
 FC_R20 = "FC-R20"
-"""The model uses a layer type no rule is verified for (hybrid symbol or attention variant)."""
+"""The model uses a layer type no rule is verified for (hybrid symbol or attention variant), or
+an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
 FC_P04 = "FC-P04"
 """Pending: shortcut-MoE layer numbering or hybrid multi-token prediction."""
@@ -94,10 +95,7 @@ FC_P05 = "FC-P05"
 """Pending: Gated DeltaProduct mixers."""
 
 FC_P06 = "FC-P06"
-"""Pending: gated ``linear_fc1`` that fsdp_dtensor keeps fused (SwiGLU split off)."""
-
-FC_P07 = "FC-P07"
-"""Pending: ``linear_fc1`` split into SwiGLU halves (``args.swiglu`` set)."""
+"""Pending: gated ``linear_fc1`` that fsdp_dtensor keeps fused (not split into SwiGLU halves)."""
 
 FC_P08 = "FC-P08"
 """Pending: Mamba-2 mixers."""

@@ -526,13 +526,23 @@ _GROUPED_EXPERT = re.compile(
 )
 
 
+_GROUPED_EXPERT_HALF = re.compile(
+    r"^(?P<head>.*\.mlp\.experts)\.(?P<linear>linear_fc\d)\.(?P<leaf>weight|bias)(?P<e>\d+)"
+    r"(?P<half>_[wv])?$"
+)
+
+
 def sequential_experts(tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """The tensors with grouped expert names renamed as ``SequentialMLP`` names them."""
+    """The tensors with grouped expert names (SwiGLU halves too) renamed as ``SequentialMLP``
+    names them."""
     renamed = {}
     for key, tensor in tensors.items():
-        match = _GROUPED_EXPERT.match(key)
+        match = _GROUPED_EXPERT_HALF.match(key)
         if match:
-            key = f"{match['head']}.local_experts.{match['e']}.{match['linear']}.{match['leaf']}"
+            key = (
+                f"{match['head']}.local_experts.{match['e']}.{match['linear']}.{match['leaf']}"
+                f"{match['half'] or ''}"
+            )
         renamed[key] = tensor
     return renamed
 
@@ -568,4 +578,49 @@ def expert_grids(tensors: Mapping[str, torch.Tensor]) -> dict[str, tuple[Region,
             axes = 2 if key.split(".layers.", 1)[1][0].isalpha() else 1
             cuts = [list(range(1, tensor.shape[d])) if d < axes else [] for d in range(tensor.ndim)]
             grids[key] = product_grid(tuple(tensor.shape), cuts)
+    return grids
+
+
+_FC1_TENSOR = re.compile(r"\.linear_fc1\.(?:weight|bias)\d*$")
+
+
+def gated_units(
+    tensors: Mapping[str, torch.Tensor], seed: int = 17
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """``tensors`` with every ``linear_fc1`` weight and bias made a gated linear unit.
+
+    Each ``[F, ...]`` tensor is replaced by a gate ``W`` and a value ``V`` of its shape and dtype,
+    drawn independently from ``seed``. Returns them twice: as SwiGLU halves (``<key>_w`` and
+    ``<key>_v``, as Megatron-FSDP splits them) and fused (``<key>`` = ``torch.cat([W, V])``, as
+    torch_dist stores them); every other tensor is kept in both.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    halves, fused = {}, {}
+    for key, tensor in tensors.items():
+        if _FC1_TENSOR.search(key) is None:
+            halves[key] = fused[key] = tensor
+            continue
+        gate, value = (
+            torch.randn(tensor.shape, generator=generator).to(tensor.dtype) for _ in range(2)
+        )
+        halves[f"{key}_w"], halves[f"{key}_v"] = gate, value
+        fused[key] = torch.cat([gate, value])
+    return halves, fused
+
+
+def swiglu_grids(tensors: Mapping[str, torch.Tensor]) -> dict[str, tuple[Region, ...]]:
+    """Megatron's torch_dist grid of every gated ``linear_fc1`` of ``tensors`` (torch_dist keys) at
+    tensor-parallel size 1: one chunk per half (the SwiGLU factory), per layer of a stacked tensor
+    and per expert of an expert tensor."""
+    grids = {}
+    for key, tensor in tensors.items():
+        if not re.search(r"\.linear_fc1\.(?:weight|bias)$", key):
+            continue
+        stacked = ".layers." in key and key.split(".layers.", 1)[1][0].isalpha()
+        lead = int(stacked) + int(".mlp.experts.experts." in key)
+        cuts = [
+            list(range(1, size)) if d < lead else [size // 2] if d == lead else []
+            for d, size in enumerate(tensor.shape)
+        ]
+        grids[key] = product_grid(tuple(tensor.shape), cuts)
     return grids

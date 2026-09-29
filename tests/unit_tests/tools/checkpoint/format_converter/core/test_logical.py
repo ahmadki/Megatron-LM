@@ -26,6 +26,10 @@ def test_ids_render_block_layer_and_name():
     assert str(NORM) == "decoder.final_norm.weight"
     assert str(LogicalId(None, None, "", "scale")) == "scale"
     assert {QKV, LogicalId("decoder", 3, "self_attention.linear_qkv", "weight")} == {QKV}
+    half = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 2, "v")
+    assert str(half) == "decoder[1].mlp.experts.linear_fc1.weight[expert 2][part v]"
+    assert half.whole == LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 2)
+    assert QKV.whole is QKV
 
 
 def test_expert_ids_name_one_expert():
@@ -49,6 +53,11 @@ def test_expert_ids_name_one_expert():
 def test_invalid_ids_are_internal_errors(block, layer, leaf, expert):
     with pytest.raises(InternalError):
         LogicalId(block, layer, "mlp.linear_fc1", leaf, expert)
+
+
+def test_a_part_needs_a_name():
+    with pytest.raises(InternalError):
+        LogicalId("decoder", 0, "mlp.linear_fc1", "weight", None, "")
 
 
 def test_slice_shape_is_its_region():

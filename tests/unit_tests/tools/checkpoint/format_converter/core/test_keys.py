@@ -11,16 +11,22 @@ from tools.checkpoint.format_converter.core.keys import (
     KeyGrammarError,
     LayerKey,
     attribute_layer_key,
+    fc2_path_of,
     innermost_layer_key,
+    is_fc1_path,
+    is_swiglu_key,
+    join_glu_half,
     join_layer_key,
     join_leaf,
     join_torch_dist_expert,
     root_of,
+    split_glu_half,
     split_layer_key,
     split_leaf,
     split_torch_dist_expert,
     torch_dist_chunk_axes,
 )
+from tools.checkpoint.format_converter.errors import InternalError
 
 
 @pytest.mark.parametrize(
@@ -217,3 +223,61 @@ def test_joining_needs_an_experts_linear_layer():
 )
 def test_torch_dist_saves_a_chunk_per_layer_and_expert(key, axes):
     assert torch_dist_chunk_axes(key) == axes
+
+
+@pytest.mark.parametrize(
+    ("name", "tensor", "part"),
+    [
+        ("decoder.layers.1.mlp.linear_fc1.weight_w", "decoder.layers.1.mlp.linear_fc1.weight", "w"),
+        ("mlp.linear_fc1.bias_v", "mlp.linear_fc1.bias", "v"),
+        ("mlp.experts.linear_fc1.weight17_v", "mlp.experts.linear_fc1.weight17", "v"),
+        (
+            "mlp.experts.local_experts.3.linear_fc1.weight_w",
+            "mlp.experts.local_experts.3.linear_fc1.weight",
+            "w",
+        ),
+        ("mlp.linear_fc1.weight", "mlp.linear_fc1.weight", None),
+        ("mlp.linear_fc2.weight_w", "mlp.linear_fc2.weight_w", None),
+        ("mlp.linear_fc1.layer_norm_weight_w", "mlp.linear_fc1.layer_norm_weight_w", None),
+        ("mlp.linear_fc1.weight_x", "mlp.linear_fc1.weight_x", None),
+    ],
+)
+def test_swiglu_halves_name_their_fused_tensor(name, tensor, part):
+    assert split_glu_half(name) == (tensor, part)
+    if part is not None:
+        assert join_glu_half(tensor, part) == name
+
+
+def test_only_the_gate_and_value_are_halves():
+    with pytest.raises(InternalError):
+        join_glu_half("mlp.linear_fc1.weight", "z")
+
+
+@pytest.mark.parametrize(
+    ("name", "split"),
+    [
+        ("decoder.layers.1.mlp.linear_fc1.weight", True),
+        ("decoder.layers.1.mlp.linear_fc1.bias", True),
+        ("decoder.layers.1.mlp.experts.linear_fc1.weight17", True),
+        ("decoder.layers.1.mlp.experts.linear_fc1.bias3", True),
+        ("decoder.layers.1.mlp.experts.local_experts.3.linear_fc1.weight", True),
+        ("decoder.layers.1.mlp.experts.local_experts.3.linear_fc1.bias", True),
+        ("decoder.layers.1.mlp.shared_experts.linear_fc1.weight", True),
+        ("vision_model.decoder.layers.0.mlp.linear_fc1.bias", True),
+        ("vision_projection.encoder.linear_fc1.weight", False),
+        ("mlp.linear_fc1.weight", False),  # Megatron's patterns need a module before mlp
+        ("decoder.layers.1.mlp.linear_fc1.layer_norm_weight", False),
+        ("decoder.layers.1.mlp.linear_fc2.weight", False),
+        ("decoder.layers.1.mlp.experts.linear_fc1.weight", False),
+    ],
+)
+def test_megatron_fsdp_splits_the_swiglu_names(name, split):
+    assert is_swiglu_key(name) is split
+
+
+def test_the_second_projection_beside_a_first():
+    assert is_fc1_path("linear_fc1") and is_fc1_path("mlp.experts.linear_fc1")
+    assert not is_fc1_path("mlp.linear_fc10") and not is_fc1_path("mlp.xlinear_fc1")
+    assert fc2_path_of("mlp.experts.linear_fc1") == "mlp.experts.linear_fc2"
+    with pytest.raises(KeyGrammarError):
+        fc2_path_of("mlp.linear_fc2")
