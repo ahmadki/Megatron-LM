@@ -9,18 +9,37 @@ multi-token-prediction depth. Older checkpoints store the pattern as
 ``hybrid_override_pattern`` with the MTP part in ``mtp_hybrid_override_pattern``;
 :func:`hybrid_pattern_of` applies Megatron's backward-compatible merge
 (``megatron/training/arguments.py``).
+
+With ``--moe-shortcut-connection``, Megatron's ``HybridStack`` groups each
+mixture-of-experts layer (``E``) with the layer before it into one module
+(``group_layers_into_shortcut_blocks``, ``models/hybrid/shortcut_block.py``),
+so its layer list has fewer modules than the pattern has layers:
+:func:`group_modules` mirrors that grouping.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .. import errors
+from ..errors import Refusal, RefusalError
 from .args_view import ArgsView
 
 PIPE = "|"
 MTP_SEPARATOR = "/"
 LAYER_SYMBOLS = frozenset("MG*DCH+W-E")
 """Every layer symbol Megatron defines (``models/hybrid/layers/utils.py``, pinned by a test)."""
+
+MOE = "E"
+"""The symbol of a mixture-of-experts layer."""
+
+SHORTCUT_PREDECESSORS = frozenset("MG*DCH+W")
+"""The layer symbols a shortcut-connected mixture-of-experts layer may follow: Mamba, Gated
+DeltaNet and the attention layers (``SUPPORTED_SHORTCUT_PREDECESSORS``, pinned by a test)."""
+
+HybridModule = tuple[int, str]
+"""One module of a hybrid layer list: the pattern position of its first layer (the torch_dist
+layer index) and its layers' symbols (one symbol, or a predecessor and ``E``)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +60,16 @@ class HybridPattern:
     def symbols(self) -> frozenset[str]:
         """Every symbol of the main decoder and the MTP depths."""
         return frozenset(self.main).union(*self.mtp)
+
+    @property
+    def stage_starts(self) -> frozenset[int]:
+        """The positions in :attr:`main` at which a ``|`` begins another pipeline stage."""
+        segments = self.text.split(MTP_SEPARATOR)[0].split(PIPE)
+        starts, position = set(), 0
+        for segment in segments[:-1]:
+            position += len(segment)
+            starts.add(position)
+        return frozenset(starts)
 
 
 def parse_hybrid_pattern(text: str) -> HybridPattern:
@@ -70,3 +99,62 @@ def hybrid_pattern_of(args: ArgsView) -> HybridPattern | None:
     if legacy_mtp is not None and depths > 0 and (text is None or MTP_SEPARATOR not in text):
         text = (text or "") + (MTP_SEPARATOR + legacy_mtp) * depths
     return None if text is None else parse_hybrid_pattern(text)
+
+
+def group_modules(
+    symbols: str, *, shortcut: bool, stage_starts: frozenset[int] = frozenset()
+) -> tuple[HybridModule, ...]:
+    """The modules of the hybrid layer list of ``symbols``, in layer-list (dense) order.
+
+    Without ``shortcut`` every layer is a module of its own. With it, this is
+    ``group_layers_into_shortcut_blocks`` applied to each pipeline stage: a
+    layer followed by an ``E`` forms one module with it, and every other layer
+    (a leading ``E``, an ``E`` after a pair) stays a module of its own; the
+    module's torch_dist index is its first layer's position.
+
+    Args:
+        symbols: One symbol per layer, without ``|`` (a main decoder or an MTP depth).
+        shortcut: ``args.moe_shortcut_connection``.
+        stage_starts: The positions that begin a pipeline stage (``|``).
+
+    Raises:
+        RefusedError: With ``shortcut``, a stage after the first begins with an
+            ``E`` (its pair would cross the stage boundary) or an ``E`` follows a
+            layer that cannot precede a shortcut-connected MoE layer (FC-R11):
+            Megatron cannot build such a model.
+    """
+    if not shortcut:
+        return tuple(enumerate(symbols))
+    for start in sorted(stage_starts):
+        if 0 < start < len(symbols) and symbols[start] == MOE:
+            raise _shortcut_refusal(
+                symbols,
+                f"layer {start} ({MOE!r}) begins a pipeline stage, so its shortcut pair would "
+                "cross the stage boundary",
+            )
+    modules: list[HybridModule] = []
+    position = 0
+    while position < len(symbols):
+        if position + 1 < len(symbols) and symbols[position + 1] == MOE:
+            if symbols[position] not in SHORTCUT_PREDECESSORS:
+                raise _shortcut_refusal(
+                    symbols,
+                    f"layer {position + 1} ({MOE!r}) follows layer {position} "
+                    f"({symbols[position]!r}), which cannot precede a shortcut-connected "
+                    f"mixture-of-experts layer (only {''.join(sorted(SHORTCUT_PREDECESSORS))} can)",
+                )
+            modules.append((position, symbols[position : position + 2]))
+            position += 2
+        else:
+            modules.append((position, symbols[position]))
+            position += 1
+    return tuple(modules)
+
+
+def _shortcut_refusal(symbols: str, reason: str) -> RefusalError:
+    return Refusal(
+        errors.FC_R11,
+        f"with args.moe_shortcut_connection=True, Megatron cannot group the hybrid layers "
+        f"{symbols!r}: {reason}",
+        hint="check that the arguments belong to this checkpoint",
+    ).to_error()
