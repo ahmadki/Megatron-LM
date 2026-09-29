@@ -16,11 +16,13 @@ with bounded host memory, never uses a GPU or a process group, and runs on a
 host without Megatron, Transformer Engine or nvidia-resiliency-ext installed.
 
 This version inspects and verifies stores, rewrites `torch_dist` stores with
-model weights only, converts the model weights of per-layer hybrid models
-(attention `*` and MLP `-` layers) between `torch_dist` and `fsdp_dtensor` in
-both directions, GPT models (`TransformerBlock` decoders, stacked or per
-layer in `torch_dist`) in both directions, and vision-language models in the
-LLaVA layout whose language model is one of those. Every other model family is
+model weights only, and converts model weights between `torch_dist` and
+`fsdp_dtensor` in both directions: hybrid models (attention `*`, MLP `-` and
+mixture-of-experts `E` layers, shortcut-connected ones included, and hybrid
+multi-token prediction layers), GPT models (`TransformerBlock` decoders,
+stacked or per layer in `torch_dist`, with dense or mixture-of-experts MLPs,
+plain or gated), and vision-language models in the LLaVA layout whose
+language model is one of those. Every other model family is
 refused, before anything is read, with a pending-family code until the change
 that supports it lands (see [Roadmap](#roadmap)). This file is the living
 design document of the package; the user guide is
@@ -198,7 +200,9 @@ training arguments and the model keys (names and shapes) go through the
 refusal fence: a model part no rule is verified for is refused with an `FC-R`
 (never supported) or `FC-P` (pending family) code, and every refusal found is
 printed. This version converts hybrid models (`--hybrid-layer-pattern`) built
-from attention (`*`), MLP (`-`) and mixture-of-experts (`E`) layers, and GPT
+from attention (`*`), MLP (`-`) and mixture-of-experts (`E`) layers
+(shortcut-connected ones included, `--moe-shortcut-connection`) with or
+without multi-token prediction layers (the pattern's `/` parts), and GPT
 models (no hybrid pattern; `TransformerBlock` layers of attention and a dense
 MLP or mixture-of-experts layer), with gated (SwiGLU, GEGLU) or plain MLPs, in both
 directions, with a single model root (`embedding`, `decoder`, `output_layer`)
@@ -211,8 +215,32 @@ refused (`FC-R13`) unless `--allow-root PREFIX` converts them unchanged.
 
 * **Keys.** `fsdp_dtensor` model keys are `model.module.<name>` (exactly one
   `module.` level; the store's planner data records `('model', 'module.<name>')`);
-  `torch_dist` keys are the bare names. Layer indices are the same in both
-  formats for these models.
+  `torch_dist` keys are the bare names.
+* **Hybrid layer numbering.** A hybrid decoder is stored per layer in both
+  formats: `torch_dist` under each module's first layer's position in the
+  pattern (`layer_number - 1`, `|` removed), `fsdp_dtensor` under its
+  layer-list index. Without `--moe-shortcut-connection` both are the layer's
+  position. With it, Megatron pairs each `E` with the layer before it into one
+  `ShortcutMoEBlock` (`group_layers_into_shortcut_blocks`; a leading `E` and an
+  `E` after a pair stay modules of their own), so the `torch_dist` indices
+  skip the `E` of every pair while the `fsdp_dtensor` ones stay dense
+  (`E*E-*EE`: modules `E`, `*E`, `-`, `*E`, `E` at `torch_dist` 0, 1, 3, 4, 6
+  and `fsdp_dtensor` 0-4). The grouping is mirrored exactly, including the
+  refusal of a `|` stage that begins with an `E` (`core/hybrid_pattern.py`);
+  the source must hold exactly the indices it gives (`FC-R11`, with the full
+  index table otherwise), and every module must hold the tensors of its
+  layers, by family signature: presence-based, the names of a pair's children
+  not assumed (`FC-R11`). Multi-token prediction
+  layers (`mtp.layers.<d>`, one per depth, or one with
+  `--mtp-use-repeated-layer`) keep their numbering, and the inner model of a
+  hybrid MTP layer, `mtp.layers.<d>.mtp_model_layer` (the same name in both
+  formats: Megatron renames it to `transformer_layer` for GPT MTP layers
+  only), is a hybrid layer list of its part of the pattern numbered like the
+  decoder from position 0. Megatron refuses `--moe-shortcut-connection` with
+  Megatron-FSDP, so no current Megatron job loads the `fsdp_dtensor` store of
+  a shortcut-MoE model (`plan` and `convert` warn): it is written in the
+  layout a Megatron-FSDP v1 job uses, and tested against Megatron-FSDP's own
+  save handlers applied to the live model.
 * **Stacked layers.** `torch_dist` stores a `TransformerBlock` (a GPT decoder)
   either stacked, one key per tensor with the layers along a new first axis
   (`decoder.layers.<name>`, shape `[L, ...]`, one chunk per layer), or per
@@ -765,17 +793,24 @@ its own, a `LogicalId` with `part` `w` or `v`, which `fsdp_dtensor` names
 one that `fsdp_dtensor` keeps fused is packed rank-major, canonical `[W; V]`
 to `[W_0; V_0; W_1; V_1; ...]` and back along its halves' `PartLayout`, at
 `pack_tp`, or `pack_etp` for a routed expert) and `identity` (tensors stored
-the same way in both formats), and two
+the same way in both formats), and four
 kinds of blocks. The blocks a store holds are found from its
 keys (each key's innermost layer list), and the model's roots from the keys'
 top-level modules: the language model's decoder is `decoder`, or
-`language_model.decoder` in a vision-language model. The registered block
-classifier recognizes the `HybridStack` decoder of a hybrid model (stored per
-layer, numbered by pattern position in `torch_dist`, which equals the dense
-index without shortcut-MoE grouping), and every other block is a
-`TransformerBlock` (`core/stacking.py`: the language model's decoder, a
-vision encoder, or a layer list of unknown kind), numbered identically in both
-formats and stored stacked or per layer in `torch_dist`. A stacked `torch_dist` tensor decomposes into
+`language_model.decoder` in a vision-language model, and its multi-token
+prediction block `mtp` (`language_model.mtp`). The registered block
+classifiers recognize the `HybridStack` decoder of a hybrid model and the inner
+layer list of each hybrid MTP layer (both stored per layer; their modules, a
+layer or a shortcut-MoE pair, numbered by their first layer's pattern position
+in `torch_dist` and densely in `fsdp_dtensor`; each `BlockLayout` records the
+map and every module's symbols, and every module's tensors are checked against
+its symbols' family signatures), and the MTP block (one layer per depth, never
+stacked); every other block is a `TransformerBlock` (`core/stacking.py`: the
+language model's decoder, a vision encoder, or a layer list of unknown kind),
+numbered identically in both formats and stored stacked or per layer in
+`torch_dist`. The layer map applies through the dense layer index of every
+`LogicalId`, so every key (and every namespace that decomposes keys the same
+way) is renumbered alike. A stacked `torch_dist` tensor decomposes into
 one logical slice per layer: the box `[l:l+1, ...]` holding a logical tensor
 of the layer's shape (the slice records the squeezed leading axis), so rules
 never see the stacking; engine copies may add or drop leading size-1 axes
@@ -787,7 +822,8 @@ the module path `<...>.mlp.experts.linear_fc<n>`, which is also what both
 `fsdp_dtensor` namings (grouped `linear_fc<n>.<leaf><e>`, sequential
 `local_experts.<e>.linear_fc<n>.<leaf>`) parse to. The expert layout (number
 of experts and `fsdp_dtensor` naming, `core/experts.py`) is derived with the
-context. The verified hybrid symbols are `*`, `-` and `E`.
+context. The verified hybrid symbols are `*`, `-` and `E`, with shortcut-MoE
+grouping and hybrid multi-token prediction layers.
 
 ### Extension contract
 
@@ -911,10 +947,10 @@ the code under test.
 
 | Tier | Content |
 |---|---|
-| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation, key grammar (layers, experts and SwiGLU halves), logical ids and parts, pool and sentinels, one case per refusal code, architecture derivations, block and expert layouts, gatedness and the SwiGLU split predicate on hand-built key tables, pack sizes (given, defaulted, required, the expert size a job at another tensor-parallel size needs, cross-checked with the manifest, and the padded vocabulary under them), `PartLayout` rank-major maps at tp 1, 2 and 4 against packs built with explicit loops, plan compilation against hand-written pieces, manifest schema, the registry contract |
-| T1 | synthetic GPT, GPT mixture-of-experts (grouped and sequential experts, stacked and per layer, router buffers in fp32 and int32, latent projections), gated MLPs (SwiGLU split into halves and GEGLU kept fused, packed at tensor-parallel sizes 1, 2 and 4 and routed experts at expert tensor-parallel size 2, against gates and values drawn by hand and packed with explicit loops over ranks; routed experts packed for a job at another tensor-parallel size; `--target-swiglu` refused where it would change the language model's activation, and splitting a GLU vision encoder under a language model without MLPs), vision-language and hybrid vision-language stores (stacked and per-layer blocks, a patch merger's lone `linear_fc1`, tensor-parallel chunk grids) converted both ways against tensors drawn one layer per key and stacked with `torch.stack`, metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, expected-difference contracts and plan replay, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on synthetic training saves in every direction, CLI exit codes, import boundary |
-| T2 | the common-state codec against Megatron's `load_common_state_dict`, the rewritten integrity manifest against Megatron's verifier, the pattern parser and the verified spec names against Megatron's objects, the grouped-tensor-parallel refusal against the weight-shard fields Megatron's `validate_args` stores, the stacking predicate against `TransformerBlock.sharded_state_dict` itself on int and list layer frequencies and `content_metadata` flags, the expert naming against `get_expert_index_from_key` and the experts modules Megatron's builders build, every expert tensor of a live MoE model's torch_dist sharded state dict against the name and value `handle_experts_in_state_dict` gives it at expert-parallel sizes 1 and 2, the SwiGLU split predicate against the state dict `preprocess_fsdp_dtensor_state_dict` builds for live Megatron-FSDP models (a SwiGLU MoE GPT with shared experts at expert-parallel sizes 1 and 2; a LLaVA with a SwiGLU language model, a plain vision encoder and a gated projection), and the fused gated `linear_fc1` of live Megatron-FSDP models at TP 2 and expert TP 2 against the rank-major pack of the halves Megatron's own split gives (container); the `fsdp_dtensor` preprocess handler set, the hybrid layer symbols, the Gated DeltaNet variant names, the SwiGLU names and gate of `handle_swiglu_in_state_dict` and the arguments that gate the language model scanned from Megatron's source (`ast`, host) |
-| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2; a GPT mixture-of-experts model (grouped experts at expert-parallel size 1, sequential and grouped at 2; router expert biases compared too) and a hybrid `*E*E` model; a hybrid model, a dense GPT and a tiny LLaVA (GPT language model, CLIP vision encoder, MLP projection; both `TransformerBlock`s stacked in `torch_dist`) through `torch_dist` -> `fsdp_dtensor` -> `torch_dist` with Megatron's own saves and strict loads, every store checked against a real save under its contract, and the GPT and LLaVA `fsdp_dtensor` saves also converted with `--torch-dist-layout per-layer` and loaded strictly (TP 1; TP 2 with `MCORE_FORMAT_CONVERTER_EXTENDED=1`); a GEGLU GPT at TP 2 (packed with `--fsdp-tp 2`) and a LLaVA whose vision encoder is gated under a plain language model (TP 1; TP 2 extended) through the same chain; for SwiGLU models, whose Megatron-FSDP state dicts only a bf16 job builds on current Megatron (the fp32 failure is a strict expected failure) and a bf16 job cannot load without optimizer state, a chain of what that permits (the converted store against a real bf16 Megatron-FSDP save's keys, shapes and dtypes; that save converted back, loaded strictly and compared parameter for parameter; the round trip against the source): a SwiGLU GPT (TP 1; TP 2 extended) and a SwiGLU MoE GPT at expert-parallel size 2 (grouped with shared experts, sequential with biases) (container with GPUs) |
+| T0 | region algebra (checked exhaustively on small shapes), error and refusal formats, options, detection table, key sections, args view and sanitation, key grammar (layers, experts and SwiGLU halves), logical ids and parts, pool and sentinels, one case per refusal code, architecture derivations, block and expert layouts, gatedness and the SwiGLU split predicate on hand-built key tables, pack sizes (given, defaulted, required, the expert size a job at another tensor-parallel size needs, cross-checked with the manifest, and the padded vocabulary under them), `PartLayout` rank-major maps at tp 1, 2 and 4 against packs built with explicit loops, plan compilation against hand-written pieces, manifest schema, the registry contract, the shortcut-MoE grouping walk on edge patterns (leading and trailing `E`, every predecessor, stage boundaries, refusals), family signatures (presence-based, opaque child names), hybrid and MTP block layouts and their index and family cross-checks |
+| T1 | synthetic GPT, GPT mixture-of-experts (grouped and sequential experts, stacked and per layer, router buffers in fp32 and int32, latent projections), gated MLPs (SwiGLU split into halves and GEGLU kept fused, packed at tensor-parallel sizes 1, 2 and 4 and routed experts at expert tensor-parallel size 2, against gates and values drawn by hand and packed with explicit loops over ranks; routed experts packed for a job at another tensor-parallel size; `--target-swiglu` refused where it would change the language model's activation, and splitting a GLU vision encoder under a language model without MLPs), vision-language and hybrid vision-language stores (stacked and per-layer blocks, a patch merger's lone `linear_fc1`, tensor-parallel chunk grids) converted both ways against tensors drawn one layer per key and stacked with `torch.stack`, metadata view and safe unpickling, read-once region reads (counting real `torch.load` calls), torch contract pins, digests, `inspect`, `verify` planted corruptions and semantic common state, expected-difference contracts and plan replay, the partial-tensor planner (no copies), every merge failure, unit packing and budgets, staging and resume after crashes at every commit point (byte-identical stores), in-process versus two-worker byte identity, no CUDA in driver or workers, bounded peak RSS, `plan`/`convert` on synthetic training saves in every direction, shortcut-MoE hybrid stores (sparse `torch_dist` indices, pipeline stages, other child names, refusals) and hybrid MTP stores (shortcut pairs in a repeated MTP layer, the legacy MTP pattern argument, gated MTP MLPs split and checked as the language model's) converted both ways against tensors drawn under hand-written indices, CLI exit codes, import boundary |
+| T2 | the common-state codec against Megatron's `load_common_state_dict`, the rewritten integrity manifest against Megatron's verifier, the pattern parser and the verified spec names against Megatron's objects, the grouped-tensor-parallel refusal against the weight-shard fields Megatron's `validate_args` stores, the stacking predicate against `TransformerBlock.sharded_state_dict` itself on int and list layer frequencies and `content_metadata` flags, the expert naming against `get_expert_index_from_key` and the experts modules Megatron's builders build, every expert tensor of a live MoE model's torch_dist sharded state dict against the name and value `handle_experts_in_state_dict` gives it at expert-parallel sizes 1 and 2, the SwiGLU split predicate against the state dict `preprocess_fsdp_dtensor_state_dict` builds for live Megatron-FSDP models (a SwiGLU MoE GPT with shared experts at expert-parallel sizes 1 and 2; a LLaVA with a SwiGLU language model, a plain vision encoder and a gated projection), the fused gated `linear_fc1` of live Megatron-FSDP models at TP 2 and expert TP 2 against the rank-major pack of the halves Megatron's own split gives, the shortcut-MoE grouping against `group_layers_into_shortcut_blocks` stage by stage and `SUPPORTED_SHORTCUT_PREDECESSORS`, and every tensor of a live shortcut-MoE hybrid model with an MTP layer (its torch_dist sharded state dict, sparse indices) against the name and value its state dict gives it (container); the `fsdp_dtensor` preprocess handler set, the hybrid layer symbols, the Gated DeltaNet variant names, the SwiGLU names and gate of `handle_swiglu_in_state_dict`, the arguments that gate the language model, and the MTP inner layer name with the conditions under which Megatron renames it scanned from Megatron's source (`ast`, host) |
+| T3 | a real Megatron save rewritten and loaded strictly into a fresh model, bit-exact at TP 1 and 2; a GPT mixture-of-experts model (grouped experts at expert-parallel size 1, sequential and grouped at 2; router expert biases compared too) and a hybrid `*E*E` model; a hybrid model, a dense GPT and a tiny LLaVA (GPT language model, CLIP vision encoder, MLP projection; both `TransformerBlock`s stacked in `torch_dist`) through `torch_dist` -> `fsdp_dtensor` -> `torch_dist` with Megatron's own saves and strict loads, every store checked against a real save under its contract, and the GPT and LLaVA `fsdp_dtensor` saves also converted with `--torch-dist-layout per-layer` and loaded strictly (TP 1; TP 2 with `MCORE_FORMAT_CONVERTER_EXTENDED=1`); a GEGLU GPT at TP 2 (packed with `--fsdp-tp 2`) and a LLaVA whose vision encoder is gated under a plain language model (TP 1; TP 2 extended) through the same chain; for SwiGLU models, whose Megatron-FSDP state dicts only a bf16 job builds on current Megatron (the fp32 failure is a strict expected failure) and a bf16 job cannot load without optimizer state, a chain of what that permits (the converted store against a real bf16 Megatron-FSDP save's keys, shapes and dtypes; that save converted back, loaded strictly and compared parameter for parameter; the round trip against the source): a SwiGLU GPT (TP 1; TP 2 extended) and a SwiGLU MoE GPT at expert-parallel size 2 (grouped with shared experts, sequential with biases); a shortcut-MoE hybrid model with an MTP layer: a real `torch_dist` save converted and checked against Megatron-FSDP's save handlers applied to the live model, that handler output converted back, loaded strictly and compared parameter for parameter, and the round trip against the source (contract `D`); hybrid MTP models (two depths, MTP layers with experts, one repeated MTP layer) through the whole chain (container with GPUs) |
 
 Host run (skips the megatron-importing root `conftest.py`):
 
@@ -947,8 +983,8 @@ unsupported input refused with a stable code.
    with the user guide (done).
 5. Mixture-of-experts layers: routed experts in grouped and sequential
    naming, router buffers (done).
-6. GLU `linear_fc1`: SwiGLU split and unsplit, rank-major packs (this version).
-7. Shortcut-MoE layer numbering and hybrid multi-token prediction.
+6. GLU `linear_fc1`: SwiGLU split and unsplit, rank-major packs (done).
+7. Shortcut-MoE layer numbering and hybrid multi-token prediction (this version).
 8. Gated DeltaProduct fused projections.
 9. Mamba-2 fused projections.
 10. Gated DeltaNet fused projections.

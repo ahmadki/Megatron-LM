@@ -61,8 +61,10 @@ checkpoints (`FC-R13`).
 | Hybrid attention and MLP layers (`--hybrid-layer-pattern` with `*` and `-`) | yes | yes | dropped | any source size; the output holds full tensors | synthetic stores; real-save chain at TP 1 and 2 |
 | GPT with dense MLP layers (plain or gated, see gated MLPs below; mixture-of-experts below; no MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
 | Vision-language models in the LLaVA layout (a GPT or hybrid language model above, a vision encoder `vision_model.decoder`, a projection) | yes | yes | dropped | as above | synthetic stores; real-save chain of a tiny LLaVA (GPT language model, CLIP encoder) at TP 1 and 2; hybrid language model on synthetic stores only |
-| Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E` without shortcut connections): routed experts, plain or gated, grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
+| Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E`): routed experts, plain or gated, grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
 | Gated MLPs of the models above (`--swiglu`, `--quick-geglu`, a gated vision encoder or projection): the `linear_fc1` of dense MLPs, shared experts and routed experts, split into SwiGLU halves or kept fused as Megatron-FSDP stores them | yes | yes | dropped | SwiGLU halves: as above; an `fsdp_dtensor` store with fused gated `linear_fc1` is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`, `--fsdp-etp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against halves and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4, expert tensor-parallel size 2); the SwiGLU split predicate pinned to Megatron-FSDP's; the rank-major pack pinned to live Megatron-FSDP models at TP 2 and expert TP 2; real-save chains of a GEGLU GPT at TP 2 and of a LLaVA whose vision encoder is gated under a plain language model (TP 1 and 2); real saves of a SwiGLU GPT (TP 1 and 2) and a SwiGLU mixture-of-experts GPT with shared experts at expert-parallel size 2, whose converted stores hold a Megatron-FSDP save's keys and whose Megatron-FSDP saves convert back and load strictly (see [Limitations](#limitations-and-non-claims)) |
+| Shortcut-connected mixture-of-experts layers of hybrid models (`--moe-shortcut-connection`: each `E` paired with the layer before it into one module, see [Hybrid layer lists](#hybrid-layer-lists)) | yes | yes | dropped | as above | synthetic stores; the grouping pinned to Megatron's `group_layers_into_shortcut_blocks` on edge patterns; a live shortcut model's `torch_dist` keys pinned to its state-dict names; a real `torch_dist` save converted and compared with what Megatron-FSDP's save handlers make of the live model; that handler output converted back, loaded strictly and compared parameter for parameter; the round trip against the source. Current Megatron refuses `--moe-shortcut-connection` with Megatron-FSDP, so no current Megatron job loads such an `fsdp_dtensor` store (see [Limitations](#limitations-and-non-claims)) |
+| Hybrid multi-token prediction (the `/` parts of `--hybrid-layer-pattern`, or the legacy `--mtp-hybrid-override-pattern`; with `--mtp-use-repeated-layer` too), including its mixture-of-experts and shortcut-connected layers | yes | yes | dropped | as above | synthetic stores; the inner layer name pinned to Megatron's; real-save chains of hybrid models with two MTP depths, MTP layers with experts, and one repeated MTP layer |
 
 Model families that later versions add are refused before anything is read,
 with a pending-family code:
@@ -151,7 +153,8 @@ other than those of the supported families are refused (`FC-R13`) unless
 ### Layer lists: stacked or per layer
 
 `fsdp_dtensor` stores one key per layer (`decoder.layers.<l>.<name>`). A
-hybrid decoder is stored per layer in `torch_dist` too. A `TransformerBlock`
+hybrid decoder is stored per layer in `torch_dist` too (see
+[Hybrid layer lists](#hybrid-layer-lists) for how the formats number it). A `TransformerBlock`
 (a GPT decoder, a vision encoder) is stored by `torch_dist` either:
 
 * **stacked**: one key per tensor with the layers along a new first axis
@@ -197,6 +200,50 @@ the manifest records another layout of a block than the one decided, the
 conversion is refused (`FC-A06`) unless a flag chooses that block's layout or
 `--ignore-manifest` is given, so a round trip restores the source's layout or
 fails.
+
+### Hybrid layer lists
+
+A hybrid decoder (`--hybrid-layer-pattern`) is stored one key per layer in
+both formats: `torch_dist` under each layer's position in the pattern
+(`layer_number - 1`, without the `|` stage separators, so the indices are
+global at any pipeline-parallel size) and `fsdp_dtensor` under its index in
+the layer list.
+
+With `--moe-shortcut-connection`, Megatron pairs each mixture-of-experts layer
+(`E`) with the layer before it (a Mamba, Gated DeltaNet or attention layer)
+into one module, whose children hold the two layers (`attn_layer` and
+`moe_layer`) next to the pair's own norms (`shortcut_pre_mlp_layernorm`,
+optionally `shortcut_post_norm`); an `E` at the start of the pattern or right
+after a pair stays a module of its own. `torch_dist` stores each module under
+its first layer's position and `fsdp_dtensor` under its layer-list index, so
+the `torch_dist` indices skip the `E` of every pair. For `E*E-*EE`:
+
+| Module (layer-list index) | 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|---|
+| Layers | `E` | `*E` | `-` | `*E` | `E` |
+| `torch_dist` index | 0 | 1 | 3 | 4 | 6 |
+
+The converter mirrors Megatron's grouping, requires the source to hold exactly
+the layer indices it gives, and checks that every module holds the tensors of
+its layers (an attention's `linear_qkv`, a dense MLP's `linear_fc1`, a
+router's weight; the names of a pair's children are not assumed). A mismatch,
+or a pattern Megatron cannot group, is refused (`FC-R11`) with the whole index
+table: an `E` whose preceding layer is neither in a pair already nor a Mamba,
+Gated DeltaNet or attention layer (the `E` of `-E`, the last `E` of `*EEE`),
+or a pipeline stage after the first that begins with an `E` (`*E|E*`). `plan`
+shows the map (`blocks.decoder`: `dense_to_td` and `symbols`).
+
+Multi-token prediction (MTP) layers are stored under `mtp.layers.<d>`, one per
+depth (the `/` parts of the pattern; a single layer serves every depth with
+`--mtp-use-repeated-layer`), numbered alike in both formats. The inner model
+of a hybrid MTP layer is a hybrid layer list of its part of the pattern,
+stored under `mtp.layers.<d>.mtp_model_layer.layers.<j>` in both formats
+(Megatron renames the inner model to `transformer_layer` for GPT MTP layers
+only) and numbered like the decoder from position 0, shortcut pairs included.
+`args.mtp_num_layers` must agree with the pattern, and MTP layers that the
+arguments do not have are refused (`FC-R11`). MTP layers are built with the
+language model's configuration, so their MLPs must be gated exactly as the
+decoder's are.
 
 ### Mixture-of-experts layers
 
@@ -471,7 +518,7 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** State-space mixers, Gated DeltaNet,
+- **Pending families.** State-space mixers, Gated DeltaNet, GPT
   multi-token prediction and multi-latent attention are refused until the
   versions that add them (see the [Support Matrix](#support-matrix)).
 - **Tensor-parallel-bound `fsdp_dtensor` stores.** A store with fused gated
@@ -490,6 +537,14 @@ directory, the target iteration and the tracker is ever changed.
   expert-parallel-local indices: an `fsdp_dtensor` store with them loads
   correctly only at expert-parallel size 1 (see
   [Mixture-of-experts layers](#mixture-of-experts-layers)).
+- **Shortcut-connected mixture-of-experts layers and Megatron-FSDP.** Current
+  Megatron refuses `--moe-shortcut-connection` with `--use-megatron-fsdp` (the
+  shortcut module bypasses Megatron-FSDP's per-layer parameter all-gather), so
+  no current Megatron job loads the `fsdp_dtensor` store of such a model, and
+  no real Megatron-FSDP save exists to compare it with: the conversion writes
+  the layout a Megatron-FSDP v1 job uses and is checked against what
+  Megatron-FSDP's own save handlers make of the live model. `plan` and
+  `convert` warn when they write such a store.
 - **Megatron-FSDP v1 only.** Megatron-FSDP v2 stores are refused.
 - **bf16 and fp16 Megatron-FSDP jobs.** On current Megatron, a Megatron-FSDP
   job with bf16 or fp16 parameters cannot load any `fsdp_dtensor` store
