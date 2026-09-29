@@ -83,6 +83,13 @@ def test_torch_dist_to_fsdp_context_and_its_log():
             "value": None,
             "evidence": "args.num_experts=None and no routed-expert tensors",
         },
+        {
+            "field": "gated_fc1",
+            "value": {},
+            "evidence": "0 linear_fc1 weights against their linear_fc2 inputs (gated: twice as "
+            "many rows); args.swiglu=False, args.quick_geglu=False make the language model's MLPs "
+            "(in decoder) plain",
+        },
         {"field": "fsdp_model_prefix", "value": "model.module.", "evidence": "dialect mfsdp_v1"},
         {
             "field": "fsdp_optim_depth",

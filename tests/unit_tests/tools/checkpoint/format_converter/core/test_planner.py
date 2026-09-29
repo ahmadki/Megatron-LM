@@ -30,7 +30,7 @@ from tools.checkpoint.format_converter.formats.torch_dist import TorchDistAdapte
 from tools.checkpoint.format_converter.rules.identity import IdentityRule
 
 QKV = "decoder.layers.0.self_attention.linear_qkv.weight"
-FC1 = "decoder.layers.1.mlp.linear_fc1.weight"
+FC2 = "decoder.layers.1.mlp.linear_fc2.weight"
 NORM = "decoder.final_norm.weight"
 
 
@@ -49,7 +49,7 @@ def entry(key: str, shape: tuple[int, ...], grid: list[Region] | None = None) ->
 
 def source(prefix: str = "", **grids) -> dict[str, TensorEntry]:
     """``*-`` hybrid model tensors, stored under ``prefix``."""
-    shapes = {QKV: (6, 4), FC1: (4, 4), NORM: (4,)}
+    shapes = {QKV: (6, 4), FC2: (4, 4), NORM: (4,)}
     return {rel: entry(prefix + rel, shape, grids.get(rel)) for rel, shape in shapes.items()}
 
 
@@ -101,31 +101,31 @@ def test_fsdp_to_torch_dist_merges_chunks_into_one():
         CopyOp(first, Region((0, 0), (3, 4)), Region((0, 0), (3, 4))),
         CopyOp(second, Region((3, 0), (3, 4)), Region((3, 0), (3, 4))),
     )
-    assert sorted(p.key for p in plan.pieces) == sorted([QKV, FC1, NORM])
+    assert sorted(p.key for p in plan.pieces) == sorted([QKV, FC2, NORM])
 
 
 def test_a_stacked_decoder_is_written_one_layer_per_key():
     """A GPT decoder stored stacked, each layer split in two column chunks (tensor parallel)."""
-    fc1, norm = (
-        "decoder.layers.mlp.linear_fc1.weight",
-        "decoder.layers.mlp.linear_fc1.layer_norm_weight",
+    fc2, norm = (
+        "decoder.layers.mlp.linear_fc2.weight",
+        "decoder.layers.mlp.linear_fc2.layer_norm_weight",
     )
     grid = [Region((layer, 0, col), (1, 4, 2)) for layer in (0, 1) for col in (0, 2)]
-    model = {fc1: entry(fc1, (2, 4, 4), grid), norm: entry(norm, (2, 4))}
+    model = {fc2: entry(fc2, (2, 4, 4), grid), norm: entry(norm, (2, 4))}
     args = ArgsView(argparse.Namespace(num_layers=2))
     ctx = build_arch_context(source=TORCH_DIST, target=FSDP_DTENSOR, args=args, model=model)
     (block,) = ctx.blocks
     assert (block.prefix, block.td_layout, block.num_modules) == ("decoder", "stacked", 2)
     plan = plan_model(ctx, model, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=32)
     assert plan.claims == {"identity": 4} and plan.outputs == 4
-    chunks = model[fc1].chunks
+    chunks = model[fc2].chunks
     expected = []
     for layer in (0, 1):
         for rows in (0, 2):  # 16-byte rows, 2 per 32-byte chunk
             left, right = chunks[2 * layer], chunks[2 * layer + 1]
             expected.append(
                 (
-                    f"model.module.decoder.layers.{layer}.mlp.linear_fc1.weight",
+                    f"model.module.decoder.layers.{layer}.mlp.linear_fc2.weight",
                     Region((rows, 0), (2, 4)),
                     (
                         CopyOp(left, Region((layer, rows, 0), (1, 2, 2)), Region((0, 0), (2, 2))),
@@ -133,14 +133,14 @@ def test_a_stacked_decoder_is_written_one_layer_per_key():
                     ),
                 )
             )
-    weights = [p for p in plan.pieces if p.key.endswith("linear_fc1.weight")]
+    weights = [p for p in plan.pieces if p.key.endswith("linear_fc2.weight")]
     assert [(p.key, p.chunk, p.ops) for p in weights] == expected
     assert {p.global_shape for p in weights} == {(4, 4)}
     norms = [p for p in plan.pieces if p.key.endswith("layer_norm_weight")]
     (norm_chunk,) = model[norm].chunks
     assert [(p.key, p.ops) for p in norms] == [
         (
-            f"model.module.decoder.layers.{layer}.mlp.linear_fc1.layer_norm_weight",
+            f"model.module.decoder.layers.{layer}.mlp.linear_fc2.layer_norm_weight",
             (CopyOp(norm_chunk, Region((layer, 0), (1, 4)), Region((0,), (4,))),),
         )
         for layer in (0, 1)
@@ -152,16 +152,16 @@ def test_layers_of_an_fsdp_store_are_stacked_one_chunk_per_layer():
     prefix = "model.module.decoder.layers"
     model = {}
     for layer in (0, 1):
-        key = f"{prefix}.{layer}.mlp.linear_fc1.weight"
+        key = f"{prefix}.{layer}.mlp.linear_fc2.weight"
         model[key.removeprefix("model.module.")] = entry(key, (4, 4), dim0_regions((4, 4), 2))
     args = ArgsView(argparse.Namespace(num_layers=2))
     ctx = build_arch_context(source=FSDP_DTENSOR, target=TORCH_DIST, args=args, model=model)
     assert [(b.prefix, b.td_layout) for b in ctx.blocks] == [("decoder", "stacked")]
     plan = plan_model(ctx, model, TorchDistAdapter(), rules=[IdentityRule()], max_chunk_bytes=8)
-    stacked = "decoder.layers.mlp.linear_fc1.weight"
+    stacked = "decoder.layers.mlp.linear_fc2.weight"
     expected = []
     for layer in (0, 1):
-        top, bottom = model[f"decoder.layers.{layer}.mlp.linear_fc1.weight"].chunks
+        top, bottom = model[f"decoder.layers.{layer}.mlp.linear_fc2.weight"].chunks
         expected.append(
             (
                 Region((layer, 0, 0), (1, 4, 4)),
@@ -176,12 +176,12 @@ def test_layers_of_an_fsdp_store_are_stacked_one_chunk_per_layer():
     assert all(p.planner_path is None for p in plan.pieces)
 
 
-EXPERTS_FC1 = "decoder.layers.mlp.experts.experts.linear_fc1.weight"
+EXPERTS_FC2 = "decoder.layers.mlp.experts.experts.linear_fc2.weight"
 
 
 @pytest.mark.parametrize(
     ("naming", "name"),
-    [("grouped", "linear_fc1.weight{e}"), ("sequential", "local_experts.{e}.linear_fc1.weight")],
+    [("grouped", "linear_fc2.weight{e}"), ("sequential", "local_experts.{e}.linear_fc2.weight")],
 )
 def test_stacked_experts_are_written_one_tensor_per_layer_and_expert(naming, name):
     """torch_dist's ``[L, E, 4, 4]`` saved one chunk per (layer, expert), split in two columns."""
@@ -191,14 +191,14 @@ def test_stacked_experts_are_written_one_tensor_per_layer_and_expert(naming, nam
         for expert in (0, 1, 2)
         for col in (0, 2)
     ]
-    model = {EXPERTS_FC1: entry(EXPERTS_FC1, (2, 3, 4, 4), grid)}
+    model = {EXPERTS_FC2: entry(EXPERTS_FC2, (2, 3, 4, 4), grid)}
     args = ArgsView(argparse.Namespace(num_layers=2, num_experts=3))
     ctx = build_arch_context(
         source=TORCH_DIST, target=FSDP_DTENSOR, args=args, model=model, expert_naming=naming
     )
     plan = plan_model(ctx, model, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=64)
     assert plan.claims == {"identity": 6} and plan.outputs == 6
-    chunks = iter(model[EXPERTS_FC1].chunks)
+    chunks = iter(model[EXPERTS_FC2].chunks)
     expected = []
     for layer in (0, 1):
         for expert in (0, 1, 2):
@@ -227,7 +227,7 @@ def test_stacked_experts_are_written_one_tensor_per_layer_and_expert(naming, nam
 
 @pytest.mark.parametrize(
     ("naming", "name"),
-    [("grouped", "linear_fc1.weight{e}"), ("sequential", "local_experts.{e}.linear_fc1.weight")],
+    [("grouped", "linear_fc2.weight{e}"), ("sequential", "local_experts.{e}.linear_fc2.weight")],
 )
 def test_experts_of_an_fsdp_store_are_stacked_one_chunk_per_layer_and_expert(naming, name):
     model = {}
@@ -255,7 +255,7 @@ def test_experts_of_an_fsdp_store_are_stacked_one_chunk_per_layer_and_expert(nam
                     ),
                 )
             )
-    assert {(p.key, p.global_shape) for p in plan.pieces} == {(EXPERTS_FC1, (2, 3, 4, 4))}
+    assert {(p.key, p.global_shape) for p in plan.pieces} == {(EXPERTS_FC2, (2, 3, 4, 4))}
     assert [(p.chunk, p.ops) for p in plan.pieces] == expected
 
 
@@ -355,4 +355,4 @@ def test_the_registered_rules_plan_a_hybrid_model():
         ctx, model, FsdpMfsdpV1Adapter(), rules=REGISTRY.rules_for(ctx), max_chunk_bytes=2**30
     )
     assert plan.claims == {"identity": 3}
-    assert [p.key for p in plan.pieces] == ["model.module." + k for k in sorted([QKV, FC1, NORM])]
+    assert [p.key for p in plan.pieces] == ["model.module." + k for k in sorted([QKV, FC2, NORM])]

@@ -66,8 +66,8 @@ FC_R11 = "FC-R11"
 """The layer indices a store holds contradict the hybrid layer pattern."""
 
 FC_R12 = "FC-R12"
-"""A block's layers are stacked inconsistently, or its layer (or an fsdp_dtensor store's expert)
-indices are not contiguous."""
+"""A block's layers are stacked inconsistently, its layer (or an fsdp_dtensor store's expert)
+indices are not contiguous, or its gated linear units contradict one another or the arguments."""
 
 FC_R13 = "FC-R13"
 """The store layout is unknown or not a DCP store this tool can read."""

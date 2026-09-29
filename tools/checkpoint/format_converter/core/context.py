@@ -31,6 +31,7 @@ from .args_view import ArgsView
 from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
 from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
+from .glu import GluLayout, glu_layout
 from .keys import root_of
 from .manifest import MANIFEST_FILE, Manifest
 from .names import (
@@ -104,6 +105,8 @@ class ArchContext:
             stacks their layers.
         experts: How each format stores the model's routed experts (``None``
             without mixture-of-experts layers).
+        glu: The model's MLP first projections (``linear_fc1``) and which
+            are gated linear units.
         fsdp_model_prefix: Prefix of the fsdp_dtensor side's model keys.
         fsdp_optim_depth: ``module.`` levels before a parameter name in the
             fsdp_dtensor side's optimizer keys (one more for bf16 and fp16).
@@ -130,6 +133,7 @@ class ArchContext:
     td_content_metadata: Mapping[str, Any] | None
     blocks: tuple[BlockLayout, ...]
     experts: ExpertLayout | None
+    glu: GluLayout
     fsdp_model_prefix: str
     fsdp_optim_depth: str
     dtype_policy: DtypePolicy
@@ -186,8 +190,9 @@ def build_arch_context(
             and ``fp16``, or routed experts that disagree with
             ``args.num_experts``; FC-R11 for layer indices the blocks do not
             explain; FC-R12 for inconsistently stacked layers, layers that
-            cannot be stacked as asked, or expert indices other than
-            ``0..E-1``).
+            cannot be stacked as asked, expert indices other than
+            ``0..E-1``, or gated linear units that contradict one another or
+            the arguments).
         AmbiguousError: The source holds a manifest of another store, or one
             that records another torch_dist layout of a block (FC-A06); a
             block's torch_dist layout cannot be decided (FC-A02); an
@@ -226,6 +231,8 @@ def build_arch_context(
         _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
     experts, evidence = expert_layout(args, model, source, expert_naming)
     log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
+    glu, evidence = glu_layout(args, model, blocks, source, facts.lm_decoder)
+    log.append(Derivation("gated_fc1", glu.to_json(), evidence))
     warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
         experts, model, source
     )
@@ -249,6 +256,7 @@ def build_arch_context(
         td_content_metadata=content_metadata,
         blocks=blocks,
         experts=experts,
+        glu=glu,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
         dtype_policy=DtypePolicy.PRESERVE,

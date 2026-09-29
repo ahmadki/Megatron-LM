@@ -396,6 +396,34 @@ def test_a_vision_language_model_with_decoder_num_layers_round_trips(tmp_path):
     assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
 
 
+def test_a_patch_mergers_lone_linear_fc1_is_converted_unchanged(tmp_path):
+    """A patch merger (``use_merger``: ``PixtralLargePatchMerger``) holds a plain ``nn.Linear``
+    named ``linear_fc1`` with no ``linear_fc2`` beside it: no MLP's first projection, so it
+    converts unchanged both ways."""
+    generator = torch.Generator().manual_seed(29)
+    merger = {
+        "vision_model.merger.pre_norm.weight": torch.randn(4, generator=generator).bfloat16(),
+        "vision_model.merger.linear_fc1.weight": torch.randn(4, 16, generator=generator).bfloat16(),
+    }
+    model = {**VLM, **merger}
+    source = {**VLM_STACKED, **merger}
+    src = write_gpt_source(tmp_path / "src", source)
+    report = convert_checkpoint(
+        src, tmp_path / "fsdp", ConvertOptions(to_format="fsdp_dtensor", workers=0)
+    ).to_json()
+    expect_fsdp_store(tmp_path / "fsdp" / ITER, model)
+    (gated,) = [d for d in report["derivations"] if d["field"] == "gated_fc1"]
+    assert gated["evidence"].endswith(
+        "; 1 linear_fc1 outside every layer with no linear_fc2 beside it (plain linear layers, "
+        "converted unchanged): vision_model.merger.linear_fc1.weight"
+    )
+    convert_checkpoint(tmp_path / "fsdp", tmp_path / "back", ConvertOptions(workers=0))
+    out = tmp_path / "back" / ITER
+    assert set(MetadataView.load(out).tensors) == set(source)
+    for key, tensor in read_tensors(out).items():
+        assert bitwise_equal(tensor, source[key]), key
+
+
 HYBRID_VLM = vision_language_tensors(hybrid_tensors("*-*-"))
 """The vision-language archetype: a per-layer hybrid ``*-*-`` language model and a vision
 encoder, one layer per key (what fsdp_dtensor stores)."""

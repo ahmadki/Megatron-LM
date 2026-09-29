@@ -388,6 +388,33 @@ EXTRA_STATE = re.compile(r"\._extra_state\d*(/|$)")
 """A Transformer Engine ``_extra_state`` key (``_extra_state<i>`` when grouped; torch_dist
 stores it as a tensor or a ``/shard_*`` byte item)."""
 
+FC1 = "linear_fc1"
+"""An MLP's first projection (a gated linear unit's gate and value projections when gated)."""
+
+FC2 = "linear_fc2"
+"""An MLP's second projection, whose inputs are the first projection's (value) outputs."""
+
+LINEAR_FC_WEIGHT = re.compile(r"(?:^|\.)linear_fc[12]\.weight(?:0|[1-9][0-9]*)?$")
+"""The weight of an MLP's first or second projection: ``linear_fc<n>.weight``, or one expert's
+``linear_fc<n>.weight<e>`` of a grouped experts module in fsdp_dtensor."""
+
+
+def is_fc1_path(path: str) -> bool:
+    """Whether ``path`` is the module path of an MLP's first projection (``<...>.linear_fc1``)."""
+    return path == FC1 or path.endswith(f".{FC1}")
+
+
+def fc2_path_of(fc1_path: str) -> str:
+    """The module path of the second projection beside the first projection ``fc1_path``.
+
+    Raises:
+        KeyGrammarError: ``fc1_path`` is not the module path of a first projection.
+    """
+    if not is_fc1_path(fc1_path):
+        raise KeyGrammarError(f"{fc1_path} is not the module path of a {FC1}")
+    return fc1_path[: -len(FC1)] + FC2
+
+
 FC1_WEIGHT = re.compile(r"(?:^|\.)linear_fc1\.weight(?:0|[1-9][0-9]*)?$")
 """The weight of an MLP's first projection (a candidate gated linear unit): ``linear_fc1.weight``,
 or one expert's ``linear_fc1.weight<e>`` of a grouped experts module in fsdp_dtensor."""

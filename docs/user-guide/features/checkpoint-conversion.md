@@ -353,7 +353,7 @@ condition of every code.
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
 | `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size |
 | `FC-R11` | layer indices that contradict the hybrid layer pattern |
-| `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), or layers that differ where they would be stacked |
+| `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), layers that differ where they would be stacked, or gated MLPs that contradict the arguments (`--swiglu`, `--quick-geglu`) or one another |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
 | `FC-R14` | the legacy N-D reformulated layout (load with current Megatron and save again) |
 | `FC-R17` | a store saved with `singleton_local_shards` |
