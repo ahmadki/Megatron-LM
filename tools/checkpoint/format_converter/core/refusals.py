@@ -53,12 +53,11 @@ from .keys import (
     TORCH_DIST_EXPERT_BIAS,
     root_of,
 )
-from .mixers import HYBRID_SPEC_MODULES, is_gdp_spec, spec_name
+from .mixers import GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, is_gdp_spec, spec_name
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P05: "Gated DeltaProduct mixers",
     errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
     errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
@@ -103,7 +102,7 @@ REGISTRY.allow(
     *(
         f"{module}.{name}"
         for module in HYBRID_SPEC_MODULES
-        for name in ("hybrid_stack_spec", "mamba_stack_spec")
+        for name in ("hybrid_stack_spec", "mamba_stack_spec", *sorted(GDP_SPEC_NAMES))
     ),
 )
 
@@ -112,7 +111,7 @@ REGISTRY.sentinel(
         "parameter_parts",
         TORCH_DIST,
         FACTORY_PART,
-        (errors.FC_P05, errors.FC_P08, errors.FC_P09),
+        ("gdp", errors.FC_P08, errors.FC_P09),
         "a parameter stored as parts can only be reassembled by its family's rule",
     )
 )
@@ -130,7 +129,7 @@ REGISTRY.sentinel(
         "fused_mixer_projections",
         FSDP_DTENSOR,
         FUSED_MIXER,
-        (errors.FC_P05, errors.FC_P08, errors.FC_P09),
+        ("gdp", errors.FC_P08, errors.FC_P09),
         "a fused mixer projection is packed per tensor-parallel rank and needs its mixer rule",
     )
 )
@@ -231,12 +230,12 @@ def unsupported_spec(facts: Facts) -> Iterator[Refusal]:
         )
     spec = spec_name(facts.args)
     if spec is not None and spec not in REGISTRY.allowed(Allowlist.STACK_SPECS):
-        if not is_gdp_spec(facts.args):
-            yield Refusal(
-                errors.FC_R03,
-                f"args.spec={spec!r} is not a spec whose keys the rules know",
-                hint="convert a checkpoint built with the default hybrid stack spec",
-            )
+        yield Refusal(
+            errors.FC_R03,
+            f"args.spec={spec!r} is not a spec whose keys the rules know",
+            hint="convert a checkpoint built with the default hybrid stack spec or the Gated "
+            "DeltaProduct stack spec",
+        )
     heterogeneous = [
         f"args.{name}={facts.args.get(name, None)!r}"
         for name in HETEROGENEOUS_ARGS
@@ -506,23 +505,19 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
         yield refusal
 
 
-def _mixer_code(facts: Facts) -> str:
-    """P05 (Gated DeltaProduct) when the spec or the stored parts say so, else P08 (Mamba-2)."""
-    if is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
-        return errors.FC_P05
-    return errors.FC_P08
-
-
 @REGISTRY.detector
-def pending_mixers(facts: Facts) -> Iterator[Refusal]:
-    """FC-P05 / FC-P08: state-space mixers (Gated DeltaProduct or Mamba-2)."""
-    code = _mixer_code(facts)
-    evidence = []
-    if "M" in _symbols(facts):
-        evidence.append("hybrid layer symbol M")
-    if code == errors.FC_P05 and is_gdp_spec(facts.args):
-        evidence.append(f"args.spec={spec_name(facts.args)!r}")
-    yield from _pending(code, evidence, facts.keys_matching(MIXER_PARAM))
+def pending_mamba(facts: Facts) -> Iterator[Refusal]:
+    """FC-P08: state-space mixers that are no Gated DeltaProduct mixers (Mamba-2).
+
+    A model built with the Gated DeltaProduct spec, or whose torch_dist
+    mixers are stored as its parts, passes: the architecture context tells
+    its mixers' family from their names, the spec and their widths, and
+    refuses any contradiction (``core/mixers.py``).
+    """
+    if is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
+        return
+    evidence = ["hybrid layer symbol M"] if "M" in _symbols(facts) else []
+    yield from _pending(errors.FC_P08, evidence, facts.keys_matching(MIXER_PARAM))
 
 
 @REGISTRY.detector

@@ -131,6 +131,13 @@ TORCH_DIST_EXPERTS = {
     for leaf, shape in shapes.items()
 }
 """torch_dist expert tensors (fc1 with biases) of two MoE layers."""
+GDP_SPEC = ["megatron.core.models.hybrid.hybrid_layer_specs", "gated_delta_product_stack_spec"]
+FSDP_MIXER = {
+    "decoder.layers.0.mixer.in_proj.weight": (4 * H, H),
+    "decoder.layers.0.mixer.conv1d.weight": (3 * H, 1, 4),
+}
+"""A mixer's fused projections as fsdp_dtensor stores them: Gated DeltaProduct's, or a legacy
+Mamba-2 store's (the spec tells)."""
 FSDP_SWIGLU_KEYS = {
     **{f"decoder.layers.{layer}.mlp.linear_fc1.weight": None for layer in (1, 3)},
     **{
@@ -265,15 +272,23 @@ CASES = {
             keys={f"decoder.layers.1.mlp.linear_fc1.weight_{part}": (F, H) for part in "wv"},
         ),
     ),
-    "P05 spec": (
-        errors.FC_P05,
-        facts(args={"spec": ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]}),
+    "R03 gated deltaproduct spec of another module": (
+        errors.FC_R03,
+        facts(args={"spec": ["my_package.specs", "gdp_stack_spec"]}),
     ),
-    "P05 parts": (errors.FC_P05, facts(keys={"decoder.layers.0.mixer.in_proj.weight.V0": (H, H)})),
     "P08 symbol": (errors.FC_P08, facts(args={"hybrid_layer_pattern": "M-*-"})),
     "P08 keys": (
         errors.FC_P08,
         facts(keys={"decoder.layers.0.mixer.conv1d_weight": (H, 1, 4)}, source=FSDP_DTENSOR),
+    ),
+    "P08 fused mixer without the gated deltaproduct spec": (
+        errors.FC_P08,
+        facts(
+            args={"hybrid_layer_pattern": "M-*-"},
+            keys=FSDP_MIXER,
+            source=FSDP_DTENSOR,
+            target=TORCH_DIST,
+        ),
     ),
     "P09 symbol": (errors.FC_P09, facts(args={"hybrid_layer_pattern": "G-*-"})),
     "P09 variant": (errors.FC_P09, facts(args={"experimental_attention_variant": "gdn2"})),
@@ -449,16 +464,14 @@ def test_grouped_tensor_parallelism_names_its_arguments():
     )
 
 
-def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses():
-    """A shortcut-MoE hybrid language model with a stacked GLU vision encoder (which converts)."""
+def test_a_gated_deltaproduct_vision_language_hybrid_passes_the_fence():
+    """A shortcut-MoE hybrid language model of Gated DeltaProduct mixers with a stacked GLU vision
+    encoder: every family it uses converts."""
     args = {
         "hybrid_layer_pattern": "M-*E/*E",
         "moe_shortcut_connection": True,
         "num_experts": 8,
-        "spec": [
-            "megatron.core.models.hybrid.hybrid_layer_specs",
-            "gated_delta_product_stack_spec",
-        ],
+        "spec": GDP_SPEC,
     }
     keys = {
         "language_model.decoder.layers.0.mixer.in_proj.weight.z": (H, H),
@@ -470,8 +483,32 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
         "vision_projection.encoder.linear_fc1.weight": (H, H),
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
-    found = facts(args=args, keys=keys)
-    assert codes(found) == [errors.FC_P05]
+    assert codes(facts(args=args, keys=keys)) == []
+    assert codes(facts(args={**args, "spec": None}, keys=keys)) == [errors.FC_P08]
+
+
+@pytest.mark.parametrize(
+    ("args", "keys", "source"),
+    [
+        ({"spec": GDP_SPEC, "hybrid_layer_pattern": "M-*-"}, FSDP_MIXER, FSDP_DTENSOR),
+        (
+            {"hybrid_layer_pattern": "M-*-"},
+            {"decoder.layers.0.mixer.in_proj.weight.Q": (H, H)},
+            TORCH_DIST,
+        ),
+        (
+            {"spec": GDP_SPEC, "hybrid_layer_pattern": "M-*-"},
+            {"decoder.layers.0.mixer.conv1d_weight": (H, 1, 4)},
+            FSDP_DTENSOR,
+        ),
+    ],
+    ids=["fused-gdp-spec", "gdp-parts-without-spec", "mamba-names-under-gdp-spec"],
+)
+def test_gated_deltaproduct_evidence_passes_the_fence(args, keys, source):
+    """The spec or the parts say Gated DeltaProduct: the architecture context decides the mixers'
+    family from their names, the spec and their widths, and refuses contradictions (FC-R10)."""
+    target = TORCH_DIST if source == FSDP_DTENSOR else FSDP_DTENSOR
+    assert codes(facts(args=args, keys=keys, source=source, target=target)) == []
 
 
 def test_refusals_carry_the_evidence():
@@ -497,16 +534,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P05, "mixers", hint="later")
+    pending = Refusal(errors.FC_P08, "mixers", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P05)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P08)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P05: mixers hint: later",
+        "FC-P08: mixers hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

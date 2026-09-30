@@ -626,10 +626,11 @@ def swiglu_grids(tensors: Mapping[str, torch.Tensor]) -> dict[str, tuple[Region,
     return grids
 
 
-def pack_by_ranks(gate: torch.Tensor, value: torch.Tensor, tp: int) -> torch.Tensor:
-    """What ``tp`` column-parallel ranks of a gated linear unit hold, concatenated rank after rank:
-    rank ``r`` holds ``[W_r; V_r]``, its chunk of the gate and of the value."""
-    return torch.cat([torch.cat([gate.chunk(tp)[r], value.chunk(tp)[r]]) for r in range(tp)])
+def pack_by_ranks(parts: Sequence[torch.Tensor], tp: int) -> torch.Tensor:
+    """What ``tp`` column-parallel ranks of a layer whose output concatenates ``parts`` hold,
+    concatenated rank after rank: rank ``r`` holds its chunk of every part, in order (``[W_r; V_r]``
+    for the gate and value of a gated linear unit)."""
+    return torch.cat([torch.cat([part.chunk(tp)[r] for part in parts]) for r in range(tp)])
 
 
 def packed_units(halves: Mapping[str, torch.Tensor], sizes: Callable[[str], int]):
@@ -642,7 +643,7 @@ def packed_units(halves: Mapping[str, torch.Tensor], sizes: Callable[[str], int]
             continue
         if key.endswith("_w"):
             fused = key[: -len("_w")]
-            packed[fused] = pack_by_ranks(tensor, halves[f"{fused}_v"], sizes(fused))
+            packed[fused] = pack_by_ranks((tensor, halves[f"{fused}_v"]), sizes(fused))
         else:
             packed[key] = tensor
     return packed
@@ -794,3 +795,93 @@ def hybrid_mtp_tensors(
                 )
             )
     return tensors
+
+
+def gdp_mixer_tensors(
+    mixer: str,
+    *,
+    d_inner: int,
+    group_state: int,
+    heads: int,
+    householders: int,
+    hidden: int = 8,
+    bias: bool = False,
+    seed: int,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """Random tensors of one Gated DeltaProduct mixer under ``mixer`` (e.g. ``decoder.layers.0.mixer``).
+
+    Returns its fused projections by part, ``{"<mixer>.in_proj.weight": {"z": ..., "V0": ...}}``,
+    each in the order ``GatedDeltaProductMixer`` concatenates them (written out here from its
+    definition: ``in_proj`` is ``z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a`` of sizes ``d``,
+    ``d``, ``GN``, ``GN``, ``H``, ``H``; ``conv1d`` is ``V*, K*, Q``), with their biases if ``bias``,
+    and its other tensors (``in_proj``'s layer norm, ``A_log`` in float32, ``dt_bias``, the gated
+    norm and ``out_proj``). Weights are bfloat16; every part draws its own values.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    steps = range(householders)
+    in_proj = {
+        "z": d_inner,
+        **{f"V{i}": d_inner for i in steps},
+        **{f"K{i}": group_state for i in steps},
+        "Q": group_state,
+        **{f"b{i}": heads for i in steps},
+        "a": heads,
+    }
+    conv = {**{f"V{i}": d_inner for i in steps}, **{f"K{i}": group_state for i in steps}}
+    conv["Q"] = group_state
+    fused = {}
+    for name, parts, rest in (("in_proj", in_proj, (hidden,)), ("conv1d", conv, (1, 4))):
+        for leaf, trailing in (("weight", rest), ("bias", ())) if bias else (("weight", rest),):
+            fused[f"{mixer}.{name}.{leaf}"] = {
+                part: torch.randn(rows, *trailing, generator=generator).bfloat16()
+                for part, rows in parts.items()
+            }
+    others = {
+        f"{mixer}.in_proj.layer_norm_weight": torch.randn(hidden, generator=generator).bfloat16(),
+        f"{mixer}.A_log": torch.randn(heads, generator=generator),
+        f"{mixer}.dt_bias": torch.randn(heads, generator=generator).bfloat16(),
+        f"{mixer}.norm.weight": torch.randn(d_inner, generator=generator).bfloat16(),
+        f"{mixer}.out_proj.weight": torch.randn(hidden, d_inner, generator=generator).bfloat16(),
+    }
+    return fused, others
+
+
+def torch_dist_parts(fused: Mapping[str, Mapping[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Fused projections by part as torch_dist stores them: ``<tensor>.<part>`` each."""
+    return {
+        f"{name}.{part}": value for name, parts in fused.items() for part, value in parts.items()
+    }
+
+
+def packed_projections(
+    fused: Mapping[str, Mapping[str, torch.Tensor]], tp: int
+) -> dict[str, torch.Tensor]:
+    """Fused projections by part as Megatron-FSDP stores them at tensor-parallel size ``tp``: each
+    whole, packed rank after rank (:func:`pack_by_ranks`)."""
+    return {name: pack_by_ranks(tuple(parts.values()), tp) for name, parts in fused.items()}
+
+
+def gdp_hybrid_tensors(
+    pattern: str, mixer: Mapping[str, int], *, hidden: int = 8, bias: bool = False
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """A per-layer hybrid model of ``pattern`` whose ``M`` layers are Gated DeltaProduct mixers of
+    the dimensions ``mixer`` (:func:`gdp_mixer_tensors`), with an embedding, a final norm and an
+    output layer: its mixers' fused projections by part, and every other tensor."""
+    generator = torch.Generator().manual_seed(31)
+    fused: dict[str, dict[str, torch.Tensor]] = {}
+    others = {
+        "embedding.word_embeddings.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+        "decoder.final_norm.weight": torch.randn(hidden, generator=generator),
+        "output_layer.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+    }
+    for index, symbol in enumerate(pattern):
+        layer = f"decoder.layers.{index}"
+        if symbol == "M":
+            projections, rest = gdp_mixer_tensors(
+                f"{layer}.mixer", hidden=hidden, bias=bias, seed=index, **mixer
+            )
+            fused.update(projections)
+            others.update(rest)
+        else:
+            others.update(hybrid_layer_tensors(layer, symbol, hidden=hidden, seed=index))
+    return fused, others

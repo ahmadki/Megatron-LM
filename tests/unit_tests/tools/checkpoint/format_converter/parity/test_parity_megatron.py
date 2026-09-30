@@ -61,11 +61,17 @@ def test_patterns_parse_like_megatron(pattern):
     assert ours.mtp == (theirs.mtp_pattern,) * theirs.mtp_num_depths
 
 
-def test_the_verified_specs_are_megatrons_default_hybrid_stack_spec():
-    default = importlib.import_module(HYBRID_SPEC_MODULES[0]).hybrid_stack_spec
+def test_the_verified_specs_are_megatrons_default_and_gated_deltaproduct_stack_specs():
+    specs = importlib.import_module(HYBRID_SPEC_MODULES[0])
     for name in REGISTRY.allowed(Allowlist.STACK_SPECS):
         module, _, attribute = name.rpartition(".")
-        assert getattr(importlib.import_module(module), attribute) is default, name
+        spec = getattr(importlib.import_module(module), attribute)
+        expected = (
+            specs.gated_delta_product_stack_spec
+            if attribute in GDP_SPEC_NAMES
+            else specs.hybrid_stack_spec
+        )
+        assert spec is expected, name
 
 
 def test_the_gated_deltaproduct_spec_names_exist():

@@ -392,8 +392,9 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         metavar="N",
         help="torch_dist to fsdp_dtensor: the tensor-parallel size of the job that will load the "
-        "store; fsdp_dtensor packs fused tensors (a gated linear_fc1 it does not split) per "
-        "tensor-parallel rank, so the store only loads at this size, which its arguments record "
+        "store; fsdp_dtensor packs fused tensors (a gated linear_fc1 it does not split, a Gated "
+        "DeltaProduct mixer's in_proj and conv1d) per tensor-parallel rank, so the store only "
+        "loads at this size, which its arguments record "
         "(default: the source's, if it is 1; required otherwise when such tensors exist)",
     )
     parser.add_argument(

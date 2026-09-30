@@ -31,6 +31,7 @@ from ..core.context import ArchContext
 from ..core.glu import Fc1
 from ..core.logical import LogicalCopy, LogicalId, LogicalOutput, LogicalSlice
 from ..core.names import FSDP_DTENSOR
+from ..core.part_layout import rows_box, unpack_copies
 from ..core.registry import REGISTRY
 from ..core.rule import FamilyInstance, LeafRule, LogicalPool, Stage
 from ..engine.regions import Region
@@ -94,24 +95,12 @@ def _unpacked(
 ) -> tuple[LogicalOutput, ...]:
     """The two halves cut out of the whole tensor ``piece`` packed at ``pack``."""
     rest = piece.shape[1:]
-    copies: dict[str, list[LogicalCopy]] = {part: [] for part in fc1.parts.parts}
-    for run in fc1.parts.rank_major_map(pack):
-        copies[run.part].append(
-            LogicalCopy(
-                piece.lid,
-                _rows(run.fused_start, run.rows, rest),
-                _rows(run.part_start, run.rows, rest),
-            )
-        )
     dtype = ctx.dtype_policy.output_dtype(piece.dtype)
     return tuple(
         LogicalOutput(
-            dataclasses.replace(whole, part=part),
-            (fc1.parts.size(part), *rest),
-            dtype,
-            tuple(part_copies),
+            dataclasses.replace(whole, part=part), (fc1.parts.size(part), *rest), dtype, copies
         )
-        for part, part_copies in copies.items()
+        for part, copies in unpack_copies(fc1.parts, pack, piece.lid, rest).items()
     )
 
 
@@ -127,14 +116,9 @@ def _packed(
         tuple(
             LogicalCopy(
                 piece.lid,
-                _rows(move.src_start, move.rows, rest),
-                _rows(move.dst_start, move.rows, rest),
+                rows_box(move.src_start, move.rows, rest),
+                rows_box(move.dst_start, move.rows, rest),
             )
             for move in fc1.parts.repack_map(1, pack)
         ),
     )
-
-
-def _rows(start: int, rows: int, rest: tuple[int, ...]) -> Region:
-    """Rows ``[start, start + rows)`` of a tensor whose other dimensions are ``rest``."""
-    return Region((start,) + (0,) * len(rest), (rows, *rest))

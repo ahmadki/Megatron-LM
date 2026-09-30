@@ -90,9 +90,6 @@ FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant), or
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
-FC_P05 = "FC-P05"
-"""Pending: Gated DeltaProduct mixers."""
-
 FC_P08 = "FC-P08"
 """Pending: Mamba-2 mixers."""
 

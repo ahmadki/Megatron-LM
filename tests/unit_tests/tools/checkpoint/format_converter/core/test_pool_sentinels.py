@@ -128,7 +128,7 @@ def test_rules_run_in_stage_then_name_order_when_enabled():
 def test_sentinels_are_named_owned_and_per_format():
     registry = RuleRegistry()
     parts = Sentinel(
-        "parts", "torch_dist", re.compile(r"\.weight\.[a-z]"), ("FC-P05",), "parameter parts"
+        "parts", "torch_dist", re.compile(r"\.weight\.[a-z]"), ("FC-P08",), "parameter parts"
     )
     registry.sentinel(parts)
     registry.sentinel(

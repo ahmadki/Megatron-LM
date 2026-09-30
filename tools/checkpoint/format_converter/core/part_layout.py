@@ -27,16 +27,20 @@ would interleave). :meth:`PartLayout.rank_major_map` gives, for a pack size
             o += size_p / tp
 
 Packing copies part rows into the fused rows, unpacking copies them back,
-along the same map; :meth:`PartLayout.repack_map` moves the rows of a fused
-tensor packed at one size into the tensor packed at another.
+along the same map (:func:`pack_copies`, :func:`unpack_copies`);
+:meth:`PartLayout.repack_map` moves the rows of a fused tensor packed at one
+size into the tensor packed at another.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .. import errors
+from ..engine.regions import Region
 from ..errors import InternalError, Refusal
+from .logical import LogicalCopy, LogicalId
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,3 +179,53 @@ class PartLayout:
                 f"tensor-parallel size {tp} they are packed at",
                 hint="pack at a tensor-parallel size that divides every part",
             ).to_error()
+
+
+def rows_box(start: int, rows: int, rest: tuple[int, ...]) -> Region:
+    """Rows ``[start, start + rows)`` of a tensor whose other dimensions are ``rest``."""
+    return Region((start,) + (0,) * len(rest), (rows, *rest))
+
+
+def pack_copies(
+    layout: PartLayout, tp: int, parts: Mapping[str, LogicalId], rest: tuple[int, ...]
+) -> tuple[LogicalCopy, ...]:
+    """The copies that pack the logical tensors ``parts`` (by part name) rank-major at ``tp``.
+
+    Args:
+        layout: The parts of the fused tensor.
+        tp: The pack size.
+        parts: The logical tensor of each part, of shape ``(size, *rest)``.
+        rest: The dimensions after the first, shared by the parts and the fused tensor.
+
+    Raises:
+        RefusedError: A part size does not divide by ``tp`` (FC-R10).
+    """
+    return tuple(
+        LogicalCopy(
+            parts[run.part],
+            rows_box(run.part_start, run.rows, rest),
+            rows_box(run.fused_start, run.rows, rest),
+        )
+        for run in layout.rank_major_map(tp)
+    )
+
+
+def unpack_copies(
+    layout: PartLayout, tp: int, fused: LogicalId, rest: tuple[int, ...]
+) -> dict[str, tuple[LogicalCopy, ...]]:
+    """The copies that cut each part out of the logical tensor ``fused`` packed rank-major at
+    ``tp``, by part name (in the layout's order).
+
+    Raises:
+        RefusedError: A part size does not divide by ``tp`` (FC-R10).
+    """
+    copies: dict[str, list[LogicalCopy]] = {part: [] for part in layout.parts}
+    for run in layout.rank_major_map(tp):
+        copies[run.part].append(
+            LogicalCopy(
+                fused,
+                rows_box(run.fused_start, run.rows, rest),
+                rows_box(run.part_start, run.rows, rest),
+            )
+        )
+    return {part: tuple(part_copies) for part, part_copies in copies.items()}
