@@ -57,7 +57,7 @@ from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P04: "shortcut-MoE layer numbering and hybrid multi-token prediction",
+    errors.FC_P04: "hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
     errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
@@ -529,14 +529,12 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
 
 
 @REGISTRY.detector
-def pending_shortcut_and_hybrid_mtp(facts: Facts) -> Iterator[Refusal]:
-    """FC-P04: shortcut-MoE numbering or hybrid multi-token prediction."""
+def pending_hybrid_mtp(facts: Facts) -> Iterator[Refusal]:
+    """FC-P04: hybrid multi-token prediction."""
     pattern = hybrid_pattern_of(facts.args)
     if pattern is None:
         return
     evidence = []
-    if facts.args.get("moe_shortcut_connection", False):
-        evidence.append("args.moe_shortcut_connection=True")
     if pattern.mtp:
         evidence.append(f"{len(pattern.mtp)} MTP depth(s) in the hybrid layer pattern")
     elif facts.args.get("mtp_num_layers", None):

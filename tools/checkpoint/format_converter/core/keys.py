@@ -53,7 +53,7 @@ half, and :data:`SWIGLU_KEYS` are the names it splits.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from ..errors import InternalError
@@ -382,10 +382,41 @@ GDP_PART = re.compile(r"\.mixer\.(?:in_proj|conv1d)\.(?:weight|bias)\.(?:[VKb][0
 GDN_PARAM = re.compile(r"\.self_attention\.(?:in_proj|conv1d)\.")
 """A projection of a Gated DeltaNet attention (standard attention has ``linear_qkv``)."""
 
-MLA_PARAM = re.compile(
-    r"\.self_attention\.(?:linear_q_proj|linear_(?:q|kv|qkv)_(?:down|up)_proj)\."
-)
+_MLA_PROJECTION = r"self_attention\.(?:linear_q_proj|linear_(?:q|kv|qkv)_(?:down|up)_proj)\."
+
+MLA_PARAM = re.compile(r"\." + _MLA_PROJECTION)
 """A projection of multi-latent attention."""
+
+
+@dataclass(frozen=True, slots=True)
+class LayerFamily:
+    """The tensors that identify one type of hybrid layer (its *family signature*).
+
+    Attributes:
+        tensors: What they are, for messages (e.g. ``self_attention.linear_qkv``).
+        pattern: Searched in the names inside a module of a hybrid layer list.
+    """
+
+    tensors: str
+    pattern: re.Pattern[str]
+
+
+LAYER_FAMILIES: Mapping[str, LayerFamily] = {
+    "M": LayerFamily(
+        "mixer.in_proj, mixer.conv1d", re.compile(r"(?:^|\.)mixer\.(?:in_proj|conv1d)[._]")
+    ),
+    "G": LayerFamily("self_attention.in_proj", re.compile(r"(?:^|\.)self_attention\.in_proj\.")),
+    "*": LayerFamily(
+        "self_attention.linear_qkv", re.compile(r"(?:^|\.)self_attention\.linear_qkv\.")
+    ),
+    "+": LayerFamily("self_attention.linear_q*_proj", re.compile(r"(?:^|\.)" + _MLA_PROJECTION)),
+    "-": LayerFamily("mlp.linear_fc1", re.compile(r"(?:^|\.)mlp\.linear_fc1\.")),
+    "E": LayerFamily("mlp.router.weight", re.compile(r"(?:^|\.)mlp\.router\.weight$")),
+}
+"""The family signature of the layers of each hybrid symbol: a state-space mixer's input
+projection or convolution (``M``), a Gated DeltaNet's input projection (``G``), a self-attention's
+fused QKV projection (``*``) or multi-latent projections (``+``), a dense MLP's first projection
+(``-``) and a mixture-of-experts router (``E``)."""
 
 TE_OP_FUSER_MLP = re.compile(r"\.mlp\.[0-9]+\.")
 """An MLP built with Transformer Engine's operation fuser (``mlp.<i>.basic_ops...``)."""

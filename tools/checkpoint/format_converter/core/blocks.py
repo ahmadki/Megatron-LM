@@ -51,7 +51,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
-from .hybrid_pattern import group_modules, hybrid_pattern_of
+from .hybrid_pattern import family_mismatch, group_modules, hybrid_pattern_of
 from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, root_of, split_layer_key
 from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
 from .registry import REGISTRY
@@ -342,8 +342,9 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
 
     Raises:
         RefusedError: A block's stored layer indices or ``args.num_layers``
-            disagree with its layout, or a hybrid pattern cannot be grouped
-            into modules (FC-R11), or a block's stacking is inconsistent (FC-R12).
+            disagree with its layout, a hybrid pattern cannot be grouped into
+            modules, or a hybrid module holds the tensors of other layer types
+            than its symbols (FC-R11); or a block's stacking is inconsistent (FC-R12).
         AmbiguousError: A block's torch_dist layout cannot be decided (FC-A02).
         UsageError: ``facts.layouts`` names a block that is not a
             ``TransformerBlock`` of the model.
@@ -360,6 +361,8 @@ def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[B
     for block in blocks:
         if facts.source == FSDP_DTENSOR or not block.stacked:
             _check_stored_indices(block, facts.model, facts.source)
+        if block.symbols is not None:
+            _check_families(block, block.symbols, facts.census.get(block.prefix), facts.source)
     return tuple(sorted(blocks, key=lambda block: block.prefix))
 
 
@@ -388,11 +391,7 @@ def _check_stored_indices(block: BlockLayout, model: Mapping[str, Any], source: 
     expected = set(block.stored_indices(source))
     if stored != expected:
         missing, unexpected = sorted(expected - stored), sorted(stored - expected)
-        table = (
-            ""
-            if block.symbols is None
-            else f"; its modules (dense: torch_dist index, symbols) are {block.index_table()}"
-        )
+        table = "" if block.symbols is None else _module_table(block)
         raise Refusal(
             errors.FC_R11,
             f"{block.prefix}: {block.evidence} means {source} layer indices "
@@ -400,6 +399,39 @@ def _check_stored_indices(block: BlockLayout, model: Mapping[str, Any], source: 
             f"(missing {missing or 'none'}, unexpected {unexpected or 'none'}){table}",
             hint="check that the arguments belong to this checkpoint",
         ).to_error()
+
+
+def _check_families(
+    block: BlockLayout, modules: tuple[str, ...], census: BlockCensus | None, source: str
+) -> None:
+    """Every module of a hybrid block holds the tensors of its layers' symbols ``modules`` (FC-R11).
+
+    See :func:`~.hybrid_pattern.family_mismatch`; the modules are read under
+    their ``source`` index, each key in its innermost block.
+    """
+    layers = {} if census is None else census.layers
+    wrong: list[str] = []
+    keys: list[str] = []
+    for dense, symbols in enumerate(modules):
+        stored = block.stored_index(dense, source)
+        names = sorted(layers.get(stored, {}))
+        reason = family_mismatch(symbols, names)
+        if reason is not None:
+            wrong.append(f"module {dense} ({source} index {stored}, {symbols!r}): {reason}")
+            keys.extend(join_layer_key(block.prefix, stored, name) for name in names)
+    if wrong:
+        raise Refusal(
+            errors.FC_R11,
+            f"{block.prefix}: the tensors of {len(wrong)} of its {block.num_modules} modules "
+            f"contradict {block.evidence}: {'; '.join(wrong)}{_module_table(block)}",
+            keys=tuple(keys),
+            hint="check that the arguments belong to this checkpoint",
+        ).to_error()
+
+
+def _module_table(block: BlockLayout) -> str:
+    """The full index table of a hybrid block, for refusals."""
+    return f"; its modules (dense: torch_dist index, symbols) are {block.index_table()}"
 
 
 def _count(count: int, noun: str) -> str:

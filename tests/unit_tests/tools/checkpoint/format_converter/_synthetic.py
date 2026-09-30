@@ -646,3 +646,113 @@ def packed_units(halves: Mapping[str, torch.Tensor], sizes: Callable[[str], int]
         else:
             packed[key] = tensor
     return packed
+
+
+PAIR_CHILDREN = ("attn_layer", "moe_layer")
+"""The children of Megatron's ``ShortcutMoEBlock``: the layer before the MoE layer, and the MoE
+layer."""
+
+
+def hybrid_layer_tensors(
+    layer: str, symbol: str, *, experts: int = 4, hidden: int = 8, ffn: int = 16, seed: int
+) -> dict[str, torch.Tensor]:
+    """Random tensors of one hybrid layer under ``layer`` (e.g. ``decoder.layers.2``).
+
+    Attention (``*``: fused QKV with its norm, and the output projection), a
+    dense MLP (``-``) or a mixture-of-experts layer (``E``: see
+    :func:`moe_layer_tensors`, grouped expert names without biases); bfloat16
+    weights, float32 norms and router bias.
+    """
+    if symbol == "E":
+        return moe_layer_tensors(layer, experts, hidden, bias=False, seed=seed)
+    shapes = {
+        "*": {
+            "self_attention.linear_qkv.weight": (3 * hidden, hidden),
+            "self_attention.linear_qkv.layer_norm_weight": (hidden,),
+            "self_attention.linear_proj.weight": (hidden, hidden),
+        },
+        "-": {
+            "mlp.linear_fc1.weight": (ffn, hidden),
+            "mlp.linear_fc1.layer_norm_weight": (hidden,),
+            "mlp.linear_fc2.weight": (hidden, ffn),
+        },
+    }[symbol]
+    generator = torch.Generator().manual_seed(seed)
+    return {
+        f"{layer}.{name}": torch.randn(shape, generator=generator).to(
+            torch.float32 if name.endswith("norm_weight") else torch.bfloat16
+        )
+        for name, shape in shapes.items()
+    }
+
+
+def hybrid_module_tensors(
+    module: str,
+    symbols: str,
+    *,
+    seed: int,
+    children: tuple[str, str] = PAIR_CHILDREN,
+    experts: int = 4,
+    hidden: int = 8,
+) -> dict[str, torch.Tensor]:
+    """Random tensors of one module of a hybrid layer list under ``module``: a layer
+    (:func:`hybrid_layer_tensors`), or a shortcut pair (``*E``) whose layers are its ``children``,
+    with the pair's own float32 pre-MLP norm (``shortcut_pre_mlp_layernorm``)."""
+    if len(symbols) == 1:
+        return hybrid_layer_tensors(module, symbols, experts=experts, hidden=hidden, seed=seed)
+    tensors = {}
+    for index, (child, symbol) in enumerate(zip(children, symbols)):
+        tensors.update(
+            hybrid_layer_tensors(
+                f"{module}.{child}", symbol, experts=experts, hidden=hidden, seed=seed + index
+            )
+        )
+    generator = torch.Generator().manual_seed(seed + len(symbols))
+    tensors[f"{module}.shortcut_pre_mlp_layernorm.weight"] = torch.randn(
+        hidden, generator=generator
+    )
+    return tensors
+
+
+def shortcut_hybrid_tensors(
+    modules: Sequence[str],
+    *,
+    children: tuple[str, str] = PAIR_CHILDREN,
+    experts: int = 4,
+    hidden: int = 8,
+) -> dict[str, torch.Tensor]:
+    """A hybrid model whose decoder's layer list holds ``modules`` (symbols of each, in layer-list
+    order), one key per module and expert under its layer-list index, as fsdp_dtensor stores it,
+    with an embedding, a final norm and an output layer; each module draws its own values."""
+    generator = torch.Generator().manual_seed(21)
+    tensors = {
+        "embedding.word_embeddings.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+        "decoder.final_norm.weight": torch.randn(hidden, generator=generator),
+        "output_layer.weight": torch.randn(32, hidden, generator=generator).bfloat16(),
+    }
+    for dense, symbols in enumerate(modules):
+        tensors.update(
+            hybrid_module_tensors(
+                f"decoder.layers.{dense}",
+                symbols,
+                seed=100 * dense,
+                children=children,
+                experts=experts,
+                hidden=hidden,
+            )
+        )
+    return tensors
+
+
+def renumber_layers(
+    tensors: Mapping[str, torch.Tensor], block: str, stored: Sequence[int]
+) -> dict[str, torch.Tensor]:
+    """The tensors with the layer ``d`` of ``block`` stored under the index ``stored[d]``."""
+    head = f"{block}.layers."
+    renamed = {}
+    for key, tensor in tensors.items():
+        if key.startswith(head) and key[len(head)].isdigit():
+            index, name = key[len(head) :].split(".", 1)
+            key = f"{head}{stored[int(index)]}.{name}"
+        renamed[key] = tensor
+    return renamed

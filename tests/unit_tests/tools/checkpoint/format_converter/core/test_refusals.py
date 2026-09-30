@@ -93,6 +93,13 @@ def test_a_supported_hybrid_model_passes_in_both_directions():
     assert codes(facts(source=FSDP_DTENSOR, target=TORCH_DIST)) == []
 
 
+def test_shortcut_moe_models_pass():
+    """Their numbering is checked against the keys when the blocks are laid out (FC-R11)."""
+    shortcut = {"hybrid_layer_pattern": "*E*E", "moe_shortcut_connection": True, "num_experts": 4}
+    assert codes(facts(args=shortcut)) == []
+    assert codes(facts(args=shortcut, source=FSDP_DTENSOR, target=TORCH_DIST)) == []
+
+
 GPT_ARGS = {"hybrid_layer_pattern": None}
 E = 4
 EP2 = {"num_experts": E, "expert_model_parallel_size": 2}
@@ -251,7 +258,6 @@ CASES = {
             keys={f"decoder.layers.1.mlp.linear_fc1.weight_{part}": (F, H) for part in "wv"},
         ),
     ),
-    "P04 shortcut": (errors.FC_P04, facts(args={"moe_shortcut_connection": True})),
     "P04 hybrid mtp": (errors.FC_P04, facts(args={"hybrid_layer_pattern": "*-*-/*-"})),
     "P04 legacy mtp": (
         errors.FC_P04,
@@ -473,10 +479,10 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
 
 
 def test_refusals_carry_the_evidence():
-    (refusal,) = detect_refusals(facts(args={"moe_shortcut_connection": True}))
+    (refusal,) = detect_refusals(facts(args={"hybrid_layer_pattern": "*-*-/*-/*-"}))
     assert refusal.message == (
-        "not supported yet: shortcut-MoE layer numbering and hybrid multi-token prediction "
-        "(args.moe_shortcut_connection=True)"
+        "not supported yet: hybrid multi-token prediction (2 MTP depth(s) in the hybrid layer "
+        "pattern)"
     )
     (refusal,) = detect_refusals(CASES["R05 grouped biases for fsdp"][1])
     assert refusal.message == (

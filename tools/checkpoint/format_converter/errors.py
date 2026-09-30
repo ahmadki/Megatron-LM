@@ -64,7 +64,8 @@ parts do not divide by the pack size, or the pack size a store's arguments give 
 conversion manifest."""
 
 FC_R11 = "FC-R11"
-"""The layer indices a store holds contradict the hybrid layer pattern."""
+"""The layer indices or the tensors of the layers a store holds contradict the hybrid layer
+pattern, or its shortcut-MoE grouping is impossible."""
 
 FC_R12 = "FC-R12"
 """A block's layers are stacked inconsistently, its layer (or an fsdp_dtensor store's expert)
@@ -90,7 +91,7 @@ FC_R20 = "FC-R20"
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
 FC_P04 = "FC-P04"
-"""Pending: shortcut-MoE layer numbering or hybrid multi-token prediction."""
+"""Pending: hybrid multi-token prediction."""
 
 FC_P05 = "FC-P05"
 """Pending: Gated DeltaProduct mixers."""

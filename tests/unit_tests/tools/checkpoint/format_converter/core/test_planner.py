@@ -30,6 +30,7 @@ from tools.checkpoint.format_converter.formats.torch_dist import TorchDistAdapte
 from tools.checkpoint.format_converter.rules.identity import IdentityRule
 
 QKV = "decoder.layers.0.self_attention.linear_qkv.weight"
+FC1 = "decoder.layers.1.mlp.linear_fc1.weight"
 FC2 = "decoder.layers.1.mlp.linear_fc2.weight"
 NORM = "decoder.final_norm.weight"
 
@@ -49,7 +50,7 @@ def entry(key: str, shape: tuple[int, ...], grid: list[Region] | None = None) ->
 
 def source(prefix: str = "", **grids) -> dict[str, TensorEntry]:
     """``*-`` hybrid model tensors, stored under ``prefix``."""
-    shapes = {QKV: (6, 4), FC2: (4, 4), NORM: (4,)}
+    shapes = {QKV: (6, 4), FC1: (4, 4), FC2: (4, 4), NORM: (4,)}
     return {rel: entry(prefix + rel, shape, grids.get(rel)) for rel, shape in shapes.items()}
 
 
@@ -63,7 +64,7 @@ def test_torch_dist_to_fsdp_pieces_are_split_and_read_the_right_boxes():
     model = source(**{QKV: split})
     ctx = context(TORCH_DIST, FSDP_DTENSOR, model)
     plan = plan_model(ctx, model, FsdpMfsdpV1Adapter(), rules=[IdentityRule()], max_chunk_bytes=32)
-    assert plan.claims == {"identity": 3} and plan.outputs == 3
+    assert plan.claims == {"identity": 4} and plan.outputs == 4
     qkv = [p for p in plan.pieces if p.key == "model.module." + QKV]
     chunk_a, chunk_b = model[QKV].chunks
     expected = []
@@ -101,7 +102,7 @@ def test_fsdp_to_torch_dist_merges_chunks_into_one():
         CopyOp(first, Region((0, 0), (3, 4)), Region((0, 0), (3, 4))),
         CopyOp(second, Region((3, 0), (3, 4)), Region((3, 0), (3, 4))),
     )
-    assert sorted(p.key for p in plan.pieces) == sorted([QKV, FC2, NORM])
+    assert sorted(p.key for p in plan.pieces) == sorted([QKV, FC1, FC2, NORM])
 
 
 def test_a_stacked_decoder_is_written_one_layer_per_key():
@@ -354,8 +355,10 @@ def test_the_registered_rules_plan_a_hybrid_model():
     plan = plan_model(
         ctx, model, FsdpMfsdpV1Adapter(), rules=REGISTRY.rules_for(ctx), max_chunk_bytes=2**30
     )
-    assert plan.claims == {"identity": 3}
-    assert [p.key for p in plan.pieces] == ["model.module." + k for k in sorted([QKV, FC2, NORM])]
+    assert plan.claims == {"identity": 4}
+    assert [p.key for p in plan.pieces] == [
+        "model.module." + k for k in sorted([QKV, FC1, FC2, NORM])
+    ]
 
 
 SHORTCUT_KEYS = {

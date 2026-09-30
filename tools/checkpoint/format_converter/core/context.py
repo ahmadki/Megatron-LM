@@ -34,6 +34,7 @@ from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
 from .format_args import GLU_ARGS
 from .glu import Fc1, GluLayout, glu_layout, swiglu_split
+from .hybrid_pattern import shortcut_warnings
 from .keys import root_of
 from .logical import LogicalId
 from .manifest import MANIFEST_FILE, Manifest
@@ -302,8 +303,10 @@ def build_arch_context(
     )
     glu, evidence = swiglu_split(glu, fsdp_swiglu, blocks, source, experts)
     log.append(Derivation("swiglu_split", glu.split_json(), evidence))
-    warnings = requested_layout_warnings(facts, blocks) + grouped_bias_warnings(
-        experts, model, source
+    warnings = (
+        requested_layout_warnings(facts, blocks)
+        + grouped_bias_warnings(experts, model, source)
+        + shortcut_warnings(args, target)
     )
     packs = _Packs(direction, glu, manifest, log, warnings, args=args, src_tp=tp, fsdp_tp=fsdp_tp)
     pack_tp = packs.size(TENSOR_PARALLEL, saved=tp, flag=fsdp_tp)

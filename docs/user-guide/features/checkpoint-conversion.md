@@ -69,7 +69,7 @@ with a pending-family code:
 
 | Code | Family |
 |---|---|
-| `FC-P04` | shortcut-MoE layer numbering and hybrid multi-token prediction |
+| `FC-P04` | hybrid multi-token prediction |
 | `FC-P05` | Gated DeltaProduct mixers |
 | `FC-P08` | Mamba-2 mixers |
 | `FC-P09` | Gated DeltaNet and linear attention |
@@ -250,8 +250,7 @@ Refused as well: single grouped expert parameters
 (`--moe-single-grouped-weight`, `--moe-single-grouped-bias`, which
 Megatron-FSDP does not support; `FC-R04`), the legacy `GroupedMLP`
 (`weight1`/`weight2`; `FC-R13`) and checkpoints saved with
-`singleton_local_shards` (`FC-R17`). Shortcut-connected mixture-of-experts
-layers are pending (`FC-P04`).
+`singleton_local_shards` (`FC-R17`).
 
 ### Gated MLPs (SwiGLU)
 
@@ -436,7 +435,7 @@ condition of every code.
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
 | `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size, or whose pack size the manifest records otherwise; a padded vocabulary that does not divide by `--fsdp-tp` |
-| `FC-R11` | layer indices that contradict the hybrid layer pattern |
+| `FC-R11` | layer indices or layer tensors that contradict the hybrid layer pattern, or a pattern whose shortcut-MoE layers Megatron cannot group |
 | `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), layers that differ where they would be stacked, or gated MLPs that contradict the arguments (`--swiglu`, `--quick-geglu`) or one another |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
 | `FC-R14` | the legacy N-D reformulated layout (load with current Megatron and save again) |
@@ -474,9 +473,8 @@ directory, the target iteration and the tracker is ever changed.
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
 - **Pending families.** State-space mixers, Gated DeltaNet,
-  multi-token prediction, multi-latent attention and shortcut-connected
-  mixture-of-experts layers are refused until the versions that add them
-  (see the [Support Matrix](#support-matrix)).
+  multi-token prediction and multi-latent attention are refused until the
+  versions that add them (see the [Support Matrix](#support-matrix)).
 - **Tensor-parallel-bound `fsdp_dtensor` stores.** A store with fused gated
   `linear_fc1` loads right only at the tensor-parallel sizes it was packed at,
   and the Megatron-FSDP loader does not check them (see

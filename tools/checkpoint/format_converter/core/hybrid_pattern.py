@@ -14,16 +14,20 @@ With ``--moe-shortcut-connection``, Megatron's ``HybridStack`` groups each
 mixture-of-experts layer (``E``) with the layer before it into one module
 (``group_layers_into_shortcut_blocks``, ``models/hybrid/shortcut_block.py``),
 so its layer list has fewer modules than the pattern has layers:
-:func:`group_modules` mirrors that grouping.
+:func:`group_modules` mirrors that grouping, and :func:`family_mismatch`
+checks that the tensors a module holds are those of its layers' symbols.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .. import errors
-from ..errors import Refusal, RefusalError
+from ..errors import InternalError, Refusal, RefusalError
 from .args_view import ArgsView
+from .keys import LAYER_FAMILIES
+from .names import FSDP_DTENSOR
 
 PIPE = "|"
 MTP_SEPARATOR = "/"
@@ -151,6 +155,18 @@ def group_modules(
     return tuple(modules)
 
 
+def shortcut_warnings(args: ArgsView, target: str) -> list[str]:
+    """Why no current Megatron job loads an fsdp_dtensor ``target`` of a shortcut-MoE model:
+    Megatron refuses ``--moe-shortcut-connection`` with Megatron-FSDP (``validate_args``)."""
+    if target != FSDP_DTENSOR or not args.get("moe_shortcut_connection", False):
+        return []
+    return [
+        "args.moe_shortcut_connection=True: Megatron refuses --moe-shortcut-connection with "
+        "Megatron-FSDP, so no current Megatron job loads this fsdp_dtensor store (it is written "
+        "in the layout a Megatron-FSDP v1 job uses)"
+    ]
+
+
 def _shortcut_refusal(symbols: str, reason: str) -> RefusalError:
     return Refusal(
         errors.FC_R11,
@@ -158,3 +174,57 @@ def _shortcut_refusal(symbols: str, reason: str) -> RefusalError:
         f"{symbols!r}: {reason}",
         hint="check that the arguments belong to this checkpoint",
     ).to_error()
+
+
+def family_mismatch(symbols: str, names: Iterable[str]) -> str | None:
+    """Why a module of a hybrid layer list with layers ``symbols`` cannot hold the tensors
+    ``names`` (the names inside the module), or ``None`` when it can.
+
+    The check is presence-based, by family signature (:data:`~.keys.LAYER_FAMILIES`):
+
+    * a single layer holds its symbol's family and no other;
+    * a shortcut pair ``XE`` holds ``X``'s family and ``E``'s, each inside one
+      child module of its own (the children's names are not assumed), and no
+      other family.
+
+    Any other tensor (a layer norm, the pair's own norms) may be anywhere.
+
+    Raises:
+        InternalError: A symbol has no family signature (the refusal fence
+            refuses its layers before any module is checked).
+    """
+    unknown = set(symbols) - LAYER_FAMILIES.keys()
+    if unknown:
+        raise InternalError(f"no family signature for the hybrid layer symbols {sorted(unknown)}")
+    holders: dict[str, set[str | None]] = {}
+    for name in names:
+        for symbol, family in LAYER_FAMILIES.items():
+            match = family.pattern.search(name)
+            if match is not None:  # held by the child it follows, or by the module itself
+                child = name.partition(".")[0] if match.start() else None
+                holders.setdefault(symbol, set()).add(child)
+    if set(holders) != set(symbols):
+        return (
+            f"its tensors are those of {_families(holders) or 'no layer type'}, but {symbols!r} "
+            f"means {_families(symbols)}"
+        )
+    children = [holders[symbol] for symbol in symbols]
+    if len(symbols) == 1 or (
+        all(len(held) == 1 and None not in held for held in children) and children[0] != children[1]
+    ):
+        return None
+    where = " and ".join(
+        f"its {symbol!r} tensors in {', '.join(sorted(c or 'the pair itself' for c in held))}"
+        for symbol, held in zip(symbols, children)
+    )
+    return f"a shortcut pair holds each layer in a child module of its own, but it has {where}"
+
+
+def _families(symbols: Iterable[str]) -> str:
+    """``'*' (self_attention.linear_qkv), ...`` in the order of :data:`~.keys.LAYER_FAMILIES`."""
+    present = set(symbols)
+    return ", ".join(
+        f"{symbol!r} ({family.tensors})"
+        for symbol, family in LAYER_FAMILIES.items()
+        if symbol in present
+    )

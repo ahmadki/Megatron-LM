@@ -40,6 +40,29 @@ def _keys(*indices: int) -> dict[str, TensorEntry]:
     return {key: _entry(key) for key in keys}
 
 
+MODULE_KEYS = {
+    "E": ("mlp.router.weight", "pre_mlp_layernorm.weight"),
+    "*E": (
+        "attn_layer.self_attention.linear_qkv.weight",
+        "moe_layer.mlp.router.weight",
+        "shortcut_pre_mlp_layernorm.weight",
+    ),
+    "*": ("self_attention.linear_qkv.weight",),
+    "-": ("mlp.linear_fc1.weight", "mlp.linear_fc2.weight"),
+}
+"""Tensors of a module of each kind (ShortcutMoEBlock children for a pair)."""
+
+
+def _module_keys(stored: dict[int, str], prefix: str = "decoder") -> dict[str, TensorEntry]:
+    """Model keys of the modules ``{stored index: symbols}`` of a hybrid decoder."""
+    keys = [
+        f"{prefix}.layers.{index}.{name}"
+        for index, sym in stored.items()
+        for name in MODULE_KEYS[sym]
+    ]
+    return {key: _entry(key) for key in keys}
+
+
 def classify_blocks_of(args: ArgsView, model, fmt: str):
     return classify_blocks(BlockFacts(args, fmt, model), default=transformer_block)
 
@@ -80,7 +103,9 @@ def test_the_census_puts_each_key_in_its_innermost_block():
 @pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
 def test_a_hybrid_decoder_is_one_per_layer_block(fmt):
     (block,) = classify_blocks_of(
-        _args(hybrid_layer_pattern="*-|*-/*-", num_layers=4), _keys(0, 1, 2, 3), fmt
+        _args(hybrid_layer_pattern="*-|*-/*-", num_layers=4),
+        _module_keys(dict(enumerate("*-*-"))),
+        fmt,
     )
     assert block.to_json() == {
         "prefix": "decoder",
@@ -139,27 +164,6 @@ SHORTCUT = "E*E-*EE"
 """A shortcut-MoE hybrid pattern: a leading E, pairs, a dense MLP and an E after a pair."""
 SHORTCUT_MODULES = {0: "E", 1: "*E", 3: "-", 4: "*E", 6: "E"}
 """Its modules by torch_dist index (the position of their first layer) and their symbols."""
-MODULE_KEYS = {
-    "E": ("mlp.router.weight", "pre_mlp_layernorm.weight"),
-    "*E": (
-        "attn_layer.self_attention.linear_qkv.weight",
-        "moe_layer.mlp.router.weight",
-        "shortcut_pre_mlp_layernorm.weight",
-    ),
-    "*": ("self_attention.linear_qkv.weight",),
-    "-": ("mlp.linear_fc1.weight", "mlp.linear_fc2.weight"),
-}
-"""Tensors of a module of each kind (ShortcutMoEBlock children for a pair)."""
-
-
-def _shortcut_keys(stored: dict[int, str], prefix: str = "decoder") -> dict[str, TensorEntry]:
-    """Model keys of the modules ``{stored index: symbols}`` of a shortcut-MoE hybrid decoder."""
-    keys = [
-        f"{prefix}.layers.{index}.{name}"
-        for index, sym in stored.items()
-        for name in MODULE_KEYS[sym]
-    ]
-    return {key: _entry(key) for key in keys}
 
 
 def _shortcut_args(pattern: str = SHORTCUT, **fields) -> ArgsView:
@@ -175,8 +179,8 @@ def _shortcut_args(pattern: str = SHORTCUT, **fields) -> ArgsView:
 
 
 def test_a_shortcut_decoder_numbers_its_modules_by_their_first_layer():
-    td = _shortcut_keys(SHORTCUT_MODULES)
-    fsdp = _shortcut_keys(dict(enumerate(SHORTCUT_MODULES.values())))
+    td = _module_keys(SHORTCUT_MODULES)
+    fsdp = _module_keys(dict(enumerate(SHORTCUT_MODULES.values())))
     (block,) = classify_blocks_of(_shortcut_args(), td, TORCH_DIST)
     assert classify_blocks_of(_shortcut_args(), fsdp, FSDP_DTENSOR) == (block,)
     assert block.to_json() == {
@@ -198,7 +202,7 @@ def test_a_shortcut_decoder_numbers_its_modules_by_their_first_layer():
 
 
 def test_a_vision_language_shortcut_decoder_is_renumbered_too():
-    model = _shortcut_keys(SHORTCUT_MODULES, "language_model.decoder")
+    model = _module_keys(SHORTCUT_MODULES, "language_model.decoder")
     (block,) = classify_blocks_of(_shortcut_args(), model, TORCH_DIST)
     assert (block.prefix, block.dense_to_td) == ("language_model.decoder", (0, 1, 3, 4, 6))
 
@@ -228,7 +232,7 @@ def test_a_vision_language_shortcut_decoder_is_renumbered_too():
 )
 def test_stored_indices_must_be_the_module_starts(fmt, stored, message):
     with pytest.raises(RefusedError) as excinfo:
-        classify_blocks_of(_shortcut_args(), _shortcut_keys(stored), fmt)
+        classify_blocks_of(_shortcut_args(), _module_keys(stored), fmt)
     refusal = excinfo.value.refusal
     assert refusal.code == errors.FC_R11
     assert message in refusal.message
@@ -240,9 +244,7 @@ def test_stored_indices_must_be_the_module_starts(fmt, stored, message):
 
 def test_num_layers_counts_the_layers_of_a_shortcut_pattern():
     with pytest.raises(RefusedError) as excinfo:
-        classify_blocks_of(
-            _shortcut_args(num_layers=5), _shortcut_keys(SHORTCUT_MODULES), TORCH_DIST
-        )
+        classify_blocks_of(_shortcut_args(num_layers=5), _module_keys(SHORTCUT_MODULES), TORCH_DIST)
     assert excinfo.value.refusal.code == errors.FC_R11
     assert excinfo.value.refusal.message == (
         "args.num_layers=5 but hybrid layer pattern 'E*E-*EE' (7 layers)"
@@ -257,6 +259,43 @@ def test_a_pattern_megatron_cannot_group_is_refused(pattern, reason):
         classify_blocks_of(_shortcut_args(pattern), {}, TORCH_DIST)
     assert excinfo.value.refusal.code == errors.FC_R11
     assert reason in excinfo.value.refusal.message
+
+
+@pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
+def test_each_module_must_hold_the_tensors_of_its_layers(fmt):
+    """Here module 2 (a dense MLP by the pattern) holds a shortcut pair's tensors."""
+    modules = dict(zip((0, 1, 3, 4, 6), ["E", "*E", "*E", "*E", "E"]))
+    if fmt == FSDP_DTENSOR:
+        modules = dict(enumerate(modules.values()))
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(_shortcut_args(), _module_keys(modules), fmt)
+    refusal = excinfo.value.refusal
+    stored = 3 if fmt == TORCH_DIST else 2
+    assert refusal.code == errors.FC_R11
+    assert refusal.message == (
+        "decoder: the tensors of 1 of its 5 modules contradict hybrid layer pattern 'E*E-*EE' "
+        "(7 layers) "
+        "grouped into 5 modules by args.moe_shortcut_connection=True (each E joins the layer "
+        f"before it unless that layer is paired): module 2 ({fmt} index {stored}, '-'): its "
+        "tensors are those of '*' "
+        "(self_attention.linear_qkv), 'E' (mlp.router.weight), but '-' means '-' "
+        "(mlp.linear_fc1); its modules (dense: torch_dist index, symbols) are 0: 0 E, 1: 1 *E, "
+        "2: 3 -, 3: 4 *E, 4: 6 E"
+    )
+    assert refusal.keys == tuple(
+        sorted(f"decoder.layers.{stored}.{name}" for name in MODULE_KEYS["*E"])
+    )
+
+
+def test_the_layers_of_a_hybrid_decoder_without_shortcut_are_checked_too():
+    swapped = _module_keys({0: "-", 1: "*", 2: "*", 3: "-"})
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(_args(hybrid_layer_pattern="*-*-", num_layers=4), swapped, TORCH_DIST)
+    assert excinfo.value.refusal.code == errors.FC_R11
+    assert "the tensors of 2 of its 4 modules contradict" in excinfo.value.refusal.message
+    assert "module 0 (torch_dist index 0, '*'): its tensors are those of '-'" in (
+        excinfo.value.refusal.message
+    )
 
 
 def test_a_layout_needs_one_distinct_stored_index_per_module():
@@ -284,6 +323,6 @@ def test_the_language_model_prefix_follows_the_roots():
 
 
 def test_a_vision_language_hybrid_decoder_is_under_the_language_model():
-    model = {f"language_model.{key}": entry for key, entry in _keys(0, 1).items()}
+    model = _module_keys({0: "*", 1: "-"}, "language_model.decoder")
     (block,) = classify_blocks_of(_args(hybrid_layer_pattern="*-", num_layers=2), model, TORCH_DIST)
     assert (block.prefix, block.kind) == ("language_model.decoder", "hybrid_stack")

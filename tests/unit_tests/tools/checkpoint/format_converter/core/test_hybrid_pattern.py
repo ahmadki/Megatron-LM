@@ -14,11 +14,13 @@ from tools.checkpoint.format_converter import errors
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.hybrid_pattern import (
     HybridPattern,
+    family_mismatch,
     group_modules,
     hybrid_pattern_of,
     parse_hybrid_pattern,
+    shortcut_warnings,
 )
-from tools.checkpoint.format_converter.errors import RefusedError
+from tools.checkpoint.format_converter.errors import InternalError, RefusedError
 
 
 @pytest.mark.parametrize(
@@ -139,3 +141,106 @@ def test_groupings_megatron_cannot_build_are_refused(text, reason):
         "with args.moe_shortcut_connection=True, Megatron cannot group the hybrid layers "
         f"{parse_hybrid_pattern(text).main!r}: {reason}"
     )
+
+
+QKV = ("self_attention.linear_qkv.weight", "self_attention.linear_qkv.layer_norm_weight")
+MLP = ("mlp.linear_fc1.weight", "mlp.linear_fc1.layer_norm_weight", "mlp.linear_fc2.weight")
+MOE = (
+    "pre_mlp_layernorm.weight",
+    "mlp.router.weight",
+    "mlp.router.expert_bias",
+    "mlp.experts.linear_fc1.weight3",
+    "mlp.shared_experts.linear_fc1.weight",
+)
+
+
+def _under(child: str, names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(f"{child}.{name}" for name in names)
+
+
+@pytest.mark.parametrize(
+    ("symbols", "names"),
+    [
+        ("*", QKV + ("self_attention.linear_proj.weight",)),
+        ("-", MLP),
+        ("E", MOE),  # shared experts are no dense MLP
+        ("M", ("mixer.in_proj.weight.z", "mixer.conv1d.weight.V0", "mixer.A_log")),  # parts
+        ("M", ("mixer.in_proj.weight", "mixer.conv1d_weight", "mixer.norm.weight")),  # fused
+        ("G", ("self_attention.in_proj.weight", "self_attention.conv1d.weight")),
+        (
+            "+",
+            ("self_attention.linear_q_down_proj.weight", "self_attention.linear_kv_up_proj.weight"),
+        ),
+        ("*E", _under("attn_layer", QKV) + _under("moe_layer", MOE)),
+        (
+            "*E",  # child names are not assumed; the pair may hold tensors of its own
+            _under("first", QKV)
+            + _under("second", MOE)
+            + ("shortcut_pre_mlp_layernorm.weight", "shortcut_post_norm.weight", "gate.scale"),
+        ),
+        ("ME", ("x.mixer.in_proj.weight", "y.mlp.router.weight")),
+    ],
+)
+def test_a_module_holding_its_layers_families_fits(symbols, names):
+    assert family_mismatch(symbols, names) is None
+
+
+@pytest.mark.parametrize(
+    ("symbols", "names", "reason"),
+    [
+        (
+            "-",
+            MOE,
+            "its tensors are those of 'E' (mlp.router.weight), but '-' means '-' (mlp.linear_fc1)",
+        ),
+        (
+            "*",
+            QKV + MLP,  # a GPT-style layer: attention and MLP in one module
+            "its tensors are those of '*' (self_attention.linear_qkv), '-' (mlp.linear_fc1), but "
+            "'*' means '*' (self_attention.linear_qkv)",
+        ),
+        ("*", (), "its tensors are those of no layer type, but '*' means"),
+        ("*E", QKV, "its tensors are those of '*' (self_attention.linear_qkv), but '*E' means"),
+        (
+            "*E",
+            _under("a", QKV) + _under("b", MOE) + _under("c", MLP),  # a second family
+            "its tensors are those of '*' (self_attention.linear_qkv), '-' (mlp.linear_fc1), 'E'",
+        ),
+        (
+            "*E",
+            QKV + _under("moe_layer", MOE),
+            "a shortcut pair holds each layer in a child module of its own, but it has its '*' "
+            "tensors in the pair itself and its 'E' tensors in moe_layer",
+        ),
+        (
+            "*E",
+            _under("layer", QKV + MOE),
+            "but it has its '*' tensors in layer and its 'E' tensors in layer",
+        ),
+        (
+            "*E",
+            _under("a", QKV) + _under("b", QKV) + _under("c", MOE),
+            "but it has its '*' tensors in a, b and its 'E' tensors in c",
+        ),
+    ],
+)
+def test_a_module_holding_other_families_does_not_fit(symbols, names, reason):
+    assert reason in family_mismatch(symbols, names)
+
+
+def test_symbols_without_a_family_signature_are_a_bug():
+    with pytest.raises(InternalError, match="no family signature"):
+        family_mismatch("DE", ())
+
+
+def test_only_an_fsdp_dtensor_target_of_a_shortcut_model_is_warned_about():
+    """Megatron refuses ``--moe-shortcut-connection`` with Megatron-FSDP."""
+    shortcut = _args(moe_shortcut_connection=True)
+    assert shortcut_warnings(shortcut, "fsdp_dtensor") == [
+        "args.moe_shortcut_connection=True: Megatron refuses --moe-shortcut-connection with "
+        "Megatron-FSDP, so no current Megatron job loads this fsdp_dtensor store (it is written "
+        "in the layout a Megatron-FSDP v1 job uses)"
+    ]
+    assert shortcut_warnings(shortcut, "torch_dist") == []
+    assert shortcut_warnings(_args(moe_shortcut_connection=False), "fsdp_dtensor") == []
+    assert shortcut_warnings(_args(), "fsdp_dtensor") == []
