@@ -48,6 +48,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 from .. import errors
 from ..engine.metadata import TensorEntry
@@ -89,6 +90,12 @@ class Fc1:
     gated: bool
     halves: bool
     split: bool = False
+
+    kind: ClassVar[str] = "gated linear_fc1"
+    """What it is, for messages about the tensors fsdp_dtensor packs per rank."""
+
+    parts_noun: ClassVar[str] = "gate and value halves"
+    """What its parts are called in those messages."""
 
     @property
     def group(self) -> str:

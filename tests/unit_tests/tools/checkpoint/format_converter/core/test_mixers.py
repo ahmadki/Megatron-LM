@@ -1,0 +1,444 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""The family of every state-space mixer: by its names, the spec and a unique width match.
+
+Part names, part sizes and fused widths are written out by hand from the
+mixers' definitions (``GatedDeltaProductMixer``: ``in_proj`` is
+``z, V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a`` of sizes ``d, d x M,
+GN x M, GN, H x M, H``; ``conv1d`` is ``V*, K*, Q``), never from the code under
+test.
+"""
+
+from __future__ import annotations
+
+import argparse
+
+import pytest
+import torch
+
+from tools.checkpoint.format_converter import errors
+from tools.checkpoint.format_converter.core.args_view import ArgsView
+from tools.checkpoint.format_converter.core.blocks import BlockLayout
+from tools.checkpoint.format_converter.core.logical import LogicalId
+from tools.checkpoint.format_converter.core.mixers import (
+    GDN,
+    GDN2,
+    GDP,
+    MAMBA2,
+    FusedProjection,
+    family_layouts,
+    gdn2_parts,
+    gdn_parts,
+    gdp_parts,
+    is_gdp_spec,
+    mamba2_parts,
+    megatron_fsdp_warnings,
+    mixer_layout,
+)
+from tools.checkpoint.format_converter.core.names import FSDP_DTENSOR, TORCH_DIST
+from tools.checkpoint.format_converter.core.part_layout import PartLayout
+from tools.checkpoint.format_converter.engine.metadata import TensorEntry
+from tools.checkpoint.format_converter.errors import RefusedError
+
+HIDDEN = 8
+GDP_SPEC = ["megatron.core.models.hybrid.hybrid_layer_specs", "gated_delta_product_stack_spec"]
+DIMS = {"mamba_num_heads": 4, "mamba_head_dim": 2, "mamba_num_groups": 2, "mamba_state_dim": 3}
+"""d = 4 x 2 = 8, GN = 2 x 3 = 6, H = 4."""
+IN_PROJ = {
+    "z": 8,
+    "V0": 8,
+    "V1": 8,
+    "V2": 8,
+    "K0": 6,
+    "K1": 6,
+    "K2": 6,
+    "Q": 6,
+    "b0": 4,
+    "b1": 4,
+    "b2": 4,
+    "a": 4,
+}
+"""The in_proj parts of a Gated DeltaProduct mixer of :data:`DIMS` with 3 Householder steps (72
+rows)."""
+CONV = {"V0": 8, "V1": 8, "V2": 8, "K0": 6, "K1": 6, "K2": 6, "Q": 6}
+"""Its conv1d parts (48 rows)."""
+DECODER = BlockLayout("decoder", "hybrid_stack", 2, "per_layer", (0, 1), ("M", "*"), "")
+MIXER = "decoder.layers.0.mixer"
+
+
+def mixer_shapes(
+    parts: bool, *, mixer: str = MIXER, in_proj=None, conv=None, bias: bool = False
+) -> dict[str, tuple[int, ...]]:
+    """A mixer's fused projections: one tensor per part (torch_dist) or fused (fsdp_dtensor)."""
+    layouts = {"in_proj": IN_PROJ if in_proj is None else in_proj, "conv1d": CONV}
+    if conv is not None:
+        layouts["conv1d"] = conv
+    rest = {"in_proj": (HIDDEN,), "conv1d": (1, 4)}
+    shapes = {}
+    for name, layout in layouts.items():
+        for leaf in ("weight", "bias") if bias else ("weight",):
+            trailing = rest[name] if leaf == "weight" else ()
+            if parts:
+                for part, rows in layout.items():
+                    shapes[f"{mixer}.{name}.{leaf}.{part}"] = (rows, *trailing)
+            else:
+                shapes[f"{mixer}.{name}.{leaf}"] = (sum(layout.values()), *trailing)
+    shapes[f"{mixer}.in_proj.layer_norm_weight"] = (HIDDEN,)
+    shapes[f"{mixer}.A_log"] = (4,)
+    shapes[f"{mixer}.out_proj.weight"] = (HIDDEN, 8)
+    return shapes
+
+
+def derive(shapes, *, source=TORCH_DIST, blocks=(DECODER,), **fields):
+    args = {"spec": GDP_SPEC, **DIMS, "gdp_num_householder": 3, "hidden_size": HIDDEN, **fields}
+    model = {key: TensorEntry(key, shape, torch.bfloat16, ()) for key, shape in shapes.items()}
+    return mixer_layout(ArgsView(argparse.Namespace(**args)), model, blocks, source)
+
+
+def refusal(shapes, **kwargs):
+    with pytest.raises(RefusedError) as caught:
+        derive(shapes, **kwargs)
+    assert caught.value.refusal.code == errors.FC_R10
+    return caught.value.refusal
+
+
+def test_gated_deltaproduct_parts_are_listed_component_by_component():
+    in_proj, conv = gdp_parts(8, 6, 4, 2)
+    assert in_proj == PartLayout(
+        ("z", "V0", "V1", "K0", "K1", "Q", "b0", "b1", "a"), (8, 8, 8, 6, 6, 6, 4, 4, 4)
+    )
+    assert conv == PartLayout(("V0", "V1", "K0", "K1", "Q"), (8, 8, 6, 6, 6))
+    in_proj, conv = gdp_parts(8, 6, 4, 1)
+    assert in_proj.parts == ("z", "V0", "K0", "Q", "b0", "a")
+    assert conv.parts == ("V0", "K0", "Q")
+    # a large mixer: d = 128 x 64, GN = 8 x 128, H = 128, M = 3
+    in_proj, conv = gdp_parts(8192, 1024, 128, 3)
+    assert (in_proj.fused_rows, conv.fused_rows) == (4 * (8192 + 1024 + 128), 3 * 8192 + 4 * 1024)
+
+
+def test_the_other_families_parts():
+    assert mamba2_parts(8, 6, 4) == (
+        PartLayout(("z", "x", "B", "C", "dt"), (8, 8, 6, 6, 4)),
+        PartLayout(("x", "B", "C"), (8, 6, 6)),
+    )
+    assert gdn_parts(4, 8, 2) == (
+        PartLayout(("query", "key", "value", "z", "beta", "alpha"), (4, 4, 8, 8, 2, 2)),
+        PartLayout(("query", "key", "value"), (4, 4, 8)),
+    )
+    assert gdn2_parts(4, 8) == (
+        PartLayout(("query", "key", "value", "z", "f", "b", "w"), (4, 4, 8, 8, 4, 4, 8)),
+        PartLayout(("query", "key", "value"), (4, 4, 8)),
+    )
+
+
+def test_the_arguments_give_every_familys_widths_or_why_not():
+    fields = {
+        **DIMS,
+        "mamba_num_heads": None,
+        "hidden_size": 12,
+        "linear_key_head_dim": 4,
+        "linear_num_key_heads": 1,
+        "linear_value_head_dim": 4,
+        "linear_num_value_heads": 2,
+    }
+    layouts = family_layouts(ArgsView(argparse.Namespace(**fields)))
+    # Mamba-2's heads default to 2 x hidden_size / mamba_head_dim = 12
+    assert layouts[MAMBA2].in_proj.sizes == (24, 24, 6, 6, 12)
+    assert (
+        layouts[MAMBA2].dims == "d=24, GN=6, H=12 (args.hidden_size=12 x 2 / args.mamba_head_dim)"
+    )
+    assert layouts[GDP] == "args.mamba_num_heads=None: sizes must be positive integers"
+    assert layouts[GDN].in_proj.fused_rows == 28 and layouts[GDN].conv1d.fused_rows == 16
+    assert layouts[GDN2].in_proj.fused_rows == 4 * 4 + 3 * 8
+    empty = family_layouts(ArgsView(argparse.Namespace()))
+    assert empty[MAMBA2] == (
+        "args.mamba_head_dim=None, args.mamba_num_groups=None, args.mamba_state_dim=None: sizes "
+        "must be positive integers"
+    )
+    assert empty[GDN] == empty[GDN2]
+
+
+@pytest.mark.parametrize(
+    ("spec", "gdp"),
+    [
+        (GDP_SPEC, True),
+        (["megatron.core.models.mamba.mamba_layer_specs", "gdp_stack_spec"], True),
+        ("megatron.core.models.hybrid.hybrid_layer_specs.gdp_stack_spec", True),
+        (["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"], False),
+        (["my_package.specs", "gdp_stack_spec"], False),
+        (None, False),
+    ],
+)
+def test_the_gated_deltaproduct_spec_is_a_hybrid_spec_modules(spec, gdp):
+    assert is_gdp_spec(ArgsView(argparse.Namespace(spec=spec))) is gdp
+
+
+def expected_projections(mixer: str, parts: bool, *, block="decoder", layer=0, bias=False):
+    """The fused projections of a mixer of :data:`DIMS` at ``mixer`` (its module path)."""
+    stored = mixer_shapes(parts, mixer=f"{block}.layers.{layer}.{mixer}", bias=bias)
+    projections = {}
+    for name, layout in (("in_proj", IN_PROJ), ("conv1d", CONV)):
+        for leaf in ("weight", "bias") if bias else ("weight",):
+            lid = LogicalId(block, layer, f"{mixer}.{name}", leaf)
+            prefix = f"{block}.layers.{layer}.{mixer}.{name}.{leaf}"
+            keys = tuple(sorted(k for k in stored if k == prefix or k.startswith(prefix + ".")))
+            parts_layout = PartLayout(tuple(layout), tuple(layout.values()))
+            projections[lid] = FusedProjection(lid, GDP, parts_layout, keys)
+    return projections
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+@pytest.mark.parametrize("bias", [False, True])
+def test_a_gated_deltaproduct_mixer_in_either_format(source, bias):
+    layout, evidence = derive(mixer_shapes(source == TORCH_DIST, bias=bias), source=source)
+    assert layout.families_json() == {"decoder": {GDP: 1}}
+    assert dict(layout.projections) == expected_projections(
+        "mixer", source == TORCH_DIST, bias=bias
+    )
+    stored = "as parts" if source == TORCH_DIST else "whole"
+    assert evidence == (
+        f"args.spec={'.'.join(GDP_SPEC)!r} builds Gated DeltaProduct mixers; 1 mixers stored "
+        f"{stored}; d=8 (args.mamba_num_heads=4 x args.mamba_head_dim=2), GN=6 "
+        "(args.mamba_num_groups=2 x args.mamba_state_dim=3), H=4, M=3 "
+        "(args.gdp_num_householder=3): in_proj 72 rows, conv1d 48 rows, the only family whose "
+        "widths the stored ones match (Mamba-2: in_proj 32 rows, conv1d 20 rows; Gated DeltaNet: "
+        "not derivable, args.linear_key_head_dim=None, args.linear_num_key_heads=None, "
+        "args.linear_value_head_dim=None, args.linear_num_value_heads=None: sizes must be "
+        "positive integers; Gated DeltaNet 2: not derivable, args.linear_key_head_dim=None, "
+        "args.linear_num_key_heads=None, args.linear_value_head_dim=None, "
+        "args.linear_num_value_heads=None: sizes must be positive integers)"
+    )
+    in_proj = layout.of(LogicalId("decoder", 0, "mixer.in_proj", "weight", None, "V1"))
+    assert in_proj is not None and in_proj.kind == "Gated DeltaProduct in_proj/conv1d"
+    assert layout.of(LogicalId("decoder", 0, "mixer.in_proj", "layer_norm_weight")) is None
+
+
+def test_mixers_of_shortcut_pairs_and_multi_token_prediction_layers():
+    """A pair's child container is not assumed; an MTP inner layer list is a block of its own."""
+    inner = BlockLayout(
+        "mtp.layers.0.mtp_model_layer", "hybrid_mtp_inner", 1, "per_layer", (0,), ("M",), ""
+    )
+    shapes = {
+        **mixer_shapes(True, mixer="decoder.layers.0.pair_child.mixer"),
+        **mixer_shapes(True, mixer="mtp.layers.0.mtp_model_layer.layers.0.mixer"),
+    }
+    layout, _ = derive(shapes, blocks=(DECODER, inner))
+    assert layout.families_json() == {"decoder": {GDP: 1}, "mtp.layers.0.mtp_model_layer": {GDP: 1}}
+    assert dict(layout.projections) == {
+        **expected_projections("pair_child.mixer", True),
+        **expected_projections("mixer", True, block="mtp.layers.0.mtp_model_layer"),
+    }
+
+
+def test_no_mixer_no_layout():
+    layout, evidence = derive({"decoder.layers.1.self_attention.linear_qkv.weight": (24, 8)})
+    assert not layout.families and not layout.projections
+    assert evidence == "no state-space mixer (mixer.in_proj or mixer.conv1d tensors)"
+
+
+def test_torch_dist_parts_must_be_the_specs_family():
+    mamba = {"z": 8, "x": 8, "B": 6, "C": 6, "dt": 4}
+    found = refusal(mixer_shapes(True, in_proj=mamba, conv={"x": 8, "B": 6, "C": 6}))
+    assert found.message == (
+        "decoder[0].mixer is a Mamba-2 mixer by its in_proj parts z, x, B, C, dt, but args.spec="
+        f"{'.'.join(GDP_SPEC)!r} builds Gated DeltaProduct mixers"
+    )
+    assert found.hint == "check args.spec against the model that saved the store"
+    found = refusal(mixer_shapes(True), spec=None)
+    assert found.message.startswith(
+        "decoder[0].mixer is a Gated DeltaProduct mixer by its in_proj parts z, V0, V1, V2, K0, "
+        "K1, K2, Q, b0, b1, b2, a, but args.spec=None builds Mamba-2 mixers"
+    )
+    assert found.keys[0] == f"{MIXER}.conv1d.weight.K0"
+
+
+def test_mamba_2s_fsdp_dtensor_convolution_is_no_gated_deltaproduct_one():
+    shapes = mixer_shapes(False)
+    shapes[f"{MIXER}.conv1d_weight"] = shapes.pop(f"{MIXER}.conv1d.weight")
+    found = refusal(shapes, source=FSDP_DTENSOR)
+    assert found.message.startswith(
+        "decoder[0].mixer is a Mamba-2 mixer by its convolution parameter conv1d_weight, but "
+        "args.spec="
+    )
+
+
+@pytest.mark.parametrize("householders", [3, None])
+def test_the_householder_steps_must_be_the_arguments(householders):
+    """Megatron back-fills 3 for a store saved before the argument existed."""
+    two = {p: r for p, r in IN_PROJ.items() if p not in ("V2", "K2", "b2")}
+    conv = {p: r for p, r in CONV.items() if p not in ("V2", "K2")}
+    found = refusal(mixer_shapes(True, in_proj=two, conv=conv), gdp_num_householder=householders)
+    evidence = "args.gdp_num_householder=3" if householders else "args.gdp_num_householder unset: 3"
+    assert found.message == (
+        f"decoder[0].mixer: its in_proj holds 2 Householder steps (V0..V1), but {evidence}"
+    )
+    layout, _ = derive(mixer_shapes(True), gdp_num_householder=householders)
+    assert layout.families_json() == {"decoder": {GDP: 1}}
+    layout, _ = derive(mixer_shapes(True, in_proj=two, conv=conv), gdp_num_householder=2)
+    assert layout.families_json() == {"decoder": {GDP: 1}}
+
+
+def test_gated_deltaproduct_needs_the_number_of_heads():
+    found = refusal(mixer_shapes(False), source=FSDP_DTENSOR, mamba_num_heads=None)
+    assert found.message == (
+        "decoder[0].mixer is a Gated DeltaProduct mixer, but its dimensions cannot be derived from "
+        "the arguments: args.mamba_num_heads=None: sizes must be positive integers"
+    )
+
+
+COLLISION = {
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 4,
+    "mamba_num_groups": 2,
+    "mamba_state_dim": 16,
+}
+"""A Gated DeltaProduct mixer (d = 16, GN = 32, H = 4, M = 3) whose in_proj width,
+4 x (16 + 32 + 4) = 208 rows, is also the Mamba-2 formula's for 16 heads of dimension 4:
+2 x 64 + 2 x 32 + 16 = 208 rows (its conv1d, 3 x 16 + 4 x 32 = 176 rows, is not: 64 + 64)."""
+
+
+def collision_store() -> dict[str, tuple[int, ...]]:
+    return {
+        f"{MIXER}.in_proj.weight": (4 * (16 + 32 + 4), HIDDEN),
+        f"{MIXER}.conv1d.weight": (3 * 16 + 4 * 32, 1, 4),
+    }
+
+
+def test_a_gated_deltaproduct_width_that_solves_mambas_formula_is_never_mamba():
+    """Regression: a converter that derives Mamba-2's heads from the in_proj width splits this
+    mixer as a Mamba-2 one with 16 heads. Without the Gated DeltaProduct spec the store is refused,
+    whether the arguments give Mamba-2 heads of their own or none."""
+    assert 4 * (16 + 32 + 4) == 2 * 16 * 4 + 2 * 32 + 16
+    found = refusal(collision_store(), source=FSDP_DTENSOR, spec=None, **COLLISION)
+    assert found.message == (
+        "decoder[0].mixer: its widths (conv1d.weight 176 rows, in_proj.weight 208 rows) are not "
+        "what the arguments give Mamba-2 mixers (d=16, GN=32, H=4 (args.mamba_num_heads=4): "
+        "in_proj 100 rows, conv1d 80 rows), which args.spec=None builds Mamba-2 mixers; they are "
+        "what the arguments give Gated DeltaProduct mixers"
+    )
+    unset = {**COLLISION, "mamba_num_heads": None, "hidden_size": 32}  # 2 x 32 / 4 = 16 heads
+    found = refusal(collision_store(), source=FSDP_DTENSOR, spec=None, **unset)
+    assert found.message == (
+        "decoder[0].mixer: its widths (conv1d.weight 176 rows, in_proj.weight 208 rows) are not "
+        "what the arguments give Mamba-2 mixers (d=64, GN=32, H=16 (args.hidden_size=32 x 2 / "
+        "args.mamba_head_dim): in_proj 208 rows, conv1d 128 rows), which args.spec=None builds "
+        "Mamba-2 mixers"
+    )
+    layout, _ = derive(collision_store(), source=FSDP_DTENSOR, **COLLISION)  # the spec says GDP
+    assert layout.families_json() == {"decoder": {GDP: 1}}
+
+
+def test_widths_that_two_families_share_cannot_tell_the_family():
+    """Every family's equation counts: a Gated DeltaProduct mixer (d = 8, GN = 4, H = 2, M = 1:
+    in_proj 2 x (8 + 4 + 2) = 28 rows, conv1d 8 + 2 x 4 = 16 rows) has the widths the arguments
+    give a Gated DeltaNet (qk = 4 x 1, v = 4 x 2, 2 value heads: 2 x 4 + 2 x 8 + 2 x 2 = 28 rows,
+    2 x 4 + 8 = 16 rows)."""
+    dims = {"mamba_num_heads": 2, "mamba_head_dim": 4, "mamba_num_groups": 1, "mamba_state_dim": 4}
+    gdn = {
+        "linear_key_head_dim": 4,
+        "linear_num_key_heads": 1,
+        "linear_value_head_dim": 4,
+        "linear_num_value_heads": 2,
+    }
+    store = {f"{MIXER}.in_proj.weight": (28, HIDDEN), f"{MIXER}.conv1d.weight": (16, 1, 4)}
+    found = refusal(store, source=FSDP_DTENSOR, gdp_num_householder=1, **dims, **gdn)
+    assert found.message == (
+        "decoder[0].mixer: its widths (conv1d.weight 16 rows, in_proj.weight 28 rows) are what the "
+        "arguments give Gated DeltaProduct mixers (d=8 (args.mamba_num_heads=2 x "
+        "args.mamba_head_dim=4), GN=4 (args.mamba_num_groups=1 x args.mamba_state_dim=4), H=2, M=1 "
+        "(args.gdp_num_householder=1)) and Gated DeltaNet mixers alike, so they cannot tell the "
+        "family"
+    )
+
+
+def test_widths_the_arguments_do_not_give_are_refused():
+    store = mixer_shapes(False)
+    store[f"{MIXER}.in_proj.weight"] = (80, HIDDEN)
+    found = refusal(store, source=FSDP_DTENSOR)
+    assert found.message.startswith(
+        "decoder[0].mixer: its widths (conv1d.weight 48 rows, in_proj.weight 80 rows) are not what "
+        "the arguments give Gated DeltaProduct mixers ("
+    )
+    assert found.keys == (f"{MIXER}.conv1d.weight", f"{MIXER}.in_proj.weight")
+
+
+def test_parts_must_have_their_familys_sizes():
+    """The widths match, but two parts swapped their sizes."""
+    swapped = {**IN_PROJ, "z": 6, "Q": 8}
+    found = refusal(mixer_shapes(True, in_proj=swapped))
+    assert found.message.startswith(
+        "decoder[0].mixer: in_proj.weight is stored as parts z:6, V0:8, V1:8, V2:8, K0:6, K1:6, "
+        "K2:6, Q:8, b0:4, b1:4, b2:4, a:4, but a Gated DeltaProduct in_proj has z:8, V0:8, "
+    )
+
+
+def test_torch_dist_stores_fused_projections_as_parts():
+    """Megatron's split factory stores every part of a Gated DeltaProduct mixer's in_proj and
+    conv1d weights and biases, so a whole torch_dist projection is refused at any pack size: the
+    TP-bound identity path (a whole TP-sharded tensor converted as is when pack_tp == src_tp)
+    waits for the first family that stores one (Mamba-2's in_proj.bias)."""
+    shapes = mixer_shapes(True)
+    shapes[f"{MIXER}.conv1d.weight"] = (48, 1, 4)
+    for part in CONV:
+        del shapes[f"{MIXER}.conv1d.weight.{part}"]
+    found = refusal(shapes)
+    assert found.message == (
+        "decoder[0].mixer: torch_dist stores a mixer's in_proj and conv1d as one tensor per part, "
+        "but the store holds them whole"
+    )
+    assert found.keys == (f"{MIXER}.conv1d.weight",)
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+def test_a_gdp_mixers_per_head_and_per_channel_parameters_are_whole(source):
+    """A Megatron-FSDP job above TP 1 holds and saves one rank's shard of a mixer's A_log,
+    dt_bias (H = 4 rows here) and norm.weight (d = 8): no conversion completes such a store."""
+    shapes = mixer_shapes(source == TORCH_DIST)
+    shapes[f"{MIXER}.dt_bias"] = (4,)
+    shapes[f"{MIXER}.norm.weight"] = (8,)
+    layout, _ = derive(shapes, source=source)
+    assert len(layout.projections) == 2
+    shapes[f"{MIXER}.A_log"] = (2,)
+    shapes[f"{MIXER}.norm.weight"] = (4,)
+    found = refusal(shapes, source=source)
+    assert found.message.startswith(
+        "decoder[0].mixer: A_log (2,), norm.weight (4,), but a Gated DeltaProduct mixer's A_log "
+        "and dt_bias have 4 rows and its norm.weight 8 (d=8 "
+    )
+    assert found.hint.startswith("a Megatron-FSDP job above TP 1 saves one tensor-parallel rank's")
+    assert [key.rpartition("mixer.")[2] for key in found.keys] == ["A_log", "norm.weight"]
+
+
+def test_gdp_stores_packed_above_tp_1_are_warned_about():
+    """Current Megatron-FSDP jobs above TP 1 cannot hold a Gated DeltaProduct mixer whole."""
+    layout, _ = derive(mixer_shapes(True))
+    assert megatron_fsdp_warnings(layout, FSDP_DTENSOR, 1) == []
+    assert megatron_fsdp_warnings(layout, TORCH_DIST, 2) == []
+    (warning,) = megatron_fsdp_warnings(layout, FSDP_DTENSOR, 2)
+    assert warning.startswith(
+        "Gated DeltaProduct mixers packed for --fsdp-tp 2: current Megatron-FSDP jobs above TP 1 "
+        "hold one tensor-parallel rank's shard of a mixer's A_log, dt_bias and norm.weight"
+    )
+    none, _ = derive({"decoder.layers.1.self_attention.linear_qkv.weight": (24, 8)})
+    assert megatron_fsdp_warnings(none, FSDP_DTENSOR, 2) == []
+
+
+def test_parts_that_are_no_familys_are_refused():
+    found = refusal(mixer_shapes(True, in_proj={"z": 8, "V0": 8, "X": 4}))
+    assert found.message == "decoder[0].mixer: its in_proj parts V0, X, z are no mixer family's"
+
+
+def test_a_mixer_needs_its_in_proj_and_conv1d_weights():
+    shapes = {k: v for k, v in mixer_shapes(False).items() if ".conv1d." not in k}
+    found = refusal(shapes, source=FSDP_DTENSOR)
+    assert found.message == "decoder[0].mixer has no conv1d.weight"
+
+
+def test_parts_of_one_tensor_share_their_trailing_dimensions():
+    shapes = mixer_shapes(True)
+    shapes[f"{MIXER}.in_proj.weight.a"] = (4, HIDDEN + 1)
+    found = refusal(shapes)
+    assert found.message == (
+        "decoder[0].mixer: the parts of in_proj.weight differ in dtype or in their dimensions "
+        "after the first"
+    )

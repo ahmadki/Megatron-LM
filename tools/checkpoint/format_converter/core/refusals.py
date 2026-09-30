@@ -53,6 +53,7 @@ from .keys import (
     TORCH_DIST_EXPERT_BIAS,
     root_of,
 )
+from .mixers import HYBRID_SPEC_MODULES, is_gdp_spec, spec_name
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
@@ -68,15 +69,6 @@ PENDING_FAMILIES: Mapping[str, str] = {
 
 MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
 """Block prefixes of multi-token prediction."""
-
-HYBRID_SPEC_MODULES = (
-    "megatron.core.models.hybrid.hybrid_layer_specs",
-    "megatron.core.models.mamba.mamba_layer_specs",
-)
-"""Modules exporting the hybrid stack specs (the second re-exports the first)."""
-
-GDP_SPEC_NAMES = frozenset({"gated_delta_product_stack_spec", "gdp_stack_spec"})
-"""Names of the Gated DeltaProduct stack spec in those modules."""
 
 PENDING_SYMBOLS = frozenset("MG+")
 """Hybrid layer symbols of pending families (mixers, Gated DeltaNet, MLA)."""
@@ -193,19 +185,6 @@ def _pending(code: str, evidence: list[str], keys: tuple[str, ...] = ()) -> Iter
         )
 
 
-def _spec_name(args: ArgsView) -> str | None:
-    """``--spec`` as ``<module>.<name>`` (``None`` when the default spec is used)."""
-    spec = args.get("spec", None)
-    if spec is None:
-        return None
-    return ".".join(str(part) for part in spec) if isinstance(spec, (list, tuple)) else str(spec)
-
-
-def _is_gdp_spec(args: ArgsView) -> bool:
-    spec = _spec_name(args)
-    return spec is not None and spec.rpartition(".")[2] in GDP_SPEC_NAMES
-
-
 def _symbols(facts: Facts) -> frozenset[str]:
     pattern = hybrid_pattern_of(facts.args)
     return frozenset() if pattern is None else pattern.symbols
@@ -250,9 +229,9 @@ def unsupported_spec(facts: Facts) -> Iterator[Refusal]:
             "(other implementations rename keys in torch_dist only)",
             hint="convert a checkpoint of a --transformer-impl transformer_engine run",
         )
-    spec = _spec_name(facts.args)
+    spec = spec_name(facts.args)
     if spec is not None and spec not in REGISTRY.allowed(Allowlist.STACK_SPECS):
-        if not _is_gdp_spec(facts.args):
+        if not is_gdp_spec(facts.args):
             yield Refusal(
                 errors.FC_R03,
                 f"args.spec={spec!r} is not a spec whose keys the rules know",
@@ -529,7 +508,7 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
 
 def _mixer_code(facts: Facts) -> str:
     """P05 (Gated DeltaProduct) when the spec or the stored parts say so, else P08 (Mamba-2)."""
-    if _is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
+    if is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
         return errors.FC_P05
     return errors.FC_P08
 
@@ -541,8 +520,8 @@ def pending_mixers(facts: Facts) -> Iterator[Refusal]:
     evidence = []
     if "M" in _symbols(facts):
         evidence.append("hybrid layer symbol M")
-    if code == errors.FC_P05 and _is_gdp_spec(facts.args):
-        evidence.append(f"args.spec={_spec_name(facts.args)!r}")
+    if code == errors.FC_P05 and is_gdp_spec(facts.args):
+        evidence.append(f"args.spec={spec_name(facts.args)!r}")
     yield from _pending(code, evidence, facts.keys_matching(MIXER_PARAM))
 
 

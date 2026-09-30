@@ -12,13 +12,17 @@ routed-expert tensor an expert axis after it, so ``[L, E, ...]`` becomes one
 slice per (layer, expert), ``[l:l+1, e:e+1, ...]``, whose logical tensor has
 one expert's shape. Keys outside every block keep their path. An fsdp_dtensor
 SwiGLU half (``linear_fc1.weight_w``) is the id of that part of the fused
-tensor. :func:`compose` is the inverse for the target format: it places each
+tensor, and so is a torch_dist part of a fused projection
+(``mixer.in_proj.weight.V0``). :func:`compose` is the inverse for the target
+format: it places each
 layer of a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the
 stacked tensor ``<block>.layers.<name>``, and each expert at its index of the
 expert axis (fsdp_dtensor names each expert's tensor in the model's expert
 naming instead). A SwiGLU half is a tensor of its own in fsdp_dtensor, and in
 torch_dist its rows of the fused ``linear_fc1`` tensor, ``[W; V]`` (the gate
-half first, as Megatron's SwiGLU factory saves it).
+half first, as Megatron's SwiGLU factory saves it). A part of a fused
+projection is a tensor of its own in torch_dist (``<name>.<part>``) and no
+tensor of fsdp_dtensor, which stores the projection whole.
 """
 
 from __future__ import annotations
@@ -36,12 +40,15 @@ from .keys import (
     KeyGrammarError,
     LayerKey,
     attribute_layer_key,
-    is_fc1_path,
+    is_fused_projection,
+    is_glu_half,
+    join_factory_part,
     join_fsdp_expert,
     join_glu_half,
     join_layer_key,
     join_torch_dist_expert,
     split_expert_name,
+    split_factory_part,
     split_glu_half,
     split_leaf,
 )
@@ -82,7 +89,7 @@ def decompose(
     layer_key = attribute_layer_key(relative, by_prefix)
     block = None if layer_key is None else by_prefix[layer_key.block]
     name = relative if layer_key is None else layer_key.inner
-    name, part = (name, None) if fmt == TORCH_DIST else split_glu_half(name)
+    name, part = split_factory_part(name) if fmt == TORCH_DIST else split_glu_half(name)
     expert = split_expert_name(name, fmt)
     path, leaf = (expert.path, expert.leaf) if expert is not None else split_leaf(name)
     layers = _layer_axis(relative, entry, block, layer_key, fmt)
@@ -167,12 +174,14 @@ def compose(
         stacked over the layers of a block that torch_dist stores stacked
         (``l`` its torch_dist index), and ``[..., e:e+1, ...]`` of a torch_dist
         routed-expert tensor; a torch_dist SwiGLU half is further the box of
-        its rows of the fused tensor.
+        its rows of the fused tensor, and a torch_dist part of a fused
+        projection a tensor of its own (``<name>.<part>``).
 
     Raises:
         InternalError: ``lid`` names a block that is not in ``blocks``, a
-            routed expert that ``experts`` does not place, or a part that is
-            not a SwiGLU half of a ``linear_fc1``.
+            routed expert that ``experts`` does not place, or a part ``fmt``
+            does not store (neither a SwiGLU half of a ``linear_fc1`` nor, in
+            torch_dist, a part of a fused projection).
     """
     name, expert_axis = _output_name(lid, fmt, experts)
     tensor_shape, offsets = _part_box(lid, shape, fmt)
@@ -204,9 +213,7 @@ def _part_box(
     """The shape of the tensor (after its leading index axes) that holds ``lid``, and the offsets
     of ``lid``'s box in it: the tensor itself, or for a SwiGLU half in torch_dist, its rows of the
     fused tensor."""
-    if lid.part is not None and (lid.part not in GLU_PARTS or not is_fc1_path(lid.path)):
-        raise InternalError(f"{lid}: no format stores part {lid.part!r} of this tensor")
-    if lid.part is None or fmt != TORCH_DIST:
+    if lid.part is None or fmt != TORCH_DIST or not is_glu_half(lid.path, lid.part):
         return shape, (0,) * len(shape)
     rows = shape[0]
     fused = (len(GLU_PARTS) * rows,) + shape[1:]
@@ -230,6 +237,22 @@ def _output_name(
         axis = (lid.expert, experts.num_experts)
     else:
         name, axis = join_fsdp_expert(lid.path, lid.leaf, lid.expert, experts.fsdp_form), None
-    if lid.part is not None and fmt != TORCH_DIST:
-        name = join_glu_half(name, lid.part)
+    if lid.part is not None:
+        name = _part_name(lid, name, fmt)
     return name, axis
+
+
+def _part_name(lid: LogicalId, name: str, fmt: str) -> str:
+    """The name of the part ``lid`` names of the tensor ``name`` in ``fmt``: an fsdp_dtensor SwiGLU
+    half, a torch_dist part of a fused projection, or ``name`` itself for a torch_dist SwiGLU half
+    (its rows of the whole tensor).
+
+    Raises:
+        InternalError: ``fmt`` stores no such part.
+    """
+    assert lid.part is not None
+    if is_glu_half(lid.path, lid.part):
+        return name if fmt == TORCH_DIST else join_glu_half(name, lid.part)
+    if fmt == TORCH_DIST and is_fused_projection(lid.path):
+        return join_factory_part(name, lid.part)
+    raise InternalError(f"{lid}: {fmt} stores no part {lid.part!r} of this tensor")

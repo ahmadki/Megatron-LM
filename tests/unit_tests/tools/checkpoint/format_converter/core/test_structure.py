@@ -383,3 +383,41 @@ def test_torch_dist_names_are_never_swiglu_halves():
 def test_composing_a_part_no_format_stores_is_a_bug(lid, fmt):
     with pytest.raises(InternalError):
         compose(lid, (4, 4), [HYBRID], fmt)
+
+
+@pytest.mark.parametrize(
+    ("key", "lid"),
+    [
+        (
+            "decoder.layers.0.mixer.in_proj.weight.V2",
+            LogicalId("decoder", 0, "mixer.in_proj", "weight", None, "V2"),
+        ),
+        (
+            "decoder.layers.2.mixer.conv1d.bias.Q",
+            LogicalId("decoder", 2, "mixer.conv1d", "bias", None, "Q"),
+        ),
+        (
+            "decoder.layers.1.attn_layer.mixer.in_proj.weight.z",
+            LogicalId("decoder", 1, "attn_layer.mixer.in_proj", "weight", None, "z"),
+        ),
+    ],
+)
+def test_a_torch_dist_part_of_a_fused_projection_is_a_tensor_of_its_own(key, lid):
+    """Megatron's split factory saves each component as a key of its own, ``<name>.<part>``."""
+    assert decompose_one(key, [HYBRID], TORCH_DIST) == lid
+    assert compose(lid, (4,), [HYBRID], TORCH_DIST) == OutputSlice(key, (4,), Region.full((4,)))
+    with pytest.raises(InternalError):  # fsdp_dtensor stores the projection whole
+        compose(lid, (4,), [HYBRID], FSDP_DTENSOR)
+
+
+def test_fsdp_dtensor_names_are_never_parts_of_fused_projections():
+    """fsdp_dtensor stores fused projections whole; a ``.weight.<name>`` key there is refused by
+    detection (FC-R19), never read as a part."""
+    key = "decoder.layers.0.mixer.in_proj.weight.z"
+    assert decompose_one(key, [HYBRID], FSDP_DTENSOR) == LogicalId(
+        "decoder", 0, "mixer.in_proj.weight", "z"
+    )
+    whole = "decoder.layers.0.mixer.in_proj.weight"
+    assert decompose_one(whole, [HYBRID], TORCH_DIST) == LogicalId(
+        "decoder", 0, "mixer.in_proj", "weight"
+    )

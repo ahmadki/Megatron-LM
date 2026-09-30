@@ -271,3 +271,93 @@ def test_an_fsdp_source_is_unpacked_at_its_arguments_sizes():
         source=FSDP_DTENSOR, manifest=_manifest(pack_tp=1), args=tp2, manifest_ignored=True
     )
     assert ignored.pack_tp == 2
+
+
+GDP_SPEC = ["megatron.core.models.hybrid.hybrid_layer_specs", "gated_delta_product_stack_spec"]
+GDP_ARGS = {
+    "hybrid_layer_pattern": "M-",
+    "spec": GDP_SPEC,
+    "num_experts": None,
+    "quick_geglu": False,
+    "mamba_num_heads": 4,
+    "mamba_head_dim": 2,
+    "mamba_num_groups": 2,
+    "mamba_state_dim": 2,
+    "gdp_num_householder": 1,
+}
+"""A plain hybrid model with one Gated DeltaProduct mixer: d = 8, GN = 4, H = 4, M = 1."""
+GDP_PARTS = {
+    "in_proj": {"z": 8, "V0": 8, "K0": 4, "Q": 4, "b0": 4, "a": 4},
+    "conv1d": {"V0": 8, "K0": 4, "Q": 4},
+}
+GDP_MIXER = {
+    **{
+        f"decoder.layers.0.mixer.{name}.weight.{part}": (
+            (rows, H) if name == "in_proj" else (rows, 1, 4)
+        )
+        for name, parts in GDP_PARTS.items()
+        for part, rows in parts.items()
+    },
+    "decoder.layers.1.mlp.linear_fc1.weight": (F, H),
+    "decoder.layers.1.mlp.linear_fc2.weight": (H, F),
+}
+GDP_FSDP = {
+    "decoder.layers.0.mixer.in_proj.weight": (32, H),
+    "decoder.layers.0.mixer.conv1d.weight": (16, 1, 4),
+    "decoder.layers.1.mlp.linear_fc1.weight": (F, H),
+    "decoder.layers.1.mlp.linear_fc2.weight": (H, F),
+}
+
+
+def test_fused_mixer_projections_are_packed_per_tensor_parallel_rank():
+    ctx = context(GDP_MIXER, args=GDP_ARGS)
+    assert (ctx.pack_tp, ctx.pack_etp) == (1, None)
+    assert logged(ctx, "pack_tp") == (
+        1,
+        "args.tensor_model_parallel_size=1 of the source; 2 Gated DeltaProduct in_proj/conv1d "
+        "that fsdp_dtensor keeps fused, packed per rank",
+    )
+    assert logged(ctx, "mixers")[0] == {"decoder": {"gdp": 1}}
+    with pytest.raises(AmbiguousError) as caught:
+        context(GDP_MIXER, args={**GDP_ARGS, "tensor_model_parallel_size": 2})
+    refusal = caught.value.refusal
+    assert refusal.code == errors.FC_A01
+    assert refusal.message == (
+        "fsdp_dtensor packs 2 Gated DeltaProduct in_proj/conv1d per rank of the job that loads "
+        "it, and the source was saved with args.tensor_model_parallel_size=2: the store loads "
+        "right only at the size it is packed at"
+    )
+    assert refusal.keys == (
+        "decoder.layers.0.mixer.conv1d.weight.K0",
+        "decoder.layers.0.mixer.in_proj.weight.K0",
+    )
+    tp4 = context(GDP_MIXER, args={**GDP_ARGS, "tensor_model_parallel_size": 2}, fsdp_tp=4)
+    assert tp4.pack_tp == 4
+
+
+def test_mixer_parts_that_do_not_divide_by_the_pack_size_are_refused():
+    with pytest.raises(RefusedError) as caught:
+        context(GDP_MIXER, args=GDP_ARGS, fsdp_tp=8)
+    refusal = caught.value.refusal
+    assert refusal.code == errors.FC_R10
+    assert refusal.message == (
+        "the parts of 2 stored Gated DeltaProduct in_proj/conv1d tensors do not divide by "
+        "--fsdp-tp 8"
+    )
+    with pytest.raises(RefusedError) as caught:  # the store's own size, converting back
+        context(GDP_FSDP, source=FSDP_DTENSOR, args={**GDP_ARGS, "tensor_model_parallel_size": 8})
+    assert caught.value.refusal.message.endswith(
+        "do not divide by the store's args.tensor_model_parallel_size=8"
+    )
+
+
+def test_gated_linear_units_and_mixers_are_packed_at_one_size():
+    """A GEGLU hybrid model: its gated linear_fc1 and its mixer both packed per rank."""
+    geglu = {**GDP_MIXER, "decoder.layers.1.mlp.linear_fc1.weight": (2 * F, H)}
+    ctx = context(
+        geglu, args={**GDP_ARGS, "quick_geglu": True, "tensor_model_parallel_size": 2}, fsdp_tp=2
+    )
+    assert logged(ctx, "pack_tp")[1] == (
+        "--fsdp-tp 2; 1 gated linear_fc1 and 2 Gated DeltaProduct in_proj/conv1d that "
+        "fsdp_dtensor keeps fused, packed per rank"
+    )

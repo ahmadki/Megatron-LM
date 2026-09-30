@@ -19,9 +19,9 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -44,6 +44,7 @@ from .hybrid_pattern import shortcut_warnings
 from .keys import root_of
 from .logical import LogicalId
 from .manifest import MANIFEST_FILE, Manifest
+from .mixers import MixerLayout, megatron_fsdp_warnings, mixer_layout
 from .names import (
     AUTO_EXPERT_NAMING,
     AUTO_SWIGLU,
@@ -55,6 +56,7 @@ from .names import (
     SWIGLU_ON,
     TORCH_DIST,
 )
+from .part_layout import PartLayout
 from .stacking import requested_layout_warnings, transformer_block
 
 TD_TO_FSDP = "td_to_fsdp"
@@ -109,6 +111,34 @@ def pack_kind(lid: LogicalId) -> PackKind:
     return EXPERT_TENSOR_PARALLEL if lid.expert is not None else TENSOR_PARALLEL
 
 
+class RankMajor(Protocol):
+    """A tensor fsdp_dtensor stores packed per tensor-parallel rank (a gated ``linear_fc1`` it
+    keeps fused, a mixer's fused projection).
+
+    Attributes:
+        lid: Its logical id.
+        key: A stored source key that holds it (for messages).
+        parts: Its parts, each sharded over the ranks.
+        kind: What it is (``gated linear_fc1``), for messages.
+        parts_noun: What its parts are called (``gate and value halves``), for messages.
+    """
+
+    @property
+    def lid(self) -> LogicalId: ...  # pylint: disable=missing-function-docstring
+
+    @property
+    def key(self) -> str: ...  # pylint: disable=missing-function-docstring
+
+    @property
+    def parts(self) -> PartLayout: ...  # pylint: disable=missing-function-docstring
+
+    @property
+    def kind(self) -> str: ...  # pylint: disable=missing-function-docstring
+
+    @property
+    def parts_noun(self) -> str: ...  # pylint: disable=missing-function-docstring
+
+
 @dataclass(frozen=True, slots=True)
 class Derivation:
     """How one context field was derived.
@@ -151,6 +181,8 @@ class ArchContext:
             without mixture-of-experts layers).
         glu: The model's MLP first projections (``linear_fc1``): which are
             gated linear units, and which fsdp_dtensor stores as SwiGLU halves.
+        mixers: The model's state-space mixers: the family of each, and the
+            parts of its fused projections.
         pack_tp: The tensor-parallel size the fsdp_dtensor side packs fused
             tensors at (``None``: it packs none).
         pack_etp: The expert tensor-parallel size it packs the fused tensors
@@ -184,6 +216,7 @@ class ArchContext:
     blocks: tuple[BlockLayout, ...]
     experts: ExpertLayout | None
     glu: GluLayout
+    mixers: MixerLayout
     pack_tp: int | None
     pack_etp: int | None
     fsdp_glu_args: Mapping[str, bool]
@@ -310,14 +343,21 @@ def build_arch_context(
     )
     glu, evidence = swiglu_split(glu, fsdp_swiglu, blocks, source, experts)
     log.append(Derivation("swiglu_split", glu.split_json(), evidence))
+    mixers, evidence = mixer_layout(args, model, blocks, source)
+    log.append(Derivation("mixers", mixers.families_json(), evidence))
     warnings = (
         requested_layout_warnings(facts, blocks)
         + grouped_bias_warnings(experts, model, source)
         + shortcut_warnings(args, target)
     )
-    packs = _Packs(direction, glu, manifest, log, warnings, args=args, src_tp=tp, fsdp_tp=fsdp_tp)
+    rank_major = [fc1 for fc1 in glu.fc1s.values() if fc1.packed]
+    rank_major += list(mixers.projections.values())
+    packs = _Packs(
+        direction, rank_major, manifest, log, warnings, args=args, src_tp=tp, fsdp_tp=fsdp_tp
+    )
     pack_tp = packs.size(TENSOR_PARALLEL, saved=tp, flag=fsdp_tp)
     pack_etp = packs.size(EXPERT_TENSOR_PARALLEL, saved=etp, flag=fsdp_etp)
+    warnings += megatron_fsdp_warnings(mixers, target, pack_tp)
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
@@ -339,6 +379,7 @@ def build_arch_context(
         blocks=blocks,
         experts=experts,
         glu=glu,
+        mixers=mixers,
         pack_tp=pack_tp,
         pack_etp=pack_etp,
         fsdp_glu_args=fsdp_glu_args,
@@ -491,12 +532,12 @@ def _block_summary(block: BlockLayout) -> dict[str, Any]:
 
 
 class _Packs:
-    """Derives the sizes fsdp_dtensor packs fused tensors at (the tensors: ``glu``'s packed
-    first projections), checked against the manifest, the part sizes and the padded vocabulary.
+    """Derives the sizes fsdp_dtensor packs fused tensors at, checked against the manifest, the
+    part sizes and the padded vocabulary.
 
     Args:
         direction: The conversion's direction.
-        glu: The model's first projections.
+        rank_major: The tensors fsdp_dtensor packs per rank.
         manifest: The source's conversion manifest, if any.
         log: The derivations, appended to.
         warnings: The context's warnings, appended to.
@@ -508,7 +549,7 @@ class _Packs:
     def __init__(
         self,
         direction: str,
-        glu: GluLayout,
+        rank_major: Sequence[RankMajor],
         manifest: Manifest | None,
         log: list[Derivation],
         warnings: list[str],
@@ -518,7 +559,7 @@ class _Packs:
         fsdp_tp: int | None,
     ) -> None:
         self._direction = direction
-        self._packed = [fc1 for fc1 in glu.fc1s.values() if fc1.packed]
+        self._packed = list(rank_major)
         self._recorded = {
             record.get("field"): record.get("value")
             for record in (() if manifest is None else manifest.derivations)
@@ -546,7 +587,7 @@ class _Packs:
                 fsdp_dtensor source's manifest records another size, or the
                 padded vocabulary does not divide by ``--fsdp-tp`` (FC-R10).
         """
-        packed = [fc1 for fc1 in self._packed if pack_kind(fc1.lid) is kind]
+        packed = [tensor for tensor in self._packed if pack_kind(tensor.lid) is kind]
         if not packed:
             unused = "" if flag is None else f"; {kind.flag} {flag} has no effect"
             if flag is not None:
@@ -555,9 +596,9 @@ class _Packs:
                 Derivation(kind.field, None, f"no fused tensor to pack per rank{unused}")
             )
             return None
-        keys = tuple(sorted({fc1.key for fc1 in packed}))
+        keys = tuple(sorted({tensor.key for tensor in packed}))
         if self._direction == TD_TO_FSDP:
-            size, evidence = self._target_size(kind, saved, flag, len(packed), keys)
+            size, evidence = self._target_size(kind, saved, flag, _counted(packed), keys)
             _check_divisible(
                 packed, size, f"{kind.flag} {size}", f"pass a {kind.flag} that divides them"
             )
@@ -573,8 +614,7 @@ class _Packs:
             Derivation(
                 kind.field,
                 size,
-                f"{evidence}; {len(packed)} gated linear_fc1 that fsdp_dtensor keeps fused, "
-                "packed per rank",
+                f"{evidence}; {_counted(packed)} that fsdp_dtensor keeps fused, packed per rank",
             )
         )
         return size
@@ -585,26 +625,26 @@ class _Packs:
             f"{kind.flag} {flag} has no effect: the fsdp_dtensor store packs no tensor per "
             f"{kind.rank}"
         )
-        experts = [fc1 for fc1 in self._packed if pack_kind(fc1.lid).experts]
+        experts = [tensor for tensor in self._packed if pack_kind(tensor.lid).experts]
         if kind.experts or not experts:
             return f"{unused}, so it loads at any {kind.arg}"
         etp = EXPERT_TENSOR_PARALLEL
         return (
-            f"{unused}, but it packs {len(experts)} gated linear_fc1 of routed experts per "
+            f"{unused}, but it packs {_counted(experts)} of routed experts per "
             f"{etp.rank}: they load right only at the {etp.arg} the store's arguments record "
             f"({etp.field}), which the loading job must set with --expert-tensor-parallel-size "
             "(Megatron does not take it from a checkpoint)"
         )
 
     def _target_size(
-        self, kind: PackKind, saved: int, flag: int | None, count: int, keys: tuple[str, ...]
+        self, kind: PackKind, saved: int, flag: int | None, counted: str, keys: tuple[str, ...]
     ) -> tuple[int, str]:
         if flag is not None:
             return flag, f"{kind.flag} {flag}"
         if kind.experts and self._fsdp_tp is not None and self._fsdp_tp != self._src_tp:
             raise Refusal(
                 errors.FC_A01,
-                f"fsdp_dtensor packs {count} gated linear_fc1 of routed experts per "
+                f"fsdp_dtensor packs {counted} of routed experts per "
                 f"{kind.rank} of the job that loads it, and {TENSOR_PARALLEL.flag} "
                 f"{self._fsdp_tp} is not the size the source was saved with "
                 f"(args.{TENSOR_PARALLEL.arg}={self._src_tp}): a job at tensor-parallel size "
@@ -618,9 +658,9 @@ class _Packs:
             return 1, f"args.{kind.arg}=1 of the source"
         raise Refusal(
             errors.FC_A01,
-            f"fsdp_dtensor packs {count} gated linear_fc1 per rank of the job that loads it, and "
-            f"the source was saved with args.{kind.arg}={saved}: the store loads right only at "
-            "the size it is packed at",
+            f"fsdp_dtensor packs {counted} per rank of the job that loads it, and the source "
+            f"was saved with args.{kind.arg}={saved}: the store loads right only at the size it "
+            "is packed at",
             keys=keys,
             hint=f"pass {kind.flag} N with the {kind.arg} of that job (the store's arguments then "
             "record it)",
@@ -695,17 +735,35 @@ class _Packs:
             ).to_error()
 
 
-def _check_divisible(packed: list[Fc1], size: int, given: str, hint: str) -> None:
-    """Every packed tensor's halves divide by its pack size ``size``, ``given`` as said (FC-R10)."""
-    uneven = sorted({fc1.key for fc1 in packed if any(part % size for part in fc1.parts.sizes)})
+def _check_divisible(packed: Sequence[RankMajor], size: int, given: str, hint: str) -> None:
+    """Every packed tensor's parts divide by its pack size ``size``, ``given`` as said (FC-R10)."""
+    uneven = [tensor for tensor in packed if any(part % size for part in tensor.parts.sizes)]
     if uneven:
+        described = " and ".join(
+            f"the {tensor.parts_noun} of {count} stored {tensor.kind} tensors"
+            for tensor, count in _kinds(uneven)
+        )
         raise Refusal(
             errors.FC_R10,
-            f"the gate and value halves of {len(uneven)} stored gated linear_fc1 tensors do not "
-            f"divide by {given}",
-            keys=tuple(uneven),
+            f"{described} do not divide by {given}",
+            keys=tuple(sorted({tensor.key for tensor in uneven})),
             hint=hint,
         ).to_error()
+
+
+def _kinds(tensors: Sequence[RankMajor]) -> list[tuple[RankMajor, int]]:
+    """One tensor of each kind of ``tensors`` and the number of that kind, in first-seen order."""
+    first: dict[str, RankMajor] = {}
+    counts: Counter[str] = Counter()
+    for tensor in tensors:
+        first.setdefault(tensor.kind, tensor)
+        counts[tensor.kind] += 1
+    return [(tensor, counts[kind]) for kind, tensor in first.items()]
+
+
+def _counted(tensors: Sequence[RankMajor]) -> str:
+    """``3 gated linear_fc1 and 8 Gated DeltaProduct in_proj/conv1d``."""
+    return " and ".join(f"{count} {tensor.kind}" for tensor, count in _kinds(tensors))
 
 
 def _fsdp_swiglu(

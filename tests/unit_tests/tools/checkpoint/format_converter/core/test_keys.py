@@ -7,22 +7,28 @@ from __future__ import annotations
 import pytest
 
 from tools.checkpoint.format_converter.core.keys import (
+    MIXER_TENSOR,
     ExpertName,
     KeyGrammarError,
     LayerKey,
+    MixerTensor,
     attribute_layer_key,
     fc2_path_of,
     innermost_layer_key,
     is_fc1_path,
+    is_glu_half,
     is_swiglu_key,
+    join_factory_part,
     join_glu_half,
     join_layer_key,
     join_leaf,
     join_torch_dist_expert,
     root_of,
+    split_factory_part,
     split_glu_half,
     split_layer_key,
     split_leaf,
+    split_mixer_tensor,
     split_torch_dist_expert,
     torch_dist_chunk_axes,
 )
@@ -281,3 +287,87 @@ def test_the_second_projection_beside_a_first():
     assert fc2_path_of("mlp.experts.linear_fc1") == "mlp.experts.linear_fc2"
     with pytest.raises(KeyGrammarError):
         fc2_path_of("mlp.linear_fc2")
+
+
+@pytest.mark.parametrize(
+    ("name", "tensor", "part"),
+    [
+        ("mixer.in_proj.weight.V0", "mixer.in_proj.weight", "V0"),
+        ("mixer.in_proj.bias.a", "mixer.in_proj.bias", "a"),
+        ("mixer.conv1d.weight.K12", "mixer.conv1d.weight", "K12"),
+        ("attn_layer.mixer.in_proj.weight.z", "attn_layer.mixer.in_proj.weight", "z"),
+        ("self_attention.in_proj.weight.query", "self_attention.in_proj.weight", "query"),
+        ("self_attention.conv1d.bias.value", "self_attention.conv1d.bias", "value"),
+        # whole tensors, and names that are no fused projection's part
+        ("mixer.in_proj.weight", "mixer.in_proj.weight", None),
+        ("mixer.in_proj.layer_norm_weight", "mixer.in_proj.layer_norm_weight", None),
+        ("mixer.out_proj.weight.z", "mixer.out_proj.weight.z", None),
+        ("mlp.linear_fc1.weight.w", "mlp.linear_fc1.weight.w", None),
+        ("mixer.in_proj.weight.0", "mixer.in_proj.weight.0", None),
+        ("in_proj.weight.z", "in_proj.weight.z", None),
+    ],
+)
+def test_torch_dist_factory_parts_name_their_fused_tensor(name, tensor, part):
+    assert split_factory_part(name) == (tensor, part)
+    if part is not None:
+        assert join_factory_part(tensor, part) == name
+
+
+def test_only_fused_projections_are_joined_with_parts():
+    with pytest.raises(InternalError):
+        join_factory_part("mlp.linear_fc1.weight", "z")
+
+
+def test_swiglu_halves_are_parts_of_first_projections_only():
+    assert is_glu_half("mlp.linear_fc1", "w") and is_glu_half("mlp.experts.linear_fc1", "v")
+    assert not is_glu_half("mlp.linear_fc2", "w")
+    assert not is_glu_half("self_attention.in_proj", "w")  # a Gated DeltaNet 2 part
+
+
+@pytest.mark.parametrize(
+    ("key", "path", "leaf", "tensor"),
+    [
+        (
+            "decoder.layers.0.mixer.in_proj.weight.V0",
+            "mixer.in_proj",
+            "weight",
+            MixerTensor("mixer", "in_proj", "weight"),
+        ),
+        (
+            "decoder.layers.1.attn_layer.mixer.conv1d.bias",
+            "attn_layer.mixer.conv1d",
+            "bias",
+            MixerTensor("attn_layer.mixer", "conv1d", "bias"),
+        ),
+        (
+            "decoder.layers.2.mixer.conv1d_weight",
+            "mixer",
+            "conv1d_weight",
+            MixerTensor("mixer", "conv1d", "weight", conv_parameter=True),
+        ),
+        (
+            "decoder.layers.2.mixer.conv1d_bias",
+            "mixer",
+            "conv1d_bias",
+            MixerTensor("mixer", "conv1d", "bias", conv_parameter=True),
+        ),
+    ],
+)
+def test_mixer_tensors_are_named_by_mixer_projection_and_leaf(key, path, leaf, tensor):
+    assert MIXER_TENSOR.search(key)
+    assert split_mixer_tensor(path, leaf) == tensor
+
+
+@pytest.mark.parametrize(
+    ("key", "path", "leaf"),
+    [
+        ("decoder.layers.0.mixer.in_proj.layer_norm_weight", "mixer.in_proj", "layer_norm_weight"),
+        ("decoder.layers.0.mixer.out_proj.weight", "mixer.out_proj", "weight"),
+        ("decoder.layers.0.mixer.A_log", "mixer", "A_log"),
+        ("decoder.layers.0.self_attention.in_proj.weight", "self_attention.in_proj", "weight"),
+        ("decoder.layers.0.mixer.norm.weight", "mixer.norm", "weight"),
+    ],
+)
+def test_other_mixer_tensors_are_no_fused_projections(key, path, leaf):
+    assert MIXER_TENSOR.search(key) is None
+    assert split_mixer_tensor(path, leaf) is None

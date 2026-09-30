@@ -47,7 +47,11 @@ whatever the format.
 Megatron-FSDP may store the weight and bias of a gated MLP's ``linear_fc1``
 as two SwiGLU halves, ``<name>_w`` and ``<name>_v`` (``linear_fc1.weight<e>_w``
 for a grouped expert): :func:`split_glu_half` names the whole tensor and the
-half, and :data:`SWIGLU_KEYS` are the names it splits.
+half, and :data:`SWIGLU_KEYS` are the names it splits. The other way round,
+torch_dist stores the weight and bias of a state-space mixer's fused
+projections (:data:`FUSED_PROJECTION`) as one tensor per component, e.g.
+``mixer.in_proj.weight.V0``, while fsdp_dtensor stores them whole:
+:func:`split_factory_part` names the whole tensor and the part.
 """
 
 from __future__ import annotations
@@ -359,6 +363,91 @@ FUSED_MIXER = re.compile(
 )
 """A fused state-space or linear-attention projection as fsdp_dtensor stores it."""
 
+IN_PROJ, CONV1D = "in_proj", "conv1d"
+"""The fused projections of a state-space mixer (and of a Gated DeltaNet): the input projection,
+which concatenates one projection per component, and the depthwise convolution over some of them."""
+
+FUSED_PROJECTION = re.compile(r"(?:^|\.)(?:mixer|self_attention)\.(?:in_proj|conv1d)$")
+"""The module path of a fused projection (``<...>.mixer.in_proj``, ``<...>.self_attention.conv1d``).
+Megatron's split factory saves its weight and bias in torch_dist as one tensor per component
+(``mixer.in_proj.weight.z``); fsdp_dtensor stores them whole."""
+
+_FACTORY_PART_NAME = re.compile(
+    r"(?P<tensor>(?P<path>.+)\.(?:weight|bias))\.(?P<part>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def split_factory_part(name: str) -> tuple[str, str | None]:
+    """The tensor and the part of a torch_dist factory sub-key of a fused projection.
+
+    Returns:
+        ``(<...>.in_proj.weight, "V0")`` for ``<...>.in_proj.weight.V0`` (see
+        :data:`FUSED_PROJECTION`), ``(name, None)`` for any other name.
+    """
+    match = _FACTORY_PART_NAME.fullmatch(name)
+    if match is None or FUSED_PROJECTION.search(match.group("path")) is None:
+        return name, None
+    return match.group("tensor"), match.group("part")
+
+
+def join_factory_part(name: str, part: str) -> str:
+    """The torch_dist key of part ``part`` of the fused-projection tensor ``name``.
+
+    Raises:
+        InternalError: ``name`` is not the weight or bias of a fused projection.
+    """
+    path, _ = split_leaf(name)
+    if FUSED_PROJECTION.search(path) is None:
+        raise InternalError(f"{name} is not a fused projection that torch_dist stores in parts")
+    return f"{name}.{part}"
+
+
+def is_fused_projection(path: str) -> bool:
+    """Whether ``path`` is the module path of a fused projection (:data:`FUSED_PROJECTION`)."""
+    return FUSED_PROJECTION.search(path) is not None
+
+
+MIXER_TENSOR = re.compile(
+    r"(?:^|\.)mixer\.(?:(?:in_proj|conv1d)\.(?:weight|bias)(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
+    r"|conv1d_(?:weight|bias))$"
+)
+"""A fused projection tensor of a state-space mixer, whole or one torch_dist part of it; Mamba-2's
+fsdp_dtensor stores name its convolution ``mixer.conv1d_weight`` and ``mixer.conv1d_bias``."""
+
+_MIXER_PROJECTION = re.compile(r"(?P<mixer>(?:.+\.)?mixer)\.(?P<projection>in_proj|conv1d)")
+_MIXER_MODULE = re.compile(r"(?:.+\.)?mixer")
+_MAMBA_CONV_LEAVES = {"conv1d_weight": "weight", "conv1d_bias": "bias"}
+
+
+@dataclass(frozen=True, slots=True)
+class MixerTensor:
+    """A fused projection tensor of a state-space mixer, by its logical name.
+
+    Attributes:
+        mixer: The module path of the mixer inside its layer (``mixer``, or
+            ``<child>.mixer`` in a shortcut pair).
+        projection: ``in_proj`` or ``conv1d``.
+        leaf: ``weight`` or ``bias``.
+        conv_parameter: Stored as the mixer's own parameter ``conv1d_weight``
+            or ``conv1d_bias`` (as Mamba-2's fsdp_dtensor stores name it).
+    """
+
+    mixer: str
+    projection: str
+    leaf: str
+    conv_parameter: bool = False
+
+
+def split_mixer_tensor(path: str, leaf: str) -> MixerTensor | None:
+    """The mixer tensor of the logical name ``path``/``leaf``, or ``None`` if it is none."""
+    match = _MIXER_PROJECTION.fullmatch(path)
+    if match is not None and leaf in ("weight", "bias"):
+        return MixerTensor(match.group("mixer"), match.group("projection"), leaf)
+    if leaf in _MAMBA_CONV_LEAVES and _MIXER_MODULE.fullmatch(path) is not None:
+        return MixerTensor(path, CONV1D, _MAMBA_CONV_LEAVES[leaf], conv_parameter=True)
+    return None
+
+
 ROUTED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.")
 """A tensor under the routed experts of a mixture-of-experts layer (``<...>.mlp.experts.``)."""
 
@@ -477,6 +566,11 @@ def is_swiglu_key(name: str) -> bool:
     """Whether Megatron-FSDP splits the tensor it stores as ``name`` into SwiGLU halves (if its
     layer is gated; see :data:`SWIGLU_KEYS`)."""
     return any(pattern.search(name) is not None for pattern in SWIGLU_KEYS)
+
+
+def is_glu_half(path: str, part: str) -> bool:
+    """Whether ``part`` of the tensor at module path ``path`` is a SwiGLU half of ``linear_fc1``."""
+    return part in GLU_PARTS and is_fc1_path(path)
 
 
 def split_glu_half(name: str) -> tuple[str, str | None]:
