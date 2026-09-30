@@ -201,10 +201,16 @@ def load_weights_only(model, optimizer, args, load_dir: Path) -> int:
 
 
 def hybrid_provider(
-    pre_process: bool = True, post_process: bool = True, *, seed: int, pattern: str, **kwargs
+    pre_process: bool = True,
+    post_process: bool = True,
+    *,
+    seed: int,
+    pattern: str,
+    stack_spec: ModuleSpec = hybrid_stack_spec,
+    **kwargs,
 ) -> HybridModel:
-    """A tiny hybrid model of ``pattern`` with the default (Transformer Engine) stack spec (and
-    multi-token prediction layers of its ``/`` parts).
+    """A tiny hybrid model of ``pattern`` with the default (Transformer Engine) stack spec, or
+    ``stack_spec`` (and multi-token prediction layers of its ``/`` parts).
 
     Linear layers have biases, the MLP is not gated, and the output layer is
     untied from the embedding, so every kind of tensor these layers have is
@@ -227,7 +233,7 @@ def hybrid_provider(
     )
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_stack_spec=stack_spec,
         vocab_size=HYBRID_VOCAB,
         max_sequence_length=4,
         hybrid_layer_pattern=pattern,
@@ -295,7 +301,8 @@ def build_hybrid(
 ):
     """A tiny hybrid model (classic or Megatron-FSDP v1) with a distributed optimizer.
 
-    ``config`` adds TransformerConfig fields (e.g. :data:`MOE_CONFIG` for ``E`` layers).
+    ``config`` adds TransformerConfig fields (e.g. :data:`MOE_CONFIG` for ``E`` layers) or the
+    stack spec of :func:`hybrid_provider`.
     """
     return setup_model_and_optimizer(
         seed=seed,
@@ -547,7 +554,9 @@ def full_params(model) -> dict[str, torch.Tensor]:
         if isinstance(param, DTensor):
             value = uneven_dtensor_to_full_tensor(param)
         elif getattr(param, "tensor_model_parallel", False):
-            value = _gather_tensor_parallel(param.detach(), param.partition_dim)
+            # A Gated DeltaProduct mixer's A_log, dt_bias and norm.weight are sharded along
+            # their first dimension without a partition_dim (their sharded state dict says so).
+            value = _gather_tensor_parallel(param.detach(), getattr(param, "partition_dim", 0))
         else:
             value = param
         params[name] = value.detach().cpu().clone()
