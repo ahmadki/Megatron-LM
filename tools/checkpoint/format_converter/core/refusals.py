@@ -33,7 +33,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
-from .blocks import SINGLE_ROOTS, VLM_ROOTS
+from .blocks import LANGUAGE_MODEL, MTP, SINGLE_ROOTS, VLM_ROOTS
 from .experts import built_expert_form
 from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
@@ -57,7 +57,6 @@ from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P04: "hybrid multi-token prediction",
     errors.FC_P05: "Gated DeltaProduct mixers",
     errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
@@ -67,7 +66,7 @@ PENDING_FAMILIES: Mapping[str, str] = {
 }
 """Every pending-family code and the family it stands for."""
 
-MTP_BLOCKS = ("mtp", "language_model.mtp")
+MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
 """Block prefixes of multi-token prediction."""
 
 HYBRID_SPEC_MODULES = (
@@ -526,20 +525,6 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
     refusal = singleton_local_shards_refusal(facts.content_metadata, tuple(sorted(set(keys))))
     if refusal is not None:
         yield refusal
-
-
-@REGISTRY.detector
-def pending_hybrid_mtp(facts: Facts) -> Iterator[Refusal]:
-    """FC-P04: hybrid multi-token prediction."""
-    pattern = hybrid_pattern_of(facts.args)
-    if pattern is None:
-        return
-    evidence = []
-    if pattern.mtp:
-        evidence.append(f"{len(pattern.mtp)} MTP depth(s) in the hybrid layer pattern")
-    elif facts.args.get("mtp_num_layers", None):
-        evidence.append(f"args.mtp_num_layers={facts.args.get('mtp_num_layers')}")
-    yield from _pending(errors.FC_P04, evidence, _mtp_keys(facts))
 
 
 def _mixer_code(facts: Facts) -> str:

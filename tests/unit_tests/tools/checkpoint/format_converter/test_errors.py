@@ -76,12 +76,12 @@ def test_cli_prints_every_refusal_on_its_own_line(monkeypatch, capsys):
 
     def refuse(args):
         raise errors.refusal_error(
-            [Refusal(errors.FC_P04, "shortcut", hint="later"), Refusal(errors.FC_R20, "symbol D")]
+            [Refusal(errors.FC_P05, "mixers", hint="later"), Refusal(errors.FC_R20, "symbol D")]
         )
 
     monkeypatch.setattr(cli, "_run_inspect", refuse)
     assert cli.main(["inspect", "somewhere"]) == ExitCode.REFUSED
     assert capsys.readouterr().err.splitlines() == [
         "error: FC-R20: symbol D",
-        "error: FC-P04: shortcut hint: later",
+        "error: FC-P05: mixers hint: later",
     ]

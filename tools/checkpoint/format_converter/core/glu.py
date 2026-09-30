@@ -20,9 +20,9 @@ The shapes are cross-checked against the configuration:
   all plain;
 * the language model's configuration is gated iff ``args.swiglu`` or
   ``args.quick_geglu`` is set (Megatron's ``core_transformer_config_from_args``),
-  so its decoder's first projections must be gated exactly then. Other
-  blocks (a vision encoder) and MLPs outside blocks have configurations of
-  their own.
+  so the first projections of its decoder and of its multi-token prediction
+  layers must be gated exactly then. Other blocks (a vision encoder) and MLPs
+  outside blocks have configurations of their own.
 
 A contradiction is refused (FC-R12), as is a first projection without its
 second, whose gatedness cannot be told. A ``linear_fc1`` outside every layer
@@ -46,7 +46,7 @@ every first projection as the predicate says, both halves of a split tensor
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from .. import errors
@@ -123,9 +123,10 @@ class GluLayout:
             return None
         return self.fc1s.get(LogicalId(lid.block, lid.layer, lid.path, WEIGHT, lid.expert))
 
-    def language_model(self, decoder: str) -> list[Fc1]:
-        """The first projections of the language model's decoder ``decoder``."""
-        return [fc1 for fc1 in self.fc1s.values() if fc1.lid.block == decoder]
+    def language_model(self, blocks: Collection[str]) -> list[Fc1]:
+        """The first projections of the language model's ``blocks`` (decoder, multi-token
+        prediction)."""
+        return [fc1 for fc1 in self.fc1s.values() if fc1.lid.block in blocks]
 
     def gated_json(self) -> dict[str, dict[str, int]]:
         """The number of gated and plain first projections of each block (or module)."""
@@ -153,7 +154,7 @@ def glu_layout(
     model: Mapping[str, TensorEntry],
     blocks: Sequence[BlockLayout],
     source: str,
-    lm_decoder: str,
+    language_model: Sequence[str],
 ) -> tuple[GluLayout, str]:
     """The model's first projections and whether each is gated, and the evidence.
 
@@ -162,13 +163,14 @@ def glu_layout(
         model: The source's model tensors by model-relative key.
         blocks: The model's blocks.
         source: The source format.
-        lm_decoder: The language model's decoder block.
+        language_model: The blocks built with the language model's configuration (its
+            decoder and multi-token prediction blocks).
 
     Raises:
         RefusedError: A first projection has no second projection beside it
             (unless it is a plain linear layer, see above), the first
             projections of a layer are not all gated or all plain,
-            the language model's decoder is gated otherwise than its
+            the language model's blocks are gated otherwise than its
             arguments say, or a first projection's weight and bias are not
             both split into SwiGLU halves or both whole (FC-R12); a SwiGLU
             half has no pair of its shape, or is stored beside its whole
@@ -194,11 +196,11 @@ def glu_layout(
         rows = shape[0] * (len(GLU_PARTS) if lid.part is not None else 1)
         fc1s[whole] = Fc1(whole, key, rows, rows == 2 * fc2[1][-1], halves[whole])
     _check_layers(fc1s.values())
-    lm_gated = _check_language_model(args, fc1s.values(), lm_decoder)
+    lm_gated = _check_language_model(args, fc1s.values(), language_model)
     flags = ", ".join(f"args.{name}={args.get(name, False)}" for name in GLU_ARGS)
     evidence = (
         f"{len(fc1s)} linear_fc1 weights against their linear_fc2 inputs (gated: twice as many "
-        f"rows); {flags} make the language model's MLPs (in {lm_decoder}) "
+        f"rows); {flags} make the language model's MLPs (in {', '.join(language_model)}) "
         + ("gated" if lm_gated else "plain")
         + _plain_linears_note(plain_linears)
     )
@@ -359,16 +361,20 @@ def _check_layers(fc1s: Iterable[Fc1]) -> None:
             )
 
 
-def _check_language_model(args: ArgsView, fc1s: Iterable[Fc1], lm_decoder: str) -> bool:
-    """The language model's decoder is gated iff its arguments say so (FC-R12); whether it is."""
+def _check_language_model(
+    args: ArgsView, fc1s: Iterable[Fc1], language_model: Sequence[str]
+) -> bool:
+    """The language model's blocks are gated iff its arguments say so (FC-R12); whether they are."""
     gated = any(bool(args.get(name, False)) for name in GLU_ARGS)
-    wrong = sorted({fc1.key for fc1 in fc1s if fc1.lid.block == lm_decoder and fc1.gated != gated})
+    wrong = sorted(
+        {fc1.key for fc1 in fc1s if fc1.lid.block in language_model and fc1.gated != gated}
+    )
     if wrong:
         flags = " and ".join(f"args.{name}={args.get(name, False)}" for name in GLU_ARGS)
         observed = "plain" if gated else "gated (twice the rows linear_fc2 has inputs)"
         raise _refusal(
-            f"the language model's linear_fc1 weights (in {lm_decoder}) are {observed}, but "
-            f"{flags} make its MLPs {'gated' if gated else 'plain'}",
+            f"the language model's linear_fc1 weights (in {', '.join(language_model)}) are "
+            f"{observed}, but {flags} make its MLPs {'gated' if gated else 'plain'}",
             tuple(wrong),
         )
     return gated

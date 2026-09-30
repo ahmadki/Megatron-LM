@@ -93,11 +93,18 @@ def test_a_supported_hybrid_model_passes_in_both_directions():
     assert codes(facts(source=FSDP_DTENSOR, target=TORCH_DIST)) == []
 
 
-def test_shortcut_moe_models_pass():
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"hybrid_layer_pattern": "*E*E", "moe_shortcut_connection": True, "num_experts": 4},
+        {"hybrid_layer_pattern": "*-*-/*-/*-", "mtp_num_layers": 2},
+        {"mtp_hybrid_override_pattern": "*-", "mtp_num_layers": 2},  # the legacy MTP pattern
+    ],
+)
+def test_shortcut_moe_and_hybrid_mtp_models_pass(args):
     """Their numbering is checked against the keys when the blocks are laid out (FC-R11)."""
-    shortcut = {"hybrid_layer_pattern": "*E*E", "moe_shortcut_connection": True, "num_experts": 4}
-    assert codes(facts(args=shortcut)) == []
-    assert codes(facts(args=shortcut, source=FSDP_DTENSOR, target=TORCH_DIST)) == []
+    assert codes(facts(args=args)) == []
+    assert codes(facts(args=args, source=FSDP_DTENSOR, target=TORCH_DIST)) == []
 
 
 GPT_ARGS = {"hybrid_layer_pattern": None}
@@ -258,18 +265,6 @@ CASES = {
             keys={f"decoder.layers.1.mlp.linear_fc1.weight_{part}": (F, H) for part in "wv"},
         ),
     ),
-    "P04 hybrid mtp": (errors.FC_P04, facts(args={"hybrid_layer_pattern": "*-*-/*-"})),
-    "P04 legacy mtp": (
-        errors.FC_P04,
-        facts(args={"mtp_hybrid_override_pattern": "*-", "mtp_num_layers": 2}),
-    ),
-    "P04 hybrid mtp keys": (
-        errors.FC_P04,
-        facts(
-            args={"hybrid_layer_pattern": "*-*-/*-"},
-            keys={"mtp.layers.0.mtp_model_layer.layers.1.mlp.linear_fc2.weight": (H, F)},
-        ),
-    ),
     "P05 spec": (
         errors.FC_P05,
         facts(args={"spec": ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]}),
@@ -286,6 +281,7 @@ CASES = {
         errors.FC_P09,
         facts(keys={"decoder.layers.0.self_attention.in_proj.weight": (4 * H, H)}),
     ),
+    "P10 gpt mtp": (errors.FC_P10, facts(args={**GPT_ARGS, "mtp_num_layers": 1})),
     "P10 mla": (errors.FC_P10, facts(args={"multi_latent_attention": True})),
     "P10 symbol": (errors.FC_P10, facts(args={"hybrid_layer_pattern": "+-+-"})),
     "P11 optimizer": (
@@ -475,14 +471,14 @@ def test_a_vision_language_hybrid_is_refused_with_every_pending_family_it_uses()
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     found = facts(args=args, keys=keys)
-    assert codes(found) == [errors.FC_P04, errors.FC_P05]
+    assert codes(found) == [errors.FC_P05]
 
 
 def test_refusals_carry_the_evidence():
-    (refusal,) = detect_refusals(facts(args={"hybrid_layer_pattern": "*-*-/*-/*-"}))
+    (refusal,) = detect_refusals(facts(args={**GPT_ARGS, "mtp_num_layers": 2}))
     assert refusal.message == (
-        "not supported yet: hybrid multi-token prediction (2 MTP depth(s) in the hybrid layer "
-        "pattern)"
+        "not supported yet: GPT multi-token prediction and multi-latent attention "
+        "(args.mtp_num_layers=2 without a hybrid layer pattern)"
     )
     (refusal,) = detect_refusals(CASES["R05 grouped biases for fsdp"][1])
     assert refusal.message == (
@@ -501,16 +497,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P04, "shortcut", hint="later")
+    pending = Refusal(errors.FC_P05, "mixers", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P04)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P05)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P04: shortcut hint: later",
+        "FC-P05: mixers hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

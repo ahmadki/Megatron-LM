@@ -17,7 +17,7 @@ import pytest
 
 from tools.checkpoint.format_converter.core.format_args import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
-from tools.checkpoint.format_converter.core.keys import SWIGLU_KEYS
+from tools.checkpoint.format_converter.core.keys import MTP_INNER_LAYER, SWIGLU_KEYS
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 
 from .._harness import REPO_ROOT
@@ -29,6 +29,9 @@ FSDP_DTENSOR_CHECKPOINT = (
 )
 LAYER_UTILS = REPO_ROOT / "megatron" / "core" / "models" / "hybrid" / "layers" / "utils.py"
 TRANSFORMER_CONFIG = REPO_ROOT / "megatron" / "core" / "transformer" / "transformer_config.py"
+MULTI_TOKEN_PREDICTION = (
+    REPO_ROOT / "megatron" / "core" / "transformer" / "multi_token_prediction.py"
+)
 
 FSDP_DTENSOR_HANDLERS = frozenset(
     {
@@ -235,3 +238,33 @@ def test_the_arguments_that_gate_the_language_model_are_the_mirrored_ones():
             if sets_glu:
                 gating.add(node.test.attr)
     assert gating == set(GLU_ARGS), "other arguments gate the MLPs now; update GLU_ARGS"
+
+
+def _string_constants(tree: ast.AST) -> dict[str, str]:
+    """Module-level ``NAME = '<string>'`` assignments."""
+    return {
+        target.id: node.value.value
+        for node in getattr(tree, "body", ())
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+        for target in node.targets
+        if isinstance(target, ast.Name) and isinstance(node.value.value, str)
+    }
+
+
+def test_hybrid_mtp_layers_keep_the_inner_layer_name_in_both_formats():
+    """torch_dist renames a GPT MTP layer's inner model (``mtp_model_layer`` to
+    ``transformer_layer``) only without an MTP layer pattern, and Megatron-FSDP only for the
+    layers ``get_mtp_inner_layer_paths`` finds, which excludes those with a pattern: a hybrid MTP
+    layer keeps the name in both formats."""
+    constants = _string_constants(_module(FSDP_DTENSOR_CHECKPOINT))
+    assert constants["MTP_INNER_LAYER"] == MTP_INNER_LAYER
+    paths = _definition(_module(FSDP_DTENSOR_CHECKPOINT), "get_mtp_inner_layer_paths")
+    assert "getattr(mod, 'mtp_layer_pattern', None) is None" in ast.unparse(paths)
+    layer = _definition(_module(MULTI_TOKEN_PREDICTION), "MultiTokenPredictionLayer")
+    (rename,) = [
+        node
+        for node in ast.walk(_definition(layer, "sharded_state_dict"))
+        if isinstance(node, ast.If) and "apply_prefix_mapping" in ast.unparse(node)
+    ]
+    assert ast.unparse(rename.test) == "self.mtp_layer_pattern is None"
+    assert f"{MTP_INNER_LAYER}." in ast.unparse(rename.body[0])

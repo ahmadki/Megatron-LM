@@ -69,7 +69,6 @@ with a pending-family code:
 
 | Code | Family |
 |---|---|
-| `FC-P04` | hybrid multi-token prediction |
 | `FC-P05` | Gated DeltaProduct mixers |
 | `FC-P08` | Mamba-2 mixers |
 | `FC-P09` | Gated DeltaNet and linear attention |

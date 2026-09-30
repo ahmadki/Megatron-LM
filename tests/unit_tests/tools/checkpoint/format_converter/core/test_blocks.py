@@ -63,6 +63,13 @@ def _module_keys(stored: dict[int, str], prefix: str = "decoder") -> dict[str, T
     return {key: _entry(key) for key in keys}
 
 
+def _mtp_keys(depth: int, stored: dict[int, str], prefix: str = "mtp") -> dict[str, TensorEntry]:
+    """Model keys of MTP depth ``depth``: its own tensors and its inner layer list's modules."""
+    layer = f"{prefix}.layers.{depth}"
+    keys = {key: _entry(key) for key in (f"{layer}.eh_proj.weight", f"{layer}.enorm.weight")}
+    return {**keys, **_module_keys(stored, f"{layer}.mtp_model_layer")}
+
+
 def classify_blocks_of(args: ArgsView, model, fmt: str):
     return classify_blocks(BlockFacts(args, fmt, model), default=transformer_block)
 
@@ -102,11 +109,8 @@ def test_the_census_puts_each_key_in_its_innermost_block():
 
 @pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
 def test_a_hybrid_decoder_is_one_per_layer_block(fmt):
-    (block,) = classify_blocks_of(
-        _args(hybrid_layer_pattern="*-|*-/*-", num_layers=4),
-        _module_keys(dict(enumerate("*-*-"))),
-        fmt,
-    )
+    model = {**_module_keys(dict(enumerate("*-*-"))), **_mtp_keys(0, {0: "*", 1: "-"})}
+    block, *_ = classify_blocks_of(_args(hybrid_layer_pattern="*-|*-/*-", num_layers=4), model, fmt)
     assert block.to_json() == {
         "prefix": "decoder",
         "kind": "hybrid_stack",
@@ -296,6 +300,150 @@ def test_the_layers_of_a_hybrid_decoder_without_shortcut_are_checked_too():
     assert "module 0 (torch_dist index 0, '*'): its tensors are those of '-'" in (
         excinfo.value.refusal.message
     )
+
+
+def _mtp_args(pattern: str, **fields) -> ArgsView:
+    return _args(
+        **{
+            "hybrid_layer_pattern": pattern,
+            "num_layers": len(pattern.split("/")[0]),
+            "mtp_num_layers": pattern.count("/"),
+            **fields,
+        }
+    )
+
+
+def _by_prefix(blocks) -> dict[str, dict]:
+    return {block.prefix: block.to_json() for block in blocks}
+
+
+@pytest.mark.parametrize("fmt", [TORCH_DIST, FSDP_DTENSOR])
+def test_each_hybrid_mtp_depth_holds_a_hybrid_layer_list(fmt):
+    model = {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*"}), **_mtp_keys(1, {0: "*"})}
+    blocks = _by_prefix(classify_blocks_of(_mtp_args("*-/*/*"), model, fmt))
+    assert list(blocks) == [
+        "decoder",
+        "mtp",
+        "mtp.layers.0.mtp_model_layer",
+        "mtp.layers.1.mtp_model_layer",
+    ]
+    assert blocks["mtp"] == {
+        "prefix": "mtp",
+        "kind": "mtp_block",
+        "num_modules": 2,
+        "td_layout": "per_layer",
+        "dense_to_td": [0, 1],
+        "symbols": None,
+        "evidence": "hybrid layer pattern '*-/*/*' (2 MTP depths)",
+    }
+    assert blocks["mtp.layers.1.mtp_model_layer"] == {
+        "prefix": "mtp.layers.1.mtp_model_layer",
+        "kind": "hybrid_mtp_inner",
+        "num_modules": 1,
+        "td_layout": "per_layer",
+        "dense_to_td": [0],
+        "symbols": ["*"],
+        "evidence": "MTP depth pattern '*' (1 layer)",
+    }
+
+
+def test_a_repeated_shortcut_mtp_layer_is_one_layer_numbered_like_the_decoder():
+    """``/*EE`` twice with ``--mtp-use-repeated-layer``: one MTP layer, whose inner modules are
+    ``*E`` and ``E`` (torch_dist indices 0 and 2)."""
+    args = _mtp_args("*E/*EE/*EE", moe_shortcut_connection=True, mtp_use_repeated_layer=True)
+    td = {**_module_keys({0: "*E"}), **_mtp_keys(0, {0: "*E", 2: "E"})}
+    fsdp = {**_module_keys({0: "*E"}), **_mtp_keys(0, {0: "*E", 1: "E"})}
+    blocks = _by_prefix(classify_blocks_of(args, td, TORCH_DIST))
+    assert _by_prefix(classify_blocks_of(args, fsdp, FSDP_DTENSOR)) == blocks
+    assert blocks["mtp"]["num_modules"] == 1
+    assert blocks["mtp"]["evidence"] == (
+        "hybrid layer pattern '*E/*EE/*EE' (2 MTP depths) with "
+        "args.mtp_use_repeated_layer=True (one layer serves every depth)"
+    )
+    inner = blocks["mtp.layers.0.mtp_model_layer"]
+    assert (inner["dense_to_td"], inner["symbols"]) == ([0, 2], ["*E", "E"])
+    assert inner["evidence"] == (
+        "MTP depth pattern '*EE' (3 layers) grouped into 2 modules by "
+        "args.moe_shortcut_connection=True (each E joins the layer before it unless that layer "
+        "is paired)"
+    )
+
+
+def test_a_vision_language_models_mtp_is_under_the_language_model():
+    model = {
+        **_module_keys({0: "*", 1: "-"}, "language_model.decoder"),
+        **_mtp_keys(0, {0: "-"}, "language_model.mtp"),
+    }
+    blocks = _by_prefix(classify_blocks_of(_mtp_args("*-/-"), model, TORCH_DIST))
+    assert blocks["language_model.mtp"]["kind"] == "mtp_block"
+    assert blocks["language_model.mtp.layers.0.mtp_model_layer"]["kind"] == "hybrid_mtp_inner"
+
+
+def test_gpt_mtp_depths_are_one_layer_each():
+    model = {
+        key: _entry(key)
+        for key in (
+            "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight",
+            "mtp.layers.1.eh_proj.weight",
+        )
+    }
+    (block,) = classify_blocks_of(
+        _args(hybrid_layer_pattern=None, mtp_num_layers=2), model, TORCH_DIST
+    )
+    assert (block.prefix, block.kind, block.dense_to_td) == ("mtp", "mtp_block", (0, 1))
+    assert block.evidence == "args.mtp_num_layers=2"
+
+
+@pytest.mark.parametrize(
+    ("args", "model", "code", "message"),
+    [
+        (
+            _mtp_args("*-/*", mtp_num_layers=2),
+            {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*"})},
+            errors.FC_R11,
+            "args.mtp_num_layers=2 but hybrid layer pattern '*-/*' (1 MTP depth)",
+        ),
+        (
+            _args(hybrid_layer_pattern="*-", num_layers=2),
+            {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*"})},
+            errors.FC_R11,
+            "the store holds multi-token prediction layers (mtp.layers.*), but hybrid layer "
+            "pattern '*-' (0 MTP depths)",
+        ),
+        (
+            _mtp_args("*-/*"),
+            {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*"}), **_mtp_keys(1, {0: "*"})},
+            errors.FC_R11,
+            "mtp: hybrid layer pattern '*-/*' (1 MTP depth) means torch_dist layer indices 0, "
+            "but the store has 0-1",
+        ),
+        (
+            _mtp_args("*-/*-"),
+            {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*", 2: "-"})},
+            errors.FC_R11,
+            "mtp.layers.0.mtp_model_layer: MTP depth pattern '*-' (2 layers) means torch_dist "
+            "layer indices 0-1, but the store has 0, 2 (missing [1], unexpected [2]); its modules "
+            "(dense: torch_dist index, symbols) are 0: 0 *, 1: 1 -",
+        ),
+        (
+            _mtp_args("*-/*"),
+            {
+                **_module_keys({0: "*", 1: "-"}),
+                "mtp.layers.0.mtp_model_layer.layers.self_attention.linear_qkv.weight": _entry(
+                    "mtp.layers.0.mtp_model_layer.layers.self_attention.linear_qkv.weight", (1, 4)
+                ),
+            },
+            errors.FC_R12,
+            "mtp.layers.0.mtp_model_layer is the hybrid layer list of MTP depth 0 ('*'), whose "
+            "layers are stored one per key",
+        ),
+    ],
+)
+def test_mtp_layers_that_contradict_the_arguments_are_refused(args, model, code, message):
+    with pytest.raises(RefusedError) as excinfo:
+        classify_blocks_of(args, model, TORCH_DIST)
+    assert excinfo.value.refusal.code == code
+    assert message in excinfo.value.refusal.message
 
 
 def test_a_layout_needs_one_distinct_stored_index_per_module():

@@ -65,6 +65,10 @@ LAYERS = "layers"
 LAYER_SEGMENT = f".{LAYERS}."
 """The segment that separates a block prefix from what its layer list holds."""
 
+MTP_INNER_LAYER = "mtp_model_layer"
+"""The inner model of a multi-token prediction layer; a hybrid one's is stored under this name in
+both formats (``MTP_INNER_LAYER`` of ``fsdp_dtensor_checkpoint.py``, pinned by a test)."""
+
 _INDEX_AND_INNER = re.compile(r"(?P<index>0|[1-9][0-9]*)\.(?P<inner>.+)")
 _NAME_START = re.compile(r"[A-Za-z_]")
 

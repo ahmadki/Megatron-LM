@@ -35,7 +35,7 @@ def entries(shapes: dict[str, tuple[int, ...]], prefix: str = "") -> dict[str, T
     }
 
 
-def derive(shapes, blocks, *, source=TORCH_DIST, lm="decoder", prefix="", **args):
+def derive(shapes, blocks, *, source=TORCH_DIST, lm=("decoder",), prefix="", **args):
     return glu_layout(
         ArgsView(argparse.Namespace(**args)), entries(shapes, prefix), blocks, source, lm
     )
@@ -119,7 +119,7 @@ def test_a_vision_encoder_and_projection_have_configurations_of_their_own():
         "vision_projection.encoder.linear_fc1.weight": (2 * H, S),
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
-    layout, _ = derive(shapes, [LANGUAGE, VISION], lm="language_model.decoder", swiglu=False)
+    layout, _ = derive(shapes, [LANGUAGE, VISION], lm=("language_model.decoder",), swiglu=False)
     assert layout.gated_json() == {
         "language_model.decoder": {"plain": 1},
         "vision_model.decoder": {"gated": 1},
@@ -149,6 +149,28 @@ def test_the_language_model_must_be_gated_as_its_arguments_say(rows, args, obser
         f"the language model's linear_fc1 weights (in decoder) are {observed}, but "
     )
     assert refusal.keys == ("decoder.layers.mlp.linear_fc1.weight",)
+
+
+def test_the_multi_token_prediction_layers_are_gated_as_the_language_model():
+    """They are built with the language model's configuration."""
+    inner = BlockLayout(
+        "mtp.layers.0.mtp_model_layer", "hybrid_mtp_inner", 1, "per_layer", (0,), ("-",), ""
+    )
+    shapes = {
+        "decoder.layers.mlp.linear_fc1.weight": (2, F, H),
+        "decoder.layers.mlp.linear_fc2.weight": (2, H, F),
+        "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight": (2 * F, H),
+        "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc2.weight": (H, F),
+    }
+    with pytest.raises(RefusedError) as caught:
+        derive(shapes, [STACKED, inner], lm=("decoder", inner.prefix), swiglu=False)
+    refusal = caught.value.refusal
+    assert refusal.code == errors.FC_R12
+    assert refusal.message.startswith(
+        "the language model's linear_fc1 weights (in decoder, mtp.layers.0.mtp_model_layer) are "
+        "gated (twice the rows linear_fc2 has inputs), but "
+    )
+    assert refusal.keys == ("mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight",)
 
 
 def test_the_mlps_of_a_layer_are_all_gated_or_all_plain():
@@ -183,7 +205,7 @@ def test_a_linear_fc1_outside_every_layer_without_a_linear_fc2_is_a_plain_linear
         "language_model.decoder.layers.0.mlp.linear_fc2.weight": (H, F),
         "vision_model.merger.linear_fc1.weight": (S, 4 * S),
     }
-    layout, evidence = derive(shapes, [LANGUAGE], lm="language_model.decoder")
+    layout, evidence = derive(shapes, [LANGUAGE], lm=("language_model.decoder",))
     assert list(layout.fc1s) == [fc1("language_model.decoder", 0, "mlp.linear_fc1")]
     assert layout.of(LogicalId(None, None, "vision_model.merger.linear_fc1", "weight")) is None
     assert evidence.endswith(
@@ -226,7 +248,7 @@ MOE_TD = {
 """The same model as torch_dist stores it (every expert in one tensor)."""
 
 
-def split(shapes, blocks, *, fsdp_swiglu, source=TORCH_DIST, lm="decoder", experts=None, **args):
+def split(shapes, blocks, *, fsdp_swiglu, source=TORCH_DIST, lm=("decoder",), experts=None, **args):
     layout, _ = derive(shapes, blocks, source=source, lm=lm, **args)
     return swiglu_split(layout, fsdp_swiglu, blocks, source, experts)
 
@@ -258,7 +280,7 @@ def test_only_the_swiglu_names_of_gated_layers_are_split():
         "vision_projection.head.mlp.linear_fc2.weight": (H, S),
     }
     layout, _ = split(
-        shapes, [LANGUAGE, VISION], fsdp_swiglu=True, lm="language_model.decoder", swiglu=True
+        shapes, [LANGUAGE, VISION], fsdp_swiglu=True, lm=("language_model.decoder",), swiglu=True
     )
     assert {str(lid): (fc1.gated, fc1.split) for lid, fc1 in layout.fc1s.items()} == {
         "language_model.decoder[0].mlp.linear_fc1.weight": (True, True),

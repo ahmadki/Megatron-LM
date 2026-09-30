@@ -756,3 +756,41 @@ def renumber_layers(
             key = f"{head}{stored[int(index)]}.{name}"
         renamed[key] = tensor
     return renamed
+
+
+def hybrid_mtp_tensors(
+    modules: Sequence[str],
+    *,
+    layers: int,
+    prefix: str = "mtp",
+    children: tuple[str, str] = PAIR_CHILDREN,
+    experts: int = 4,
+    hidden: int = 8,
+) -> dict[str, torch.Tensor]:
+    """The ``layers`` multi-token prediction layers of a hybrid model under ``prefix``: each with
+    its norms and projection, and its inner model's layer list of ``modules`` (symbols of each,
+    in layer-list order) under ``mtp_model_layer.layers.<j>``, as fsdp_dtensor stores them."""
+    tensors = {}
+    for layer in range(layers):
+        head = f"{prefix}.layers.{layer}"
+        generator = torch.Generator().manual_seed(1000 + layer)
+        for name, shape in {
+            "enorm.weight": (hidden,),
+            "hnorm.weight": (hidden,),
+            "eh_proj.weight": (hidden, 2 * hidden),
+            "final_layernorm.weight": (hidden,),
+        }.items():
+            value = torch.randn(shape, generator=generator)
+            tensors[f"{head}.{name}"] = value if name.endswith("norm.weight") else value.bfloat16()
+        for dense, symbols in enumerate(modules):
+            tensors.update(
+                hybrid_module_tensors(
+                    f"{head}.mtp_model_layer.layers.{dense}",
+                    symbols,
+                    seed=1000 + 100 * layer + 10 * dense,
+                    children=children,
+                    experts=experts,
+                    hidden=hidden,
+                )
+            )
+    return tensors

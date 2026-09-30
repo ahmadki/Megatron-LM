@@ -530,7 +530,6 @@ arguments and the model keys before any tensor is read.
 | `FC-R18` | a ModelOpt state (`modelopt_state` in the common state or next to the store) |
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones; or an `fsdp_dtensor` SwiGLU half (`linear_fc1.weight_w`) without its pair, of another shape than its pair, or stored beside the whole tensor |
-| `FC-P04` | pending: hybrid multi-token prediction (`/` in the pattern) |
 | `FC-P05` | pending: Gated DeltaProduct mixers (its spec or its `in_proj`/`conv1d` parts) |
 | `FC-P08` | pending: Mamba-2 mixers (symbol `M` without the Gated DeltaProduct spec) |
 | `FC-P09` | pending: Gated DeltaNet and linear attention (symbol `G`, a Gated DeltaNet `experimental_attention_variant`) |

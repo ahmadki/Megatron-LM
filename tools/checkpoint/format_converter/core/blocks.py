@@ -31,6 +31,14 @@ Kinds of blocks:
 * ``transformer_block``: a ``TransformerBlock`` (a GPT decoder, a vision
   encoder), numbered identically in both formats and stored stacked or per
   layer in torch_dist (``core/stacking.py``).
+* ``mtp_block``: the multi-token prediction block (``mtp``), one layer per
+  depth (a single layer that serves every depth with
+  ``--mtp-use-repeated-layer``), numbered identically in both formats and
+  never stacked.
+* ``hybrid_mtp_inner``: the inner model of a hybrid multi-token prediction
+  layer, ``mtp.layers.<d>.mtp_model_layer`` (the same name in both formats), a
+  ``HybridStack`` of the pattern's MTP part numbered like the decoder from
+  position 0 (with shortcut-MoE grouping too).
 
 A model has a single root (``embedding``, ``decoder``, ``output_layer``,
 ``mtp``), or is a vision-language model in the LLaVA layout: its language
@@ -51,19 +59,32 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
-from .hybrid_pattern import family_mismatch, group_modules, hybrid_pattern_of
-from .keys import KeyGrammarError, innermost_layer_key, join_layer_key, root_of, split_layer_key
+from .hybrid_pattern import HybridPattern, family_mismatch, group_modules, hybrid_pattern_of
+from .keys import (
+    LAYER_SEGMENT,
+    MTP_INNER_LAYER,
+    KeyGrammarError,
+    innermost_layer_key,
+    join_layer_key,
+    root_of,
+    split_layer_key,
+)
 from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
 from .registry import REGISTRY
 
 HYBRID_STACK = "hybrid_stack"
 TRANSFORMER_BLOCK = "transformer_block"
+MTP_BLOCK = "mtp_block"
+HYBRID_MTP_INNER = "hybrid_mtp_inner"
+
+MTP = "mtp"
+"""The language model's multi-token prediction block, under the language model's prefix."""
 
 DECODER = "decoder"
 """The language model's decoder, under the language model's prefix."""
 
 LANGUAGE_MODEL = "language_model"
-SINGLE_ROOTS = frozenset({"embedding", DECODER, "output_layer", "mtp"})
+SINGLE_ROOTS = frozenset({"embedding", DECODER, "output_layer", MTP})
 """Top-level modules of a single-root (GPT or hybrid) model."""
 
 VLM_ROOTS = frozenset({LANGUAGE_MODEL, "vision_model", "vision_projection"})
@@ -247,6 +268,11 @@ class BlockFacts:
         """The language model's decoder: ``decoder``, or ``language_model.decoder`` in a VLM."""
         return language_model_prefix(self.model) + DECODER
 
+    @functools.cached_property
+    def lm_mtp(self) -> str:
+        """The language model's multi-token prediction block: ``mtp`` (``language_model.mtp``)."""
+        return language_model_prefix(self.model) + MTP
+
 
 def language_model_prefix(model: Iterable[str]) -> str:
     """The prefix of the language model's modules: ``language_model.`` in a vision-language model.
@@ -287,46 +313,146 @@ def hybrid_stack(facts: BlockFacts) -> Iterator[BlockLayout]:
     pattern = hybrid_pattern_of(facts.args)
     if pattern is None:
         return
-    prefix = facts.lm_decoder
+    evidence = f"hybrid layer pattern {pattern.text!r} ({_count(len(pattern.main), 'layer')})"
+    num_layers = facts.args.get("num_layers", None)
+    if num_layers is not None and num_layers != len(pattern.main):
+        raise Refusal(
+            errors.FC_R11,
+            f"args.num_layers={num_layers} but {evidence}",
+            hint="check that the source checkpoint's arguments are intact",
+        ).to_error()
+    yield _hybrid_layer_list(
+        facts,
+        facts.lm_decoder,
+        HYBRID_STACK,
+        pattern.main,
+        evidence,
+        what=f"a hybrid decoder ({pattern.text!r})",
+        stage_starts=pattern.stage_starts,
+    )
+
+
+@REGISTRY.classifier
+def multi_token_prediction(facts: BlockFacts) -> Iterator[BlockLayout]:
+    """The multi-token prediction block, and the inner layer list of each hybrid MTP layer.
+
+    The block has one layer per depth: the hybrid layer pattern's MTP parts
+    (``/``), or ``args.mtp_num_layers`` without a pattern, and a single layer
+    with ``args.mtp_use_repeated_layer`` (``MultiTokenPredictionBlock``). A
+    hybrid MTP layer's inner model is a ``HybridStack`` of its part of the
+    pattern, stored per layer under ``mtp_model_layer.layers.<j>`` in both
+    formats (``MultiTokenPredictionLayer.sharded_state_dict`` renames the
+    inner model of GPT MTP layers only).
+
+    Raises:
+        RefusedError: ``args.mtp_num_layers`` disagrees with the pattern's MTP
+            parts, or the store holds MTP layers the arguments do not have
+            (FC-R11); an inner layer list is stored stacked (FC-R12) or cannot
+            be grouped (FC-R11).
+    """
+    pattern = hybrid_pattern_of(facts.args)
+    depths, evidence = _mtp_depths(facts.args, pattern)
+    prefix = facts.lm_mtp
+    if not depths:
+        if prefix in facts.census:
+            raise Refusal(
+                errors.FC_R11,
+                f"the store holds multi-token prediction layers ({prefix}{LAYER_SEGMENT}*), but "
+                f"{evidence}",
+                hint="check that the arguments belong to this checkpoint",
+            ).to_error()
+        return
+    count = depths
+    if facts.args.get("mtp_use_repeated_layer", False):
+        count = 1
+        evidence += " with args.mtp_use_repeated_layer=True (one layer serves every depth)"
+    yield BlockLayout(prefix, MTP_BLOCK, count, PER_LAYER, tuple(range(count)), None, evidence)
+    if pattern is None:
+        return  # a GPT MTP layer's inner model is a single layer
+    for depth in range(count):
+        symbols = pattern.mtp[depth]
+        yield _hybrid_layer_list(
+            facts,
+            join_layer_key(prefix, depth, MTP_INNER_LAYER),
+            HYBRID_MTP_INNER,
+            symbols,
+            f"MTP depth pattern {symbols!r} ({_count(len(symbols), 'layer')})",
+            what=f"the hybrid layer list of MTP depth {depth} ({symbols!r})",
+        )
+
+
+def _mtp_depths(args: ArgsView, pattern: HybridPattern | None) -> tuple[int, str]:
+    """The number of multi-token prediction depths, and the evidence (a noun phrase).
+
+    Raises:
+        RefusedError: ``args.mtp_num_layers`` disagrees with the hybrid layer
+            pattern's MTP parts (FC-R11): Megatron's ``HybridModel`` builds no
+            model from such arguments.
+    """
+    mtp_num_layers = args.get("mtp_num_layers", None) or 0
+    if pattern is None:
+        return mtp_num_layers, f"args.mtp_num_layers={mtp_num_layers or None}"
+    evidence = f"hybrid layer pattern {pattern.text!r} ({_count(len(pattern.mtp), 'MTP depth')})"
+    if mtp_num_layers and mtp_num_layers != len(pattern.mtp):
+        raise Refusal(
+            errors.FC_R11,
+            f"args.mtp_num_layers={mtp_num_layers} but {evidence}",
+            hint="check that the source checkpoint's arguments are intact",
+        ).to_error()
+    return len(pattern.mtp), evidence
+
+
+def _hybrid_layer_list(
+    facts: BlockFacts,
+    prefix: str,
+    kind: str,
+    symbols: str,
+    evidence: str,
+    *,
+    what: str,
+    stage_starts: frozenset[int] = frozenset(),
+) -> BlockLayout:
+    """The layout of a ``HybridStack`` layer list of layers ``symbols`` under ``prefix``: its
+    modules (grouped with ``args.moe_shortcut_connection``) stored per layer, torch_dist under
+    their first layer's position.
+
+    Raises:
+        RefusedError: The source stores tensors stacked over its layers
+            (FC-R12), or the layers cannot be grouped (FC-R11).
+    """
     census = facts.census.get(prefix)
     if census is not None and census.stacked:
         raise Refusal(
             errors.FC_R12,
-            f"{prefix} is a hybrid decoder ({pattern.text!r}), whose layers are stored one "
-            "per key, but the store holds tensors stacked over its layers",
+            f"{prefix} is {what}, whose layers are stored one per key, but the store holds "
+            "tensors stacked over its layers",
             keys=census.stacked_keys(),
             hint="check that the arguments belong to this checkpoint",
         ).to_error()
-    evidence = f"hybrid layer pattern {pattern.text!r} ({_count(len(pattern.main), 'layer')})"
-    _check_num_layers(facts.args, len(pattern.main), evidence)
     shortcut = bool(facts.args.get("moe_shortcut_connection", False))
-    modules = group_modules(pattern.main, shortcut=shortcut, stage_starts=pattern.stage_starts)
+    modules = group_modules(symbols, shortcut=shortcut, stage_starts=stage_starts)
     if shortcut:
         evidence += (
             f" grouped into {_count(len(modules), 'module')} by "
             "args.moe_shortcut_connection=True (each E joins the layer before it unless that "
             "layer is paired)"
         )
-    yield BlockLayout(
+    return BlockLayout(
         prefix=prefix,
-        kind=HYBRID_STACK,
+        kind=kind,
         num_modules=len(modules),
         td_layout=PER_LAYER,
         dense_to_td=tuple(position for position, _ in modules),
-        symbols=tuple(symbols for _, symbols in modules),
+        symbols=tuple(module for _, module in modules),
         evidence=evidence,
     )
 
 
-def _check_num_layers(args: ArgsView, count: int, evidence: str) -> None:
-    """``args.num_layers`` is the hybrid decoder's number of layers (FC-R11)."""
-    num_layers = args.get("num_layers", None)
-    if num_layers is not None and num_layers != count:
-        raise Refusal(
-            errors.FC_R11,
-            f"args.num_layers={num_layers} but {evidence}",
-            hint="check that the source checkpoint's arguments are intact",
-        ).to_error()
+def language_model_blocks(blocks: Iterable[BlockLayout], lm_decoder: str) -> tuple[str, ...]:
+    """The blocks built with the language model's configuration: its decoder ``lm_decoder`` and
+    its multi-token prediction blocks (sorted)."""
+    mtp = {block.prefix for block in blocks if block.kind in (MTP_BLOCK, HYBRID_MTP_INNER)}
+    return tuple(sorted(mtp | {lm_decoder}))
 
 
 def classify_blocks(facts: BlockFacts, *, default: DefaultClassifier) -> tuple[BlockLayout, ...]:

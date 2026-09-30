@@ -29,7 +29,13 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
-from .blocks import TRANSFORMER_BLOCK, BlockFacts, BlockLayout, classify_blocks
+from .blocks import (
+    TRANSFORMER_BLOCK,
+    BlockFacts,
+    BlockLayout,
+    classify_blocks,
+    language_model_blocks,
+)
 from .dtype_policy import DtypePolicy
 from .experts import ExpertLayout, expert_layout, grouped_bias_warnings
 from .format_args import GLU_ARGS
@@ -296,10 +302,11 @@ def build_arch_context(
         _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
     experts, evidence = expert_layout(args, model, source, expert_naming)
     log.append(Derivation("experts", None if experts is None else experts.to_json(), evidence))
-    glu, evidence = glu_layout(args, model, blocks, source, facts.lm_decoder)
+    language_model = language_model_blocks(blocks, facts.lm_decoder)
+    glu, evidence = glu_layout(args, model, blocks, source, language_model)
     log.append(Derivation("gated_fc1", glu.gated_json(), evidence))
     fsdp_swiglu, fsdp_glu_args = _fsdp_swiglu(
-        args, direction, target_swiglu, glu.language_model(facts.lm_decoder), log
+        args, direction, target_swiglu, glu.language_model(language_model), log
     )
     glu, evidence = swiglu_split(glu, fsdp_swiglu, blocks, source, experts)
     log.append(Derivation("swiglu_split", glu.split_json(), evidence))
