@@ -21,10 +21,23 @@ from tools.checkpoint.format_converter.options import PlanOptions, VerifyOptions
 
 from ._synthetic import (
     dim0_grid,
+    expert_grids,
+    gated_units,
     gdp_hybrid_tensors,
+    gdp_mixer_tensors,
     hybrid_args,
+    hybrid_module_tensors,
+    hybrid_mtp_tensors,
+    layer_grids,
+    moe_layer_tensors,
     packed_projections,
+    packed_units,
+    renumber_layers,
+    stack_experts,
+    stack_layers,
+    swiglu_grids,
     torch_dist_parts,
+    vision_language_tensors,
     write_fsdp_store,
 )
 from .test_convert_blocks import (
@@ -238,3 +251,97 @@ def test_a_store_of_other_dimensions_is_refused_before_reading(tmp_path, capsys)
         "error: FC-R10: decoder[0].mixer: its widths (conv1d.weight 52 rows, in_proj.weight 72 "
         "rows) are not what the arguments give Gated DeltaProduct mixers"
     ) in err
+
+
+ARCHETYPE = "M-*EME-M/*E"
+"""The language model of the vision-language archetype: Gated DeltaProduct mixers, dense MLPs,
+shortcut-connected mixture-of-experts pairs after an attention layer and after a mixer, and a
+multi-token prediction layer holding a pair."""
+MODULES = ("M", "-", "*E", "ME", "-", "M")
+DENSE_TO_TD = (0, 1, 2, 4, 6, 7)
+"""The torch_dist index (pattern position) of each module of its decoder, written out by hand."""
+EXPERTS = 4
+LANGUAGE_MODEL = "language_model."
+
+
+def archetype_language_model() -> tuple[dict, dict]:
+    """The archetype's language model as fsdp_dtensor stores it (dense module indices, grouped
+    experts): its mixers' fused projections by part, and every other tensor."""
+    generator = torch.Generator().manual_seed(41)
+    fused: dict = {}
+    tensors = {
+        "embedding.word_embeddings.weight": torch.randn(32, 8, generator=generator).bfloat16(),
+        "decoder.final_norm.weight": torch.randn(8, generator=generator),
+        "output_layer.weight": torch.randn(32, 8, generator=generator).bfloat16(),
+    }
+    for dense, symbols in enumerate(MODULES):
+        module = f"decoder.layers.{dense}"
+        if "M" in symbols:
+            mixer = f"{module}.attn_layer.mixer" if len(symbols) == 2 else f"{module}.mixer"
+            projections, rest = gdp_mixer_tensors(mixer, seed=10 + dense, **MIXER)
+            fused.update(projections)
+            tensors.update(rest)
+            if len(symbols) == 2:
+                tensors.update(
+                    moe_layer_tensors(f"{module}.moe_layer", EXPERTS, bias=False, seed=dense)
+                )
+                norm = torch.randn(8, generator=generator)
+                tensors[f"{module}.shortcut_pre_mlp_layernorm.weight"] = norm
+        else:
+            tensors.update(hybrid_module_tensors(module, symbols, seed=100 * dense))
+    tensors.update(hybrid_mtp_tensors(("*E",), layers=1, experts=EXPERTS))
+    return fused, tensors
+
+
+def archetype(tp: int) -> tuple[dict, dict, dict]:
+    """The vision-language archetype: its fsdp_dtensor store packed at ``tp`` (fused mixer
+    projections and the gated vision encoder's linear_fc1 packed rank after rank), its torch_dist
+    store (sparse decoder indices, stacked experts and vision layers, mixer parts) and that
+    store's grid (one chunk per layer, expert and SwiGLU half)."""
+    fused, language_model = archetype_language_model()
+    fused = {LANGUAGE_MODEL + key: parts for key, parts in fused.items()}
+    halves, glu = gated_units(vision_language_tensors(language_model), prefix="vision_model.")
+    fsdp = {**packed_units(halves, lambda key: tp), **packed_projections(fused, tp)}
+    source = {**glu, **torch_dist_parts(fused)}
+    source = renumber_layers(source, f"{LANGUAGE_MODEL}decoder", DENSE_TO_TD)
+    source = stack_layers(stack_experts(source), "vision_model.decoder")
+    vision = {key: tensor for key, tensor in source.items() if key.startswith("vision_model.")}
+    grids = {
+        **layer_grids(source, "vision_model.decoder"),
+        **expert_grids(source),
+        **swiglu_grids(vision),
+    }
+    return fsdp, source, grids
+
+
+def archetype_args(tp: int, **overrides):
+    return gdp_args(
+        hybrid_layer_pattern=ARCHETYPE,
+        num_layers=8,
+        mtp_num_layers=1,
+        moe_shortcut_connection=True,
+        num_experts=EXPERTS,
+        tensor_model_parallel_size=tp,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_vision_language_archetype_round_trips(tmp_path, tp):
+    """Every family at once: the pair's mixer is found under its opaque child, the sparse indices
+    map to dense ones, experts split, the vision layers unstack, and both the gated vision
+    linear_fc1 and the mixers' projections are packed at the loading job's size."""
+    fsdp_expected, source, grids = archetype(tp)
+    src = write_gpt_source(tmp_path / "src", source, grids=grids, args=archetype_args(tp))
+    fsdp, report = to_fsdp(tmp_path, src, fsdp_tp=tp)
+    expect_fsdp_store(fsdp, fsdp_expected)
+    assert "language_model.decoder.layers.3.attn_layer.mixer.in_proj.weight" in fsdp_expected
+    assert "language_model.decoder.layers.4.attn_layer.mixer.conv1d.weight.K1" in source
+    values = derived(report)
+    assert values["mixers"] == {"language_model.decoder": {"gdp": 3}}
+    assert values["swiglu_split"] == {"vision_model.decoder": {"fused": 2}}
+    assert values["pack_tp"] == tp
+    assert report["claims"]["gdp"] == 3 * 14  # 9 in_proj and 5 conv1d parts per mixer
+    out, _ = to_torch_dist(tmp_path, fsdp)
+    assert_store(out, source)
+    assert verify_checkpoint(out, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok

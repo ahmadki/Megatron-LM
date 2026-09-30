@@ -1,7 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Gated DeltaProduct mixers against Megatron's own modules.
+"""Gated DeltaProduct mixers against Megatron's own modules, saves and loads.
 
+* T3 real-save chain (``run_chain`` in ``_real_harness.py``) of a Gated
+  DeltaProduct hybrid model at TP 1: Megatron saves and strictly loads every
+  store in both formats, every parameter must equal model A's after each
+  load, and every store is checked against a real save under its contract.
+  At TP 2 current Megatron-FSDP cannot hold the mixer's ``A_log``,
+  ``dt_bias`` and ``norm.weight`` (tensor-parallel without a
+  ``partition_dim``, so it builds them as replicated tensors of one rank's
+  shard): the chain is pinned as a strict expected failure (extended matrix),
+  and a real TP 2 torch_dist save converted with ``--fsdp-tp 2`` must hold
+  the model's rank-major fused tensors, convert back, load strictly into a
+  classic TP 2 model with every parameter equal, and match the source under
+  contract D.
 * The torch_dist keys and shapes of a tiny Gated DeltaProduct hybrid model
   (its sharded state dict, split factories applied) at tensor-parallel sizes 1
   and 2: the converter's context tells both mixers apart from the real keys
@@ -21,6 +33,8 @@ the world has are skipped.
 from __future__ import annotations
 
 import argparse
+import os
+from functools import partial
 
 import pytest
 import torch
@@ -33,12 +47,15 @@ if not (megatron_available() and torch.cuda.is_available()):
 gated_delta_product = pytest.importorskip("megatron.core.ssm.gated_delta_product")
 
 # pylint: disable=wrong-import-position
+from torch.distributed.checkpoint.api import CheckpointException
+
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, apply_factories
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.context import build_arch_context
 from tools.checkpoint.format_converter.core.keys import EXTRA_STATE
@@ -49,15 +66,31 @@ from tools.checkpoint.format_converter.core.structure import compose, decompose
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 
 from .._real_harness import (
+    CHAIN_CHECKS,
     HYBRID_HIDDEN,
+    ITER,
+    ITERATION,
     Utils,
+    assert_params,
+    build_hybrid,
+    convert_store,
+    full_params,
     hybrid_provider,
+    load_weights_only,
     main_layers,
     nccl_skip_reason,
+    on_rank_zero,
     randomize_parameters,
+    run_chain,
+    save_weights_only,
+    set_format,
+    training_args,
+    verify_store,
 )
+from ..test_convert_cross import read_tensors
 
-pytestmark = pytest.mark.covers("gdp", "parity")
+pytestmark = [pytest.mark.covers("gdp", "parity"), pytest.mark.covers("gdp", "real_save")]
+EXTENDED = os.environ.get("MCORE_FORMAT_CONVERTER_EXTENDED") == "1"
 PATTERN = "M*M-"
 GDP = {
     "mamba_num_heads": 4,
@@ -106,6 +139,90 @@ def _args(tp: int) -> ArgsView:
             **GDP,
         )
     )
+
+
+@pytest.fixture(name="shared_dir")
+def fixture_shared_dir(request):
+    """The root conftest's directory shared by all ranks (absent under ``--confcutdir``)."""
+    try:
+        return request.getfixturevalue("tmp_path_dist_ckpt")
+    except pytest.FixtureLookupError:
+        pytest.skip("needs the root tests/unit_tests/conftest.py (run without --confcutdir)")
+
+
+def _configure(args, *, fsdp: bool, bf16: bool = True) -> None:
+    """A job of the tiny Gated DeltaProduct hybrid model (its spec and mixer dimensions)."""
+    set_format(args, fsdp=fsdp, pattern=PATTERN, bf16=bf16)
+    args.spec = GDP_SPEC
+    for name, value in GDP.items():
+        setattr(args, name, value)
+
+
+def _build(tp: int):
+    """``build(seed, ...)`` of the tiny Gated DeltaProduct hybrid model at ``tp``."""
+    return partial(
+        build_hybrid, tp=tp, pattern=PATTERN, stack_spec=gated_delta_product_stack_spec, **GDP
+    )
+
+
+class TestGdpChains:
+    """A Gated DeltaProduct hybrid model through Megatron's saves and strict loads."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_gdp_hybrid(self, shared_dir):
+        _initialize(1)
+        with TempNamedDir(shared_dir / "fc_gdp_tp1") as root:
+            findings = run_chain(root, tp=1, build=_build(1), configure=_configure)
+        assert findings == {check: [] for check in CHAIN_CHECKS}
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    @pytest.mark.xfail(
+        strict=True,
+        raises=CheckpointException,
+        reason="Megatron-FSDP builds a Gated DeltaProduct mixer's A_log, dt_bias and norm.weight "
+        "(tensor_model_parallel without partition_dim) as tensor-parallel replicated DTensors of "
+        "one rank's shard, so a TP 2 job cannot load their full tensors (and saves one rank's "
+        "shard); when this passes, run the TP 2 chain",
+    )
+    def test_gdp_hybrid_through_megatron_fsdp_at_two_ranks(self, shared_dir):
+        _initialize(2)
+        with TempNamedDir(shared_dir / "fc_gdp_tp2") as root:
+            run_chain(root, tp=2, build=_build(2), configure=_configure, options={"fsdp_tp": 2})
+
+    def test_a_store_packed_at_two_ranks_holds_the_models_rank_major_tensors(self, shared_dir):
+        """The live TP 2 model's fused tensors, its ranks' shards one after the other, are what
+        Megatron-FSDP stores; converted back, the store loads strictly into a classic model."""
+        _initialize(2)
+        with TempNamedDir(shared_dir / "fc_gdp_pack_tp2") as root:
+            s1, c1, back = (root / name for name in ("s1", "c1", "back"))
+            with training_args(s1, tp=2) as args:
+                _configure(args, fsdp=False)
+                model_a, optimizer_a = _build(2)(2)
+                expected = full_params(model_a)
+                fused = {n for n in expected if n.endswith(("in_proj.weight", "conv1d.weight"))}
+                assert len(fused) == 4  # of the two mixers
+                save_weights_only(model_a, optimizer_a, args, s1, iteration=ITERATION)
+                torch.distributed.barrier()
+                on_rank_zero(convert_store, s1, c1, "fsdp_dtensor", fsdp_tp=2)
+                on_rank_zero(convert_store, c1, back, "torch_dist")
+                stored = on_rank_zero(
+                    lambda: {
+                        name: tensor
+                        for name, tensor in read_tensors(c1 / ITER).items()
+                        if name.removeprefix("model.module.") in fused
+                    }
+                )
+                assert {name.removeprefix("model.module.") for name in stored} == fused
+                for name, tensor in stored.items():
+                    live = expected[name.removeprefix("model.module.")]
+                    assert tensor.dtype == live.dtype and torch.equal(tensor, live), name
+                model_c, optimizer_c = _build(2)(4)
+                assert load_weights_only(model_c, optimizer_c, args, back) == ITERATION
+                assert_params(full_params(model_c), expected, dtype=torch.bfloat16)
+                findings = on_rank_zero(lambda: verify_store(back, s1, "D"))
+        assert findings == []
 
 
 def _sharded_tensors(sharded_state_dict) -> list[ShardedTensor]:
