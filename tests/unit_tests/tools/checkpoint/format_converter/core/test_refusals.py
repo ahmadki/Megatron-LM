@@ -276,20 +276,6 @@ CASES = {
         errors.FC_R03,
         facts(args={"spec": ["my_package.specs", "gdp_stack_spec"]}),
     ),
-    "P08 symbol": (errors.FC_P08, facts(args={"hybrid_layer_pattern": "M-*-"})),
-    "P08 keys": (
-        errors.FC_P08,
-        facts(keys={"decoder.layers.0.mixer.conv1d_weight": (H, 1, 4)}, source=FSDP_DTENSOR),
-    ),
-    "P08 fused mixer without the gated deltaproduct spec": (
-        errors.FC_P08,
-        facts(
-            args={"hybrid_layer_pattern": "M-*-"},
-            keys=FSDP_MIXER,
-            source=FSDP_DTENSOR,
-            target=TORCH_DIST,
-        ),
-    ),
     "P09 symbol": (errors.FC_P09, facts(args={"hybrid_layer_pattern": "G-*-"})),
     "P09 variant": (errors.FC_P09, facts(args={"experimental_attention_variant": "gdn2"})),
     "P09 keys": (
@@ -484,16 +470,21 @@ def test_a_gated_deltaproduct_vision_language_hybrid_passes_the_fence():
         "vision_projection.encoder.linear_fc2.weight": (H, H),
     }
     assert codes(facts(args=args, keys=keys)) == []
-    assert codes(facts(args={**args, "spec": None}, keys=keys)) == [errors.FC_P08]
 
 
 @pytest.mark.parametrize(
     ("args", "keys", "source"),
     [
         ({"spec": GDP_SPEC, "hybrid_layer_pattern": "M-*-"}, FSDP_MIXER, FSDP_DTENSOR),
+        ({"hybrid_layer_pattern": "M-*-"}, FSDP_MIXER, FSDP_DTENSOR),
         (
             {"hybrid_layer_pattern": "M-*-"},
             {"decoder.layers.0.mixer.in_proj.weight.Q": (H, H)},
+            TORCH_DIST,
+        ),
+        (
+            {"hybrid_layer_pattern": "M-*-"},
+            {"decoder.layers.0.mixer.in_proj.weight.x": (H, H)},
             TORCH_DIST,
         ),
         (
@@ -502,11 +493,17 @@ def test_a_gated_deltaproduct_vision_language_hybrid_passes_the_fence():
             FSDP_DTENSOR,
         ),
     ],
-    ids=["fused-gdp-spec", "gdp-parts-without-spec", "mamba-names-under-gdp-spec"],
+    ids=[
+        "fused-gdp-spec",
+        "fused-default-spec",
+        "gdp-parts-without-spec",
+        "mamba-parts",
+        "mamba-names-under-gdp-spec",
+    ],
 )
-def test_gated_deltaproduct_evidence_passes_the_fence(args, keys, source):
-    """The spec or the parts say Gated DeltaProduct: the architecture context decides the mixers'
-    family from their names, the spec and their widths, and refuses contradictions (FC-R10)."""
+def test_mixers_pass_the_fence(args, keys, source):
+    """Every state-space mixer has a rule: the architecture context decides each mixer's family
+    from its names, the spec and its widths, and refuses contradictions (FC-R10)."""
     target = TORCH_DIST if source == FSDP_DTENSOR else FSDP_DTENSOR
     assert codes(facts(args=args, keys=keys, source=source, target=target)) == []
 
@@ -534,16 +531,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P08, "mixers", hint="later")
+    pending = Refusal(errors.FC_P09, "mixers", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P08)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P09)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P08: mixers hint: later",
+        "FC-P09: mixers hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

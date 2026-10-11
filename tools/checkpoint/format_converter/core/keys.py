@@ -448,6 +448,20 @@ def split_mixer_tensor(path: str, leaf: str) -> MixerTensor | None:
     return None
 
 
+def join_mixer_tensor(tensor: MixerTensor) -> tuple[str, str]:
+    """The logical ``(path, leaf)`` of ``tensor``, the inverse of :func:`split_mixer_tensor`.
+
+    ``conv_parameter`` names the convolution as the mixer's own parameter
+    (``mixer``, ``conv1d_weight``), otherwise as the ``conv1d`` module's
+    (``mixer.conv1d``, ``weight``).
+    """
+    if tensor.conv_parameter:
+        if tensor.projection != CONV1D:
+            raise InternalError(f"{tensor} is no convolution, which alone is a mixer parameter")
+        return tensor.mixer, f"{CONV1D}_{tensor.leaf}"
+    return f"{tensor.mixer}.{tensor.projection}", tensor.leaf
+
+
 ROUTED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.")
 """A tensor under the routed experts of a mixture-of-experts layer (``<...>.mlp.experts.``)."""
 
@@ -465,12 +479,6 @@ LEGACY_GROUPED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.weight[12]$")
 
 SINGLETON_EXPERT_SHARD = re.compile(r"(?:^|\.)mlp\.experts\.experts\.(?:0|[1-9][0-9]*)\.")
 """An expert saved with ``singleton_local_shards`` (torch_dist ``experts.experts.<e>.<name>``)."""
-
-MIXER_PARAM = re.compile(r"(?:^|\.)mixer\.")
-"""A parameter of a state-space mixer (Mamba-2 or Gated DeltaProduct)."""
-
-GDP_PART = re.compile(r"\.mixer\.(?:in_proj|conv1d)\.(?:weight|bias)\.(?:[VKb][0-9]+|Q|a)$")
-"""A torch_dist part of a Gated DeltaProduct ``in_proj`` or ``conv1d``."""
 
 GDN_PARAM = re.compile(r"\.self_attention\.(?:in_proj|conv1d)\.")
 """A projection of a Gated DeltaNet attention (standard attention has ``linear_qkv``)."""

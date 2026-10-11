@@ -13,7 +13,14 @@ tensor-parallel rank holds its shard of every component, in order (a
 every component of the weight and bias of these projections as a tensor of
 its own (Megatron's split factory: ``mixer.in_proj.weight.z``, TP-canonical);
 fsdp_dtensor stores each fused tensor whole, as its ranks' local tensors one
-after the other (rank-major).
+after the other (rank-major). Mamba-2 differs in two ways: its convolution is
+the mixer's own parameters ``conv1d_weight`` and ``conv1d_bias`` (the names
+fsdp_dtensor stores; ``MambaMixer.sharded_state_dict`` keeps torch_dist's
+``conv1d.weight``/``conv1d.bias``), and its split factory would leave an
+``in_proj.bias`` whole (``MambaMixer`` asserts ``bias=False``, so Megatron's
+stores hold none): torch_dist would store the ranks' local tensors one after
+the other, as fsdp_dtensor does, which converts only at the size it was saved
+at (:func:`check_tp_bound`).
 
 :func:`mixer_layout` decides the family of every mixer, never from the fused
 widths alone:
@@ -34,14 +41,18 @@ widths alone:
    store that predates the argument, as Megatron back-fills it).
 
 In torch_dist, every part must then have the name and size the family's
-layout gives it, and a Gated DeltaProduct mixer's ``A_log`` and ``dt_bias``
-must have ``H`` rows and its ``norm.weight`` ``d`` (a Megatron-FSDP job above
-TP 1 saves one rank's shard of them). A contradiction anywhere is refused
-(FC-R10).
+layout gives it, and the mixer's per-head and per-channel parameters must be
+whole: ``A_log`` and ``dt_bias`` (and Mamba-2's ``D``) have ``H`` rows,
+``norm.weight`` ``d`` (a Megatron-FSDP job above TP 1 saves one rank's shard of
+a Gated DeltaProduct mixer's). An fsdp_dtensor store saved before
+``MambaMixer`` owned its convolution names it ``mixer.conv1d.weight`` like a
+Gated DeltaProduct mixer's: the spec tells. A contradiction anywhere is
+refused (FC-R10).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -49,12 +60,20 @@ from typing import ClassVar
 
 from .. import errors
 from ..engine.metadata import TensorEntry
-from ..errors import Refusal, RefusalError
+from ..errors import InternalError, Refusal, RefusalError
 from .args_view import ArgsView
 from .blocks import BlockLayout
-from .keys import CONV1D, IN_PROJ, MIXER_TENSOR, KeyGrammarError, MixerTensor, split_mixer_tensor
+from .keys import (
+    CONV1D,
+    IN_PROJ,
+    MIXER_TENSOR,
+    KeyGrammarError,
+    MixerTensor,
+    join_mixer_tensor,
+    split_mixer_tensor,
+)
 from .logical import LogicalId, LogicalSlice
-from .names import FSDP_DTENSOR
+from .names import FSDP_DTENSOR, TORCH_DIST
 from .part_layout import PartLayout
 from .structure import decompose
 
@@ -81,15 +100,35 @@ DEFAULT_HOUSEHOLDERS = 3
 (``load_args_from_checkpoint``), its ``TransformerConfig`` default."""
 
 MAMBA_EXPAND = 2
-"""``MambaMixer``'s default ``expand``: its inner size is ``expand x hidden_size`` when
-``mamba_num_heads`` is unset."""
+"""``MambaMixer``'s default ``expand`` (no stack spec passes another): its inner size is
+``expand x hidden_size`` when ``mamba_num_heads`` is unset."""
+
+TORCH_DIST_WHOLE: Mapping[str, frozenset[tuple[str, str]]] = {
+    MAMBA2: frozenset({(IN_PROJ, "bias")})
+}
+"""The fused tensors torch_dist stores whole (``(projection, leaf)``, by family):
+``MambaMixer.sharded_state_dict`` splits ``in_proj.weight``, ``conv1d.weight``
+and ``conv1d.bias``, never ``in_proj.bias`` (which ``MambaMixer.__init__``
+asserts it has not; a store from a mixer built otherwise may hold one). Such a
+tensor is the tensor-parallel ranks' local tensors one after the other in both
+formats."""
 
 _HOUSEHOLDER_PART = re.compile(r"V(?:0|[1-9][0-9]*)")
-_MIXER_VECTOR_KEY = re.compile(r"(?:^|\.)mixer\.(?:A_log|dt_bias|norm\.weight)$")
-_MIXER_VECTOR = re.compile(r"(?P<mixer>(?:.+\.)?mixer)\.(?P<name>A_log|dt_bias|norm\.weight)")
-_GDP_VECTOR_PART = {"A_log": "a", "dt_bias": "a", "norm.weight": "z"}
-"""The ``in_proj`` component as long as each per-head (``H``) or per-channel (``d``) parameter of a
-Gated DeltaProduct mixer (tensor-parallel, stored unfused in both formats)."""
+_MIXER_VECTOR_KEY = re.compile(r"(?:^|\.)mixer\.(?:A_log|dt_bias|D|norm\.weight)$")
+_MIXER_VECTOR = re.compile(r"(?P<mixer>(?:.+\.)?mixer)\.(?P<name>A_log|dt_bias|D|norm\.weight)")
+_VECTOR_PARTS: Mapping[str, Mapping[str, tuple[str, ...]]] = {
+    GDP: {"A_log": ("a",), "dt_bias": ("a",), "norm.weight": ("z",)},
+    MAMBA2: {"A_log": ("dt",), "dt_bias": ("dt",), "D": ("dt", "z"), "norm.weight": ("z",)},
+}
+"""The ``in_proj`` components as long as each per-head (``H``) or per-channel (``d``) parameter of
+a mixer may be, by family (tensor-parallel, stored unfused in both formats). ``MambaMixer``'s ``D``
+has ``H`` rows, or ``d`` with ``D_has_hdim``. A family without an entry has none checked."""
+_VECTOR_HINTS: Mapping[str, str] = {
+    GDP: "a Megatron-FSDP job above TP 1 saves one tensor-parallel rank's shard of these "
+    "parameters (see the Gated DeltaProduct limitations); convert a store that holds them whole",
+    MAMBA2: "a store that holds one tensor-parallel rank's shard of these parameters cannot be "
+    "completed; convert a store that holds them whole",
+}
 _FUSED_TENSORS = ((IN_PROJ, "weight"), (CONV1D, "weight"))
 """The fused tensors every mixer of every family has (their biases are optional)."""
 
@@ -240,6 +279,10 @@ def _mamba2_layout(args: ArgsView) -> FamilyLayout | str:
         return wrong
     head_dim, groups = sizes["mamba_head_dim"], sizes["mamba_num_groups"]
     state = sizes["mamba_state_dim"]
+    # MambaMixer.__init__: d_inner = expand x d_model (d_model is hidden_size, MambaLayer); with
+    # config.mamba_num_heads, nheads = mamba_num_heads and d_inner = nheads x headdim, otherwise
+    # nheads = d_inner // headdim, which must divide; in_proj is z x B C dt (sizes d_inner,
+    # d_inner, ngroups x d_state twice, nheads) and conv1d x B C.
     heads = args.get("mamba_num_heads", None)
     if heads is None:
         hidden = args.get("hidden_size", None)
@@ -316,6 +359,32 @@ class FusedProjection:
     def kind(self) -> str:
         """What it is, for messages (``Gated DeltaProduct in_proj/conv1d``)."""
         return f"{FAMILY_NAMES[self.family]} in_proj/conv1d"
+
+    @property
+    def tensor(self) -> MixerTensor:
+        """Its mixer, projection and leaf."""
+        tensor = split_mixer_tensor(self.lid.path, self.lid.leaf)
+        if tensor is None:
+            raise InternalError(f"{self.lid} is no fused projection of a mixer")
+        return tensor
+
+    @property
+    def torch_dist_whole(self) -> bool:
+        """Whether torch_dist stores it whole, not as parts (:data:`TORCH_DIST_WHOLE`)."""
+        tensor = self.tensor
+        return (tensor.projection, tensor.leaf) in TORCH_DIST_WHOLE.get(self.family, frozenset())
+
+    def target_lid(self, fmt: str) -> LogicalId:
+        """The logical id of the whole tensor as a store of format ``fmt`` names it.
+
+        A Mamba-2 mixer's convolution is its own parameter in fsdp_dtensor
+        (``conv1d_weight``), the ``conv1d`` module's in torch_dist (and in an
+        fsdp_dtensor store saved before ``MambaMixer`` owned it).
+        """
+        tensor = self.tensor
+        own = fmt == FSDP_DTENSOR and self.family == MAMBA2 and tensor.projection == CONV1D
+        path, leaf = join_mixer_tensor(dataclasses.replace(tensor, conv_parameter=own))
+        return dataclasses.replace(self.lid, path=path, leaf=leaf)
 
 
 Mixer = tuple[str | None, int | None, str]
@@ -396,8 +465,7 @@ def mixer_layout(
     projections: dict[LogicalId, FusedProjection] = {}
     for mixer, tensors in stored.items():
         layout = _discriminate(mixer, tensors, spec_family, spec, layouts, args, source)
-        if spec_family == GDP:
-            _check_vectors(_where(mixer), vectors.get(mixer, {}), layout)
+        _check_vectors(_where(mixer), vectors.get(mixer, {}), layout)
         families[mixer] = spec_family
         for found in tensors.values():
             (lid,) = {piece.lid.whole for piece in found.slices.values()}
@@ -411,11 +479,20 @@ def mixer_layout(
         for family, layout in layouts.items()
         if family != spec_family
     )
+    shared = any(
+        isinstance(layout, FamilyLayout) and layout.widths == chosen.widths
+        for family, layout in layouts.items()
+        if family != spec_family
+    )
+    match = (
+        "the family the stored names give (another family has these widths too)"
+        if shared
+        else "the only family whose widths the stored ones match"
+    )
     evidence = (
         f"{spec}; {len(stored)} mixers stored "
         + ("whole" if source == FSDP_DTENSOR else "as parts")
-        + f"; {chosen.dims}: {chosen.widths}, the only family whose widths the stored ones match "
-        f"({others})"
+        + f"; {chosen.dims}: {chosen.widths}, {match} ({others})"
     )
     return MixerLayout(families, projections), evidence
 
@@ -439,8 +516,19 @@ def _stored_mixers(
             tensor = split_mixer_tensor(piece.lid.path, piece.lid.leaf)
             if tensor is None:
                 continue
-            tensors = mixers.setdefault((piece.lid.block, piece.lid.layer, tensor.mixer), {})
+            mixer = (piece.lid.block, piece.lid.layer, tensor.mixer)
+            tensors = mixers.setdefault(mixer, {})
             found = tensors.setdefault((tensor.projection, tensor.leaf), _Stored(tensor, {}))
+            twice = found.slices.get(piece.lid.part)
+            if twice is not None:
+                raise _refusal(
+                    f"{_where(mixer)}: {tensor.projection}.{tensor.leaf} is stored twice, as "
+                    f"{twice.key} and {piece.key}",
+                    (twice.key, piece.key),
+                    hint="keep one of them (a Mamba-2 store names its convolution conv1d_weight "
+                    "and conv1d_bias, or conv1d.weight and conv1d.bias before MambaMixer owned "
+                    "them)",
+                )
             found.slices[piece.lid.part] = piece
     return mixers
 
@@ -466,25 +554,46 @@ def _mixer_vectors(
 
 
 def _check_vectors(where: str, vectors: Mapping[str, LogicalSlice], layout: FamilyLayout) -> None:
-    """A Gated DeltaProduct mixer's ``A_log`` and ``dt_bias`` have ``H`` rows and its
-    ``norm.weight`` ``d`` (FC-R10): a Megatron-FSDP job above TP 1 holds and saves one
-    tensor-parallel rank's shard of each, which no conversion can complete."""
+    """A mixer's per-head and per-channel parameters are whole (FC-R10): ``A_log`` and ``dt_bias``
+    (and a Mamba-2 mixer's ``D``) have ``H`` rows, ``norm.weight`` ``d`` (:data:`_VECTOR_PARTS`).
+
+    A Megatron-FSDP job above TP 1 holds and saves one tensor-parallel rank's
+    shard of a Gated DeltaProduct mixer's, which no conversion can complete.
+    """
+    parts = _VECTOR_PARTS.get(layout.family, {})
+    if not parts:
+        return
     sizes = dict(zip(layout.in_proj.parts, layout.in_proj.sizes))
     wrong = {
         name: piece
         for name, piece in sorted(vectors.items())
-        if piece.shape[:1] != (sizes[_GDP_VECTOR_PART[name]],)
+        if name in parts and piece.shape[:1] not in {(sizes[part],) for part in parts[name]}
     }
     if wrong:
         found = ", ".join(f"{name} {tuple(piece.shape)}" for name, piece in wrong.items())
         raise _refusal(
-            f"{where}: {found}, but a Gated DeltaProduct mixer's A_log and dt_bias have "
-            f"{sizes['a']} rows and its norm.weight {sizes['z']} ({layout.dims})",
+            f"{where}: {found}, but a {FAMILY_NAMES[layout.family]} mixer's "
+            f"{_vector_rows(parts, sizes)} ({layout.dims})",
             tuple(piece.key for piece in wrong.values()),
-            hint="a Megatron-FSDP job above TP 1 saves one tensor-parallel rank's shard of these "
-            "parameters (see the Gated DeltaProduct limitations); convert a store that holds them "
-            "whole",
+            hint=_VECTOR_HINTS[layout.family],
         )
+
+
+def _vector_rows(parts: Mapping[str, tuple[str, ...]], sizes: Mapping[str, int]) -> str:
+    """``A_log and dt_bias have 4 rows, its D 4 or 8 and its norm.weight 8``: the rows of the
+    parameters ``parts`` gives the components of, grouped by component."""
+    groups: dict[tuple[str, ...], list[str]] = {}
+    for name, components in parts.items():
+        groups.setdefault(components, []).append(name)
+    phrases = [
+        f"{' and '.join(names)} "
+        + ("have " if index == 0 else "")
+        + " or ".join(dict.fromkeys(str(sizes[part]) for part in components))
+        + (" rows" if index == 0 else "")
+        for index, (components, names) in enumerate(groups.items())
+    ]
+    *first, last = [phrases[0], *(f"its {phrase}" for phrase in phrases[1:])]
+    return f"{', '.join(first)} and {last}" if first else last
 
 
 def megatron_fsdp_warnings(mixers: MixerLayout, target: str, pack_tp: int | None) -> list[str]:
@@ -501,6 +610,40 @@ def megatron_fsdp_warnings(mixers: MixerLayout, target: str, pack_tp: int | None
         "norm.weight, so no current Megatron job loads this fsdp_dtensor store (see the Gated "
         "DeltaProduct limitations)"
     ]
+
+
+def check_tp_bound(mixers: MixerLayout, source: str, src_tp: int, pack_tp: int | None) -> None:
+    """A tensor torch_dist stores whole converts only at the size it was saved at (FC-R10).
+
+    Such a tensor (:data:`TORCH_DIST_WHOLE`) is the ranks' local tensors one
+    after the other in both formats, so it converts as is, which is right
+    only when fsdp_dtensor packs it at the source's tensor-parallel size. An
+    fsdp_dtensor source is unpacked at its own size, which its torch_dist
+    target keeps.
+
+    Args:
+        mixers: The model's mixers.
+        source: The source format.
+        src_tp: The tensor-parallel size the source was saved with.
+        pack_tp: The size fsdp_dtensor packs at (``None``: nothing is packed).
+    """
+    if source != TORCH_DIST or pack_tp is None or pack_tp == src_tp:
+        return
+    bound = sorted(
+        (fused for fused in mixers.projections.values() if fused.torch_dist_whole),
+        key=lambda fused: fused.key,
+    )
+    if bound:
+        names = ", ".join(
+            sorted({f"{fused.tensor.projection}.{fused.tensor.leaf}" for fused in bound})
+        )
+        raise _refusal(
+            f"{len(bound)} {FAMILY_NAMES[bound[0].family]} mixer {names} tensors (such as "
+            f"{bound[0].lid}) are stored whole, as the {src_tp} tensor-parallel ranks' local "
+            f"tensors one after the other, which no fsdp_dtensor store packed at {pack_tp} holds",
+            tuple(fused.key for fused in bound),
+            hint=f"pass --fsdp-tp {src_tp}, the size the source was saved with",
+        )
 
 
 def _discriminate(
@@ -541,7 +684,8 @@ def _discriminate(
             f"derived from the arguments: {layout}",
             keys,
         )
-    _check_widths(where, tensors, spec_family, spec, layouts, keys)
+    candidates = {family: layout for family, layout in layouts.items() if family in named}
+    _check_widths(where, tensors, spec_family, spec, candidates, keys)
     for found in tensors.values():
         _check_parts(where, found, layout, keys)
     return layout
@@ -575,25 +719,40 @@ def _named_families(
     """The families the stored names allow, and the names (a noun phrase, for messages).
 
     Raises:
-        RefusedError: torch_dist stores a fused projection whole, or its
-            ``in_proj`` parts are no family's (FC-R10).
+        RefusedError: torch_dist stores a fused projection whole that its
+            family splits (any but a Mamba-2 ``in_proj.bias``), or as parts one
+            it keeps whole, or its ``in_proj`` parts are no family's, or it
+            names a convolution ``conv1d_weight``/``conv1d_bias`` (FC-R10).
     """
-    if any(found.tensor.conv_parameter for found in tensors.values()):
+    own = sorted(
+        key for found in tensors.values() if found.tensor.conv_parameter for key in found.keys
+    )
+    if own and source != FSDP_DTENSOR:
+        raise _refusal(
+            f"{where}: torch_dist names a Mamba-2 mixer's convolution conv1d.weight and "
+            "conv1d.bias (stored as parts), but the store holds conv1d_weight or conv1d_bias",
+            tuple(own),
+            hint="check that the store was saved by Megatron",
+        )
+    if own:
         return frozenset({MAMBA2}), "its convolution parameter conv1d_weight"
     if source == FSDP_DTENSOR:
         return frozenset({GDP, MAMBA2}), "its fused in_proj and conv1d.weight"
-    # Megatron's split factory stores every part of a Gated DeltaProduct mixer's in_proj and
-    # conv1d weights and biases; a whole (TP-bound, rank-major) torch_dist tensor would need
-    # identity at pack_tp == src_tp only. Mamba-2's in_proj.bias is the first such key.
-    whole = [key for found in tensors.values() if None in found.slices for key in found.keys]
-    if whole:
+    parts = tensors[IN_PROJ, "weight"].parts
+    named = _family_of_parts(parts) if parts else None
+    whole = TORCH_DIST_WHOLE.get(named[0], frozenset()) if named is not None else frozenset()
+    unsplit = [
+        key
+        for name, found in tensors.items()
+        if None in found.slices and name not in whole
+        for key in found.keys
+    ]
+    if unsplit:
         raise _refusal(
             f"{where}: torch_dist stores a mixer's in_proj and conv1d as one tensor per part, but "
             "the store holds them whole",
-            tuple(whole),
+            tuple(unsplit),
         )
-    parts = tensors[IN_PROJ, "weight"].parts
-    named = _family_of_parts(parts)
     if named is None:
         raise _refusal(
             f"{where}: its in_proj parts {', '.join(sorted(parts))} are no mixer family's",
@@ -601,6 +760,15 @@ def _named_families(
             hint="check that the store was saved by Megatron",
         )
     family, order = named
+    split = sorted(name for name in whole if name in tensors and tensors[name].parts)
+    if split:
+        raise _refusal(
+            f"{where}: torch_dist stores a {FAMILY_NAMES[family]} mixer's "
+            f"{' and '.join(f'{projection}.{leaf}' for projection, leaf in split)} whole, but the "
+            "store holds it as parts",
+            tuple(key for name in split for key in tensors[name].keys),
+            hint="check that the store was saved by Megatron",
+        )
     return frozenset({family}), f"its in_proj parts {', '.join(_ordered(parts, order))}"
 
 
@@ -652,8 +820,16 @@ def _check_widths(
     layouts: Mapping[str, FamilyLayout | str],
     keys: tuple[str, ...],
 ) -> None:
-    """Exactly one family has the stored widths as the arguments give it: ``spec_family``
-    (FC-R10)."""
+    """Exactly one family of ``layouts`` has the stored widths as the arguments give it:
+    ``spec_family`` (FC-R10).
+
+    ``layouts`` holds only the families the stored names leave: the one
+    torch_dist parts or an fsdp_dtensor ``conv1d_weight`` name, Gated
+    DeltaProduct and Mamba-2 for an fsdp_dtensor ``mixer.conv1d.weight``. A
+    family the names exclude does not count, even with the same widths: every
+    Megatron argument namespace carries Gated DeltaNet's ``linear_*``
+    defaults, which a Mamba-2 model's widths may match.
+    """
     matches = [
         family
         for family, layout in layouts.items()

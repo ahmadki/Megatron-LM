@@ -22,6 +22,7 @@ from tools.checkpoint.format_converter.core.keys import (
     join_glu_half,
     join_layer_key,
     join_leaf,
+    join_mixer_tensor,
     join_torch_dist_expert,
     root_of,
     split_factory_part,
@@ -356,6 +357,13 @@ def test_swiglu_halves_are_parts_of_first_projections_only():
 def test_mixer_tensors_are_named_by_mixer_projection_and_leaf(key, path, leaf, tensor):
     assert MIXER_TENSOR.search(key)
     assert split_mixer_tensor(path, leaf) == tensor
+    assert join_mixer_tensor(tensor) == (path, leaf)
+
+
+def test_only_a_convolution_is_a_mixer_parameter():
+    assert join_mixer_tensor(MixerTensor("mixer", "conv1d", "bias")) == ("mixer.conv1d", "bias")
+    with pytest.raises(InternalError, match="no convolution"):
+        join_mixer_tensor(MixerTensor("mixer", "in_proj", "weight", conv_parameter=True))
 
 
 @pytest.mark.parametrize(

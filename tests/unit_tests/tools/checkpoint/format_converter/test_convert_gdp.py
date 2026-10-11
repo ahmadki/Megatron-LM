@@ -227,13 +227,18 @@ def test_the_plan_names_the_rule_and_the_mixers(tmp_path, capsys):
 
 
 def test_a_mixer_store_without_the_gdp_spec_is_never_converted(tmp_path, capsys):
-    """fsdp_dtensor's fused projections may be a legacy Mamba-2 store's: without the spec the
-    store is a pending Mamba-2 model. torch_dist's parts name Gated DeltaProduct, and the spec
-    builds Mamba-2 mixers: a contradiction."""
+    """fsdp_dtensor's fused projections may be a legacy Mamba-2 store's: without the spec they are
+    Mamba-2 mixers, whose widths the arguments do not give these. torch_dist's parts name Gated
+    DeltaProduct, and the spec builds Mamba-2 mixers: a contradiction."""
     args = gdp_args(ckpt_format="fsdp_dtensor", spec=None)
     fsdp = write_fsdp_store(tmp_path / "fsdp" / ITER, fsdp_expected(1), args=args)
     assert run("plan", fsdp, "--to", "torch_dist") == 3
-    assert "error: FC-P08: not supported yet: Mamba-2 mixers" in capsys.readouterr().err
+    assert (
+        "error: FC-R10: decoder[0].mixer: its widths (conv1d.weight 52 rows, in_proj.weight 72 "
+        "rows) are not what the arguments give Mamba-2 mixers (d=8, GN=12, H=4 "
+        "(args.mamba_num_heads=4): in_proj 44 rows, conv1d 32 rows), which args.spec=None builds "
+        "Mamba-2 mixers; they are what the arguments give Gated DeltaProduct mixers"
+    ) in capsys.readouterr().err
     src = write_gpt_source(tmp_path / "src", TORCH_DIST, args=gdp_args(spec=None))
     assert run("plan", src, "--to", "fsdp_dtensor") == 3
     err = capsys.readouterr().err

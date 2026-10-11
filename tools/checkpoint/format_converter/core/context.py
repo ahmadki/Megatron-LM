@@ -44,7 +44,7 @@ from .hybrid_pattern import shortcut_warnings
 from .keys import root_of
 from .logical import LogicalId
 from .manifest import MANIFEST_FILE, Manifest
-from .mixers import MixerLayout, megatron_fsdp_warnings, mixer_layout
+from .mixers import MixerLayout, check_tp_bound, megatron_fsdp_warnings, mixer_layout
 from .names import (
     AUTO_EXPERT_NAMING,
     AUTO_SWIGLU,
@@ -294,7 +294,9 @@ def build_arch_context(
             cannot be stacked as asked, expert indices other than
             ``0..E-1``, or gated linear units that contradict one another or
             the arguments; FC-R10 for packed tensors that do not divide by
-            their pack size, or pack sizes the manifest records otherwise).
+            their pack size, pack sizes the manifest records otherwise, mixers
+            the names, the spec or the widths contradict, or a mixer tensor
+            torch_dist stores whole packed at another size than the source's).
         AmbiguousError: The source holds a manifest of another store, or one
             that records another torch_dist layout of a block (FC-A06); a
             block's torch_dist layout cannot be decided (FC-A02); an
@@ -357,6 +359,7 @@ def build_arch_context(
     )
     pack_tp = packs.size(TENSOR_PARALLEL, saved=tp, flag=fsdp_tp)
     pack_etp = packs.size(EXPERT_TENSOR_PARALLEL, saved=etp, flag=fsdp_etp)
+    check_tp_bound(mixers, source, tp, pack_tp)
     warnings += megatron_fsdp_warnings(mixers, target, pack_tp)
     log.append(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")

@@ -867,6 +867,88 @@ def gdp_hybrid_tensors(
     """A per-layer hybrid model of ``pattern`` whose ``M`` layers are Gated DeltaProduct mixers of
     the dimensions ``mixer`` (:func:`gdp_mixer_tensors`), with an embedding, a final norm and an
     output layer: its mixers' fused projections by part, and every other tensor."""
+    return mixer_hybrid_tensors(pattern, gdp_mixer_tensors, mixer, hidden=hidden, bias=bias)
+
+
+def mamba_mixer_tensors(
+    mixer: str,
+    *,
+    d_inner: int,
+    group_state: int,
+    heads: int,
+    hidden: int = 8,
+    bias: bool = False,
+    seed: int,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """Random tensors of one Mamba-2 mixer under ``mixer`` (e.g. ``decoder.layers.0.mixer``).
+
+    Returns its fused projections by part, ``{"<mixer>.in_proj.weight": {"z": ..., "x": ...}}``,
+    each in the order ``MambaMixer`` concatenates them (written out here from its definition:
+    ``in_proj`` is ``z, x, B, C, dt`` of sizes ``d``, ``d``, ``GN``, ``GN``, ``H``; ``conv1d`` is
+    ``x, B, C``), named by the ``conv1d`` module as torch_dist names them; the convolution always
+    has its bias (``conv_bias=True``) and ``in_proj`` has one if ``bias``. Also its other tensors:
+    ``in_proj``'s layer norm, ``A_log`` and ``D`` in float32, ``dt_bias``, the gated norm and
+    ``out_proj``. Weights are bfloat16; every part draws its own values.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    in_proj = {"z": d_inner, "x": d_inner, "B": group_state, "C": group_state, "dt": heads}
+    conv = {"x": d_inner, "B": group_state, "C": group_state}
+    leaves = {"in_proj": (("weight", (hidden,)),) + ((("bias", ()),) if bias else ())}
+    leaves["conv1d"] = (("weight", (1, 4)), ("bias", ()))
+    fused = {}
+    for name, parts in (("in_proj", in_proj), ("conv1d", conv)):
+        for leaf, trailing in leaves[name]:
+            fused[f"{mixer}.{name}.{leaf}"] = {
+                part: torch.randn(rows, *trailing, generator=generator).bfloat16()
+                for part, rows in parts.items()
+            }
+    others = {
+        f"{mixer}.in_proj.layer_norm_weight": torch.randn(hidden, generator=generator).bfloat16(),
+        f"{mixer}.A_log": torch.randn(heads, generator=generator),
+        f"{mixer}.dt_bias": torch.randn(heads, generator=generator).bfloat16(),
+        f"{mixer}.D": torch.randn(heads, generator=generator),
+        f"{mixer}.norm.weight": torch.randn(d_inner, generator=generator).bfloat16(),
+        f"{mixer}.out_proj.weight": torch.randn(hidden, d_inner, generator=generator).bfloat16(),
+    }
+    return fused, others
+
+
+def mamba_hybrid_tensors(
+    pattern: str, mixer: Mapping[str, int], *, hidden: int = 8, bias: bool = False
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """:func:`gdp_hybrid_tensors` with Mamba-2 mixers (:func:`mamba_mixer_tensors`)."""
+    return mixer_hybrid_tensors(pattern, mamba_mixer_tensors, mixer, hidden=hidden, bias=bias)
+
+
+MAMBA_CONV_PARAMETERS = {
+    ".mixer.conv1d.weight": ".mixer.conv1d_weight",
+    ".mixer.conv1d.bias": ".mixer.conv1d_bias",
+}
+"""``MambaMixer``'s convolution as torch_dist names it (its ``sharded_state_dict`` keeps the names
+of the old ``conv1d`` module) and as Megatron-FSDP saves it (the mixer's own parameters)."""
+
+
+def mamba_fsdp_names(tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """``tensors`` with every Mamba-2 convolution renamed as Megatron-FSDP saves it."""
+    renamed = {}
+    for key, tensor in tensors.items():
+        for module_name, parameter in MAMBA_CONV_PARAMETERS.items():
+            if key.endswith(module_name):
+                key = key[: -len(module_name)] + parameter
+        renamed[key] = tensor
+    return renamed
+
+
+def mixer_hybrid_tensors(
+    pattern: str,
+    mixer_tensors: Callable[..., tuple[dict, dict]],
+    mixer: Mapping[str, int],
+    *,
+    hidden: int,
+    bias: bool,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """A per-layer hybrid model of ``pattern`` whose ``M`` layers are ``mixer_tensors`` mixers of
+    the dimensions ``mixer``: its mixers' fused projections by part, and every other tensor."""
     generator = torch.Generator().manual_seed(31)
     fused: dict[str, dict[str, torch.Tensor]] = {}
     others = {
@@ -877,7 +959,7 @@ def gdp_hybrid_tensors(
     for index, symbol in enumerate(pattern):
         layer = f"decoder.layers.{index}"
         if symbol == "M":
-            projections, rest = gdp_mixer_tensors(
+            projections, rest = mixer_tensors(
                 f"{layer}.mixer", hidden=hidden, bias=bias, seed=index, **mixer
             )
             fused.update(projections)

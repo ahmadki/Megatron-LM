@@ -7,4 +7,4 @@ Importing this package registers every rule with ``core.registry.REGISTRY``.
 
 from __future__ import annotations
 
-from . import gdp, glu, identity
+from . import glu, identity, mixers

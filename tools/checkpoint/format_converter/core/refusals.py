@@ -40,12 +40,10 @@ from .keys import (
     FACTORY_PART,
     FUSED_MIXER,
     GDN_PARAM,
-    GDP_PART,
     GLU_HALF,
     GROUPED_EXPERT_BIAS,
     LAYER_SEGMENT,
     LEGACY_GROUPED_EXPERTS,
-    MIXER_PARAM,
     MLA_PARAM,
     SINGLE_GROUPED_EXPERTS,
     SINGLETON_EXPERT_SHARD,
@@ -53,12 +51,11 @@ from .keys import (
     TORCH_DIST_EXPERT_BIAS,
     root_of,
 )
-from .mixers import GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, is_gdp_spec, spec_name
+from .mixers import GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, spec_name
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P08: "Mamba-2 mixers",
     errors.FC_P09: "Gated DeltaNet and linear-attention layers",
     errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
     errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
@@ -69,8 +66,8 @@ PENDING_FAMILIES: Mapping[str, str] = {
 MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
 """Block prefixes of multi-token prediction."""
 
-PENDING_SYMBOLS = frozenset("MG+")
-"""Hybrid layer symbols of pending families (mixers, Gated DeltaNet, MLA)."""
+PENDING_SYMBOLS = frozenset("G+")
+"""Hybrid layer symbols of pending families (Gated DeltaNet, MLA)."""
 
 GDN_VARIANTS = frozenset({"gdn", "gdn2", "gated_delta_net"})
 """``experimental_attention_variant`` values of the Gated DeltaNet family."""
@@ -96,7 +93,7 @@ SINGLE_GROUPED_ARGS = ("moe_single_grouped_weight", "moe_single_grouped_bias")
 SINGLETON_LOCAL_SHARDS = "singleton_local_shards"
 """The ``content_metadata`` flag of a checkpoint saved one local shard per key."""
 
-REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E")
+REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E", "M")
 REGISTRY.allow(
     Allowlist.STACK_SPECS,
     *(
@@ -111,7 +108,7 @@ REGISTRY.sentinel(
         "parameter_parts",
         TORCH_DIST,
         FACTORY_PART,
-        ("gdp", errors.FC_P08, errors.FC_P09),
+        ("gdp", "mamba2", errors.FC_P09),
         "a parameter stored as parts can only be reassembled by its family's rule",
     )
 )
@@ -129,7 +126,7 @@ REGISTRY.sentinel(
         "fused_mixer_projections",
         FSDP_DTENSOR,
         FUSED_MIXER,
-        ("gdp", errors.FC_P08, errors.FC_P09),
+        ("gdp", "mamba2", errors.FC_P09),
         "a fused mixer projection is packed per tensor-parallel rank and needs its mixer rule",
     )
 )
@@ -503,21 +500,6 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
     refusal = singleton_local_shards_refusal(facts.content_metadata, tuple(sorted(set(keys))))
     if refusal is not None:
         yield refusal
-
-
-@REGISTRY.detector
-def pending_mamba(facts: Facts) -> Iterator[Refusal]:
-    """FC-P08: state-space mixers that are no Gated DeltaProduct mixers (Mamba-2).
-
-    A model built with the Gated DeltaProduct spec, or whose torch_dist
-    mixers are stored as its parts, passes: the architecture context tells
-    its mixers' family from their names, the spec and their widths, and
-    refuses any contradiction (``core/mixers.py``).
-    """
-    if is_gdp_spec(facts.args) or facts.keys_matching(GDP_PART):
-        return
-    evidence = ["hybrid layer symbol M"] if "M" in _symbols(facts) else []
-    yield from _pending(errors.FC_P08, evidence, facts.keys_matching(MIXER_PARAM))
 
 
 @REGISTRY.detector
