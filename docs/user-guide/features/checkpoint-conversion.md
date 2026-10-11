@@ -66,13 +66,13 @@ checkpoints (`FC-R13`).
 | Shortcut-connected mixture-of-experts layers of hybrid models (`--moe-shortcut-connection`: each `E` paired with the layer before it into one module, see [Hybrid layer lists](#hybrid-layer-lists)) | yes | yes | dropped | as above | synthetic stores; the grouping pinned to Megatron's `group_layers_into_shortcut_blocks` on edge patterns; a live shortcut model's `torch_dist` keys pinned to its state-dict names; a real `torch_dist` save converted and compared with what Megatron-FSDP's save handlers make of the live model; that handler output converted back, loaded strictly and compared parameter for parameter; the round trip against the source. Current Megatron refuses `--moe-shortcut-connection` with Megatron-FSDP, so no current Megatron job loads such an `fsdp_dtensor` store (see [Limitations](#limitations-and-non-claims)) |
 | Hybrid multi-token prediction (the `/` parts of `--hybrid-layer-pattern`, or the legacy `--mtp-hybrid-override-pattern`; with `--mtp-use-repeated-layer` too), including its mixture-of-experts and shortcut-connected layers | yes | yes | dropped | as above | synthetic stores; the inner layer name pinned to Megatron's; real-save chains of hybrid models with two MTP depths, MTP layers with experts, and one repeated MTP layer |
 | Gated DeltaProduct mixers of hybrid models (symbol `M` with `--spec megatron.core.models.hybrid.hybrid_layer_specs gated_delta_product_stack_spec`, or its alias `gdp_stack_spec`): the fused `in_proj` and `conv1d` weights and biases of every mixer, in shortcut-connected pairs and multi-token prediction layers too, see [Gated DeltaProduct mixers](#gated-deltaproduct-mixers) | yes | yes | dropped | an `fsdp_dtensor` store is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`; see [Tensor parallelism](#tensor-parallelism)); current Megatron-FSDP jobs hold these mixers at TP 1 only (see [Limitations](#limitations-and-non-claims)) | synthetic stores against parts and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4, with biases) and a vision-language store of every family above; the parts pinned to Megatron's split helpers for 1 to 3 Householder steps; a real TP 2 mixer's fused tensors pinned to the rank-major pack of its own `torch_dist` parts; a real model's `torch_dist` keys and state-dict names at TP 1 and 2; a real-save chain at TP 1; a real TP 2 `torch_dist` save converted with `--fsdp-tp 2`, whose store holds the model's rank-major tensors, converted back and loaded strictly |
+| Mamba-2 mixers of hybrid models (symbol `M` with the default stack spec, `hybrid_stack_spec` or its alias `mamba_stack_spec`): the fused `in_proj` weight and the convolution's weight and bias of every mixer, in shortcut-connected pairs and multi-token prediction layers too, see [Mamba-2 mixers](#mamba-2-mixers) | yes | yes | dropped | an `fsdp_dtensor` store is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against parts and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4; heads from `mamba_num_heads` or from `hidden_size`; a store saved before the mixer owned its convolution) and a vision-language store of every family above, each failing under converters that swap two parts, slice the parts' concatenation by rank or misname the convolution; the parts and names pinned to `MambaMixer.sharded_state_dict` (source scan) and to a real mixer's split factories at TP 1 and 2; a real TP 2 mixer's fused tensors pinned to the rank-major pack of its own `torch_dist` parts; a real model's `torch_dist` keys and state-dict names at TP 1 and 2; real-save chains of `M*-` and `M*E` at TP 1 (and `M*-` at TP 2 with `--fsdp-tp 2`, extended) |
 
 Model families that later versions add are refused before anything is read,
 with a pending-family code:
 
 | Code | Family |
 |---|---|
-| `FC-P08` | Mamba-2 mixers |
 | `FC-P09` | Gated DeltaNet and linear attention |
 | `FC-P10` | GPT multi-token prediction and multi-latent attention |
 | `FC-P11`, `FC-P12` | optimizer state (`--optimizer convert`) |
@@ -380,7 +380,7 @@ Megatron assumes). Any contradiction is refused (`FC-R10`); `plan` shows the
 family of every mixer with its dimensions and widths (`mixers`). A mixer
 store without the Gated DeltaProduct spec and without its components'
 names (an `fsdp_dtensor` store's fused tensors are those of either family) is
-a Mamba-2 model (`FC-P08`).
+a Mamba-2 model (see [Mamba-2 mixers](#mamba-2-mixers)).
 
 The mixer's `A_log` and `dt_bias` (`H` rows) and `norm.weight` (`d` rows)
 are copied unchanged, and must have their full sizes (`FC-R10`): a
@@ -391,6 +391,48 @@ to `fsdp_dtensor` with `--fsdp-tp` above 1 warns that no current Megatron-FSDP
 job loads the store. The inference stack specs
 (`gated_delta_product_inference_stack_spec`, alias `gdp_inference_stack_spec`)
 are not on the spec allowlist and are refused (`FC-R03`).
+
+### Mamba-2 mixers
+
+A hybrid model built with the default stack spec (`hybrid_stack_spec`, alias
+`mamba_stack_spec`, or no `--spec`) has a Mamba-2 mixer (`MambaMixer`) in
+every `M` layer. Its input projection `in_proj` concatenates the components
+`z, x, B, C, dt` (sizes `d`, `d`, `GN`, `GN`, `H`) and its convolution the
+components `x, B, C`, with `H = mamba_num_heads` and
+`d = H x mamba_head_dim`, or without `mamba_num_heads`, `d = 2 x hidden_size`
+and `H = d / mamba_head_dim` (as `MambaMixer` derives them), and
+`GN = mamba_num_groups x mamba_state_dim`; every tensor-parallel rank holds
+its shard of each component, in this order. The mixer has no `in_proj` bias,
+and always a convolution bias.
+
+`torch_dist` stores each component of the `in_proj` weight and of the
+convolution's weight and bias as a tensor of its own,
+`<...>.mixer.in_proj.weight.z` and `<...>.mixer.conv1d.weight.x`. The mixer
+holds its convolution as its own parameters, which Megatron-FSDP stores
+under those names, `<...>.mixer.conv1d_weight` and `<...>.mixer.conv1d_bias`,
+each whole and packed per tensor-parallel rank like `in_proj.weight` (see
+[Tensor parallelism](#tensor-parallelism)). Converting to `fsdp_dtensor`
+packs the components at `--fsdp-tp` and writes these names; converting to
+`torch_dist` cuts the components out of the store packed at its own
+tensor-parallel size. An `fsdp_dtensor` store saved before `MambaMixer` owned
+its convolution names it `<...>.mixer.conv1d.weight` and `.bias`, as a Gated
+DeltaProduct mixer's are named: it is read as Mamba-2 unless the spec is the
+Gated DeltaProduct one. A convolution stored under both names is refused
+(`FC-R10`).
+
+The family is told as for [Gated DeltaProduct mixers](#gated-deltaproduct-mixers)
+(names, spec, the unique width match; `FC-R10` for any contradiction). The
+mixer's `A_log`, `dt_bias` and `D` (`H` rows) and `norm.weight` (`d` rows)
+are copied unchanged and must have their full sizes (`FC-R10`); unlike a
+Gated DeltaProduct mixer's, Megatron-FSDP shards them over the
+tensor-parallel ranks, so Megatron-FSDP jobs above TP 1 hold Mamba-2 mixers
+whole.
+
+If an `in_proj.bias` is present (a mixer built otherwise than `MambaMixer`,
+which asserts it has none), Megatron's split factory would not split it:
+`torch_dist` then holds the ranks' local biases one after the other, as
+`fsdp_dtensor` does. It is copied as is when `--fsdp-tp` is the source's
+tensor-parallel size, and refused otherwise (`FC-R10`).
 
 ### Vision-language models
 
@@ -420,8 +462,9 @@ with one exception.
 
 ```{warning}
 An `fsdp_dtensor` store that holds fused gated `linear_fc1` (see
-[Gated MLPs](#gated-mlps-swiglu)) or Gated DeltaProduct mixers (see
-[Gated DeltaProduct mixers](#gated-deltaproduct-mixers)) is
+[Gated MLPs](#gated-mlps-swiglu)), Gated DeltaProduct mixers (see
+[Gated DeltaProduct mixers](#gated-deltaproduct-mixers)) or Mamba-2 mixers
+(see [Mamba-2 mixers](#mamba-2-mixers)) is
 **tensor-parallel-bound**: each such tensor is packed per tensor-parallel
 rank (per expert tensor-parallel rank for routed experts) and loads right only
 at the size it was packed at. The Megatron-FSDP loader does not check the
@@ -528,7 +571,7 @@ condition of every code.
 | `FC-R05` | grouped expert biases in `fsdp_dtensor` with expert parallelism (Megatron-FSDP keeps their expert-parallel-local indices) |
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
-| `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size, or whose pack size the manifest records otherwise; a padded vocabulary that does not divide by `--fsdp-tp`; a state-space mixer whose family the names, the spec and the widths do not tell alike, whose dimensions the arguments do not give, whose `torch_dist` parts are not its family's, or a Gated DeltaProduct mixer whose `A_log`, `dt_bias` or `norm.weight` is one rank's shard |
+| `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size, or whose pack size the manifest records otherwise; a padded vocabulary that does not divide by `--fsdp-tp`; a state-space mixer whose family the names, the spec and the widths do not tell alike, whose dimensions the arguments do not give, whose `torch_dist` parts are not its family's, whose `A_log`, `dt_bias`, `D` or `norm.weight` is one rank's shard, or whose convolution is stored under both its names; a Mamba-2 `in_proj.bias` stored whole in `torch_dist` converted with `--fsdp-tp` other than the source's tensor-parallel size |
 | `FC-R11` | layer indices or layer tensors that contradict the hybrid layer pattern, or a pattern whose shortcut-MoE layers Megatron cannot group |
 | `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), layers that differ where they would be stacked, or gated MLPs that contradict the arguments (`--swiglu`, `--quick-geglu`) or one another |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
@@ -566,11 +609,11 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** Mamba-2 mixers, Gated DeltaNet, GPT multi-token
-  prediction and multi-latent attention are refused until the versions that
-  add them (see the [Support Matrix](#support-matrix)).
+- **Pending families.** Gated DeltaNet, GPT multi-token prediction and
+  multi-latent attention are refused until the versions that add them (see
+  the [Support Matrix](#support-matrix)).
 - **Tensor-parallel-bound `fsdp_dtensor` stores.** A store with fused gated
-  `linear_fc1` or Gated DeltaProduct mixers loads right only at the
+  `linear_fc1`, Gated DeltaProduct or Mamba-2 mixers loads right only at the
   tensor-parallel sizes it was packed at, and the Megatron-FSDP loader does
   not check them (see [Tensor parallelism](#tensor-parallelism)).
 - **Gated DeltaProduct and Megatron-FSDP at TP > 1.** On current Megatron, a
