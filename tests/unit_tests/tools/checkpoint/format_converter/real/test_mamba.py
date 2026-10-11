@@ -1,7 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Mamba-2 mixers against Megatron's own modules.
+"""Mamba-2 mixers against Megatron's own modules, saves and loads.
 
+* T3 real-save chains (``run_chain`` in ``_real_harness.py``) of Mamba-2
+  hybrid models (``M*-``, and ``M*E`` with a mixture-of-experts layer) at TP 1:
+  Megatron saves and strictly loads every store in both formats, every
+  parameter must equal model A's after each load, and every store is checked
+  against a real save under its contract (A, B, C, D). The TP 2 chain
+  (``--fsdp-tp 2``) runs in the extended matrix.
 * ``MambaMixer.sharded_state_dict`` at tensor-parallel sizes 1 and 2 (split
   factories applied): the parts of ``in_proj.weight`` and of the convolution's
   weight and bias, their names, order, global and local sizes, are the
@@ -27,6 +33,8 @@ need more ranks than the world has are skipped.
 from __future__ import annotations
 
 import argparse
+import os
+from functools import partial
 
 import pytest
 import torch
@@ -46,6 +54,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.context import build_arch_context
 from tools.checkpoint.format_converter.core.keys import EXTRA_STATE
@@ -56,15 +65,22 @@ from tools.checkpoint.format_converter.core.structure import compose, decompose
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 
 from .._real_harness import (
+    CHAIN_CHECKS,
     HYBRID_HIDDEN,
+    MOE_CONFIG,
     Utils,
+    build_hybrid,
     hybrid_provider,
     main_layers,
     nccl_skip_reason,
     randomize_parameters,
+    run_chain,
+    set_format,
+    set_moe_format,
 )
 
-pytestmark = [pytest.mark.covers("mamba2", "parity")]
+pytestmark = [pytest.mark.covers("mamba2", "parity"), pytest.mark.covers("mamba2", "real_save")]
+EXTENDED = os.environ.get("MCORE_FORMAT_CONVERTER_EXTENDED") == "1"
 PATTERN = "M*M-"
 MAMBA = {"mamba_num_heads": 8, "mamba_head_dim": 8, "mamba_num_groups": 2, "mamba_state_dim": 16}
 """TransformerConfig (and argument) fields of the tiny mixers: d = 64, GN = 32, H = 8."""
@@ -95,6 +111,59 @@ def _args(tp: int, **mamba) -> ArgsView:
             **{**MAMBA, **mamba},
         )
     )
+
+
+@pytest.fixture(name="shared_dir")
+def fixture_shared_dir(request):
+    """The root conftest's directory shared by all ranks (absent under ``--confcutdir``)."""
+    try:
+        return request.getfixturevalue("tmp_path_dist_ckpt")
+    except pytest.FixtureLookupError:
+        pytest.skip("needs the root tests/unit_tests/conftest.py (run without --confcutdir)")
+
+
+def _configure(args, *, pattern: str, fsdp: bool, bf16: bool = True) -> None:
+    """A job of a tiny Mamba-2 hybrid model of ``pattern`` (default stack spec, :data:`MAMBA`
+    mixers; one routed-expert module per ``E``)."""
+    if "E" in pattern:
+        set_moe_format(args, fsdp=fsdp, grouped=False, ep=1, pattern=pattern, bf16=bf16)
+    else:
+        set_format(args, fsdp=fsdp, pattern=pattern, bf16=bf16)
+    args.spec = None
+    for name, value in MAMBA.items():
+        setattr(args, name, value)
+
+
+def _chain(shared_dir, name: str, *, tp: int, pattern: str) -> dict[str, list[str]]:
+    """:func:`run_chain` of a tiny Mamba-2 hybrid model of ``pattern`` at ``tp``."""
+    _initialize(tp)
+    config = {**MAMBA, **(MOE_CONFIG if "E" in pattern else {})}
+    with TempNamedDir(shared_dir / name) as root:
+        return run_chain(
+            root,
+            tp=tp,
+            build=partial(build_hybrid, tp=tp, pattern=pattern, **config),
+            configure=partial(_configure, pattern=pattern),
+            buffers="E" in pattern,
+            options={"fsdp_tp": tp},
+        )
+
+
+class TestMambaChains:
+    """Mamba-2 hybrid models through Megatron's saves and strict loads."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("pattern", ["M*-", "M*E"])
+    def test_mamba_hybrid(self, shared_dir, pattern):
+        findings = _chain(shared_dir, f"fc_mamba_{pattern[-1]}", tp=1, pattern=pattern)
+        assert findings == {check: [] for check in CHAIN_CHECKS}
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    def test_mamba_hybrid_at_two_ranks(self, shared_dir):
+        findings = _chain(shared_dir, "fc_mamba_tp2", tp=2, pattern="M*-")
+        assert findings == {check: [] for check in CHAIN_CHECKS}
 
 
 def _sharded_tensors(sharded_state_dict) -> list[ShardedTensor]:

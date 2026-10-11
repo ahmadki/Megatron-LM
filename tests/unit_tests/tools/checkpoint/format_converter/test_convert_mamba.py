@@ -21,13 +21,19 @@ import pytest
 import torch
 
 from tools.checkpoint.format_converter.api import plan_conversion, verify_checkpoint
+from tools.checkpoint.format_converter.core import mixers
+from tools.checkpoint.format_converter.core.mixers import FusedProjection
+from tools.checkpoint.format_converter.core.names import TORCH_DIST
+from tools.checkpoint.format_converter.core.part_layout import PartLayout, pack_copies
 from tools.checkpoint.format_converter.options import PlanOptions, VerifyOptions
+from tools.checkpoint.format_converter.rules import mixers as mixer_rules
 
 from ._synthetic import (
     dim0_grid,
     hybrid_args,
     mamba_fsdp_names,
     mamba_hybrid_tensors,
+    mamba_mixer_tensors,
     pack_by_ranks,
     packed_projections,
     torch_dist_parts,
@@ -35,6 +41,7 @@ from ._synthetic import (
 )
 from .test_convert_blocks import ITER, expect_fsdp_store, grid_of, run, write_gpt_source
 from .test_convert_cross import read_items
+from .test_convert_gdp import archetype, archetype_args
 from .test_convert_glu import assert_store, to_fsdp, to_torch_dist
 
 pytestmark = pytest.mark.covers("mamba2", "ground_truth")
@@ -274,3 +281,72 @@ def test_one_ranks_shard_of_the_per_head_parameters_is_refused(tmp_path, capsys)
         "error: FC-R10: decoder[0].mixer: A_log (2,), but a Mamba-2 mixer's A_log and dt_bias have "
         "4 rows, its D 4 or 8 and its norm.weight 8"
     ) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_vision_language_archetype_round_trips(tmp_path, tp):
+    """Every family at once, with Mamba-2 mixers: the pair's mixer is found under its opaque
+    child, the sparse indices map to dense ones, experts split, the vision layers unstack, and
+    both the gated vision linear_fc1 and the mixers' projections are packed at the loading job's
+    size, the convolutions under their fsdp_dtensor names."""
+    fsdp, source, grids = archetype(tp, mamba_mixer_tensors, MIXER)
+    expected = mamba_fsdp_names(fsdp)
+    src = write_gpt_source(
+        tmp_path / "src", source, grids=grids, args=archetype_args(tp, spec=None)
+    )
+    out, report = to_fsdp(tmp_path, src, fsdp_tp=tp)
+    expect_fsdp_store(out, expected)
+    assert "language_model.decoder.layers.3.attn_layer.mixer.conv1d_bias" in expected
+    assert "language_model.decoder.layers.4.attn_layer.mixer.conv1d.bias.C" in source
+    values = derived(report)
+    assert values["mixers"] == {"language_model.decoder": {"mamba2": 3}}
+    assert values["pack_tp"] == tp
+    assert report["claims"]["mamba2"] == 3 * 11  # 5 in_proj and 2 x 3 conv1d parts per mixer
+    back, _ = to_torch_dist(tmp_path, out)
+    assert_store(back, source)
+    assert verify_checkpoint(back, src / ITER, VerifyOptions(expected_diff="D", layout=True)).ok
+
+
+CONVERTER_PARTS = mixers.mamba2_parts
+CONVERTER_TARGET_LID = FusedProjection.target_lid
+"""The converter's functions that the mutations below replace."""
+
+
+def _swapped_z_and_x(d_inner: int, group_state: int, heads: int) -> tuple[PartLayout, PartLayout]:
+    """Mamba-2 parts with ``x`` before ``z`` (a layout that is not MambaMixer's)."""
+    in_proj, conv = CONVERTER_PARTS(d_inner, group_state, heads)
+    return PartLayout(("x", "z", *in_proj.parts[2:]), in_proj.sizes), conv
+
+
+def _aggregated(layout: PartLayout, tp: int, parts, rest):
+    """Each rank's section of the parts' concatenation (an aggregate of components), not its
+    shard of every part: the packing of a converter that slices aggregated sections by rank."""
+    del tp
+    return pack_copies(layout, 1, parts, rest)
+
+
+def _module_names(self: FusedProjection, fmt: str):
+    """The convolution named by its old ``conv1d`` module in fsdp_dtensor too."""
+    del fmt
+    return CONVERTER_TARGET_LID(self, TORCH_DIST)
+
+
+MUTATIONS = {
+    "z/x order swap": (mixers, "mamba2_parts", _swapped_z_and_x),
+    "aggregated-section pack": (mixer_rules, "pack_copies", _aggregated),
+    "wrong conv naming": (FusedProjection, "target_lid", _module_names),
+}
+"""Converters that get one Mamba-2 fact wrong."""
+
+
+@pytest.mark.parametrize("mutation", list(MUTATIONS))
+def test_a_converter_that_gets_the_layout_wrong_fails_these_tests(tmp_path, monkeypatch, mutation):
+    """Each mutation still converts a TP 2 source without error, and the hand-built fsdp_dtensor
+    store catches it."""
+    store = torch_dist_store()
+    args = mamba_args(tensor_model_parallel_size=2, tensor_parallel_num_weight_shards=2)
+    src = write_gpt_source(tmp_path / "src", store, grids=tp_grids(store, 2), args=args)
+    monkeypatch.setattr(*MUTATIONS[mutation])
+    out, _ = to_fsdp(tmp_path, src, fsdp_tp=2)
+    with pytest.raises(AssertionError):
+        expect_fsdp_store(out, fsdp_expected(2))

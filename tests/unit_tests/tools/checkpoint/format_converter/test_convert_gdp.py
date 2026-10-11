@@ -269,9 +269,11 @@ EXPERTS = 4
 LANGUAGE_MODEL = "language_model."
 
 
-def archetype_language_model() -> tuple[dict, dict]:
+def archetype_language_model(mixer_tensors=gdp_mixer_tensors, mixer=None) -> tuple[dict, dict]:
     """The archetype's language model as fsdp_dtensor stores it (dense module indices, grouped
-    experts): its mixers' fused projections by part, and every other tensor."""
+    experts): its mixers' fused projections by part, and every other tensor. Its mixers are
+    ``mixer_tensors`` mixers of the dimensions ``mixer`` (Gated DeltaProduct ones of
+    :data:`MIXER` by default)."""
     generator = torch.Generator().manual_seed(41)
     fused: dict = {}
     tensors = {
@@ -282,8 +284,8 @@ def archetype_language_model() -> tuple[dict, dict]:
     for dense, symbols in enumerate(MODULES):
         module = f"decoder.layers.{dense}"
         if "M" in symbols:
-            mixer = f"{module}.attn_layer.mixer" if len(symbols) == 2 else f"{module}.mixer"
-            projections, rest = gdp_mixer_tensors(mixer, seed=10 + dense, **MIXER)
+            path = f"{module}.attn_layer.mixer" if len(symbols) == 2 else f"{module}.mixer"
+            projections, rest = mixer_tensors(path, seed=10 + dense, **(mixer or MIXER))
             fused.update(projections)
             tensors.update(rest)
             if len(symbols) == 2:
@@ -298,12 +300,13 @@ def archetype_language_model() -> tuple[dict, dict]:
     return fused, tensors
 
 
-def archetype(tp: int) -> tuple[dict, dict, dict]:
+def archetype(tp: int, mixer_tensors=gdp_mixer_tensors, mixer=None) -> tuple[dict, dict, dict]:
     """The vision-language archetype: its fsdp_dtensor store packed at ``tp`` (fused mixer
     projections and the gated vision encoder's linear_fc1 packed rank after rank), its torch_dist
     store (sparse decoder indices, stacked experts and vision layers, mixer parts) and that
-    store's grid (one chunk per layer, expert and SwiGLU half)."""
-    fused, language_model = archetype_language_model()
+    store's grid (one chunk per layer, expert and SwiGLU half); with the mixers of
+    :func:`archetype_language_model`, named by their modules (``conv1d.weight``)."""
+    fused, language_model = archetype_language_model(mixer_tensors, mixer)
     fused = {LANGUAGE_MODEL + key: parts for key, parts in fused.items()}
     halves, glu = gated_units(vision_language_tensors(language_model), prefix="vision_model.")
     fsdp = {**packed_units(halves, lambda key: tp), **packed_projections(fused, tp)}
