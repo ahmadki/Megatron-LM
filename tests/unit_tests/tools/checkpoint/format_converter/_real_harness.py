@@ -46,13 +46,14 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -81,6 +82,7 @@ __all__ = [
     "build_llava",
     "build_moe_gpt",
     "build_linear_attention_gpt",
+    "build_mla_mtp_gpt",
     "build_te_gpt",
     "canonical_tensors",
     "convert_store",
@@ -449,6 +451,65 @@ def linear_attention_gpt_provider(
     )
     randomize_parameters(model, seed)
     return model
+
+
+def mla_mtp_gpt_provider(
+    pre_process: bool = True,
+    post_process: bool = True,
+    *,
+    seed: int,
+    mla: Mapping[str, Any] | None = None,
+    **kwargs,
+) -> GPTModel:
+    """A tiny GPT (Transformer Engine spec) with multi-latent attention when ``mla`` gives its
+    ``MLATransformerConfig`` fields (``mla_down_proj_fusion`` among them), and multi-token
+    prediction layers when ``kwargs`` give ``mtp_num_layers`` (the GPT MTP block spec of its
+    layer spec); otherwise as :func:`te_gpt_provider`."""
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    for extra in ("pg_collection", "config", "vp_stage"):
+        kwargs.pop(extra, None)
+    config = (TransformerConfig if mla is None else MLATransformerConfig)(
+        num_layers=GPT_LAYERS,
+        hidden_size=HYBRID_HIDDEN,
+        num_attention_heads=HYBRID_HEADS,
+        use_cpu_initialization=True,
+        **{"add_bias_linear": True, "gated_linear_unit": False, **(mla or {}), **kwargs},
+    )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        multi_latent_attention=mla is not None,
+        mla_down_proj_fusion=bool((mla or {}).get("mla_down_proj_fusion", False)),
+    )
+    mtp_spec = None
+    if config.mtp_num_layers:
+        mtp_spec = get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True)
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        vocab_size=HYBRID_VOCAB,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        share_embeddings_and_output_weights=False,
+        mtp_block_spec=mtp_spec,
+    )
+    randomize_parameters(model, seed)
+    return model
+
+
+def build_mla_mtp_gpt(
+    seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True, **config
+):
+    """A tiny GPT with multi-latent attention or multi-token prediction layers
+    (:func:`mla_mtp_gpt_provider`; classic or Megatron-FSDP v1) with its optimizer."""
+    return setup_model_and_optimizer(
+        seed=seed,
+        tp=tp,
+        pp=1,
+        initialize_fn=partial(mla_mtp_gpt_provider, **config),
+        use_megatron_fsdp=use_megatron_fsdp,
+        bf16=bf16,
+    )
 
 
 def llava_provider(

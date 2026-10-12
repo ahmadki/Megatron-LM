@@ -17,8 +17,13 @@ import pytest
 
 from tools.checkpoint.format_converter.core.format_args import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
-from tools.checkpoint.format_converter.core.keys import SWIGLU_KEYS
-from tools.checkpoint.format_converter.core.names import MTP_INNER_LAYER
+from tools.checkpoint.format_converter.core.keys import (
+    FUSED_MLA_DOWN_PROJ_KEY,
+    LAYER_FAMILIES,
+    MLA_FUSED_DOWN_PROJ,
+    SWIGLU_KEYS,
+)
+from tools.checkpoint.format_converter.core.names import GPT_MTP_INNER_LAYER, MTP_INNER_LAYER
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 
 from .._harness import REPO_ROOT
@@ -33,6 +38,16 @@ TRANSFORMER_CONFIG = REPO_ROOT / "megatron" / "core" / "transformer" / "transfor
 MULTI_TOKEN_PREDICTION = (
     REPO_ROOT / "megatron" / "core" / "transformer" / "multi_token_prediction.py"
 )
+MULTI_LATENT_ATTENTION = (
+    REPO_ROOT / "megatron" / "core" / "transformer" / "multi_latent_attention.py"
+)
+MLA_LAYER_SPECS = (
+    REPO_ROOT / "megatron" / "core" / "models" / "gpt" / "gpt_layer_specs.py",
+    REPO_ROOT / "megatron" / "core" / "models" / "hybrid" / "hybrid_layer_specs.py",
+)
+"""The layer specs that build ``FusedMLASelfAttention`` (GPT, and the hybrid ``+`` layers)."""
+MLA_DOWN_PROJS = ("linear_q_down_proj", "linear_kv_down_proj")
+"""The unfused down-projections of multi-latent attention, as both formats store them."""
 
 FSDP_DTENSOR_HANDLERS = frozenset(
     {
@@ -269,3 +284,71 @@ def test_hybrid_mtp_layers_keep_the_inner_layer_name_in_both_formats():
     ]
     assert ast.unparse(rename.test) == "self.mtp_layer_pattern is None"
     assert f"{MTP_INNER_LAYER}." in ast.unparse(rename.body[0])
+
+
+@pytest.mark.covers("identity", "parity")
+def test_gpt_mtp_layers_store_their_inner_layer_as_transformer_layer_in_both_formats():
+    """torch_dist (``MultiTokenPredictionLayer.sharded_state_dict``) and Megatron-FSDP
+    (``handle_mtp_in_state_dict``) both store a GPT MTP layer's ``mtp_model_layer`` as
+    ``transformer_layer``, model and optimizer state alike."""
+    tree = _module(FSDP_DTENSOR_CHECKPOINT)
+    constants = _string_constants(tree)
+    assert constants["MTP_INNER_LAYER_CHECKPOINT_NAME"] == GPT_MTP_INNER_LAYER
+    assert constants["MTP_INNER_LAYER"] == MTP_INNER_LAYER
+    rename = ast.unparse(_definition(tree, "rename_mtp_inner_layer_keys"))
+    assert "{MTP_INNER_LAYER}." in rename and "{MTP_INNER_LAYER_CHECKPOINT_NAME}." in rename
+    handler = ast.unparse(_definition(tree, "handle_mtp_in_state_dict"))
+    assert "rename_mtp_inner_layer_keys(model_state_dict, mtp_layer_paths)" in handler
+    layer = _definition(_module(MULTI_TOKEN_PREDICTION), "MultiTokenPredictionLayer")
+    mapping = ast.unparse(_definition(layer, "sharded_state_dict"))
+    assert f"{{prefix}}{MTP_INNER_LAYER}.': f'{{prefix}}{GPT_MTP_INNER_LAYER}." in mapping
+
+
+def _top_level_calls(function: ast.AST) -> set[str]:
+    """The calls ``function`` makes as statements of its own body (not under a condition)."""
+    return {
+        ast.unparse(statement.value)
+        for statement in getattr(function, "body", ())
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+    }
+
+
+@pytest.mark.covers("identity", "parity")
+def test_both_formats_store_fused_mla_unfused():
+    """Megatron-FSDP always unfuses ``linear_qkv_down_proj`` (``handle_mla_down_proj_in_state_dict``
+    runs unconditionally) into the two down-projections, and moves the input layer norm it
+    absorbed to the layer's ``input_layernorm``; torch_dist does the same
+    (``FusedMLASelfAttention.sharded_state_dict`` and the fused layer specs' key maps), so MLA
+    converts as identity and only the fused live name is refused (FC-R08)."""
+    tree = _module(FSDP_DTENSOR_CHECKPOINT)
+    assert _string_constants(tree)["MLA_FUSED_DOWN_PROJ"] == MLA_FUSED_DOWN_PROJ
+    (unfused,) = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "MLA_UNFUSED_DOWN_PROJS" for t in node.targets)
+    ]
+    assert ast.literal_eval(unfused) == MLA_DOWN_PROJS
+    absorbed = ast.unparse(_definition(tree, "absorbed_input_layernorm_key"))
+    assert ".input_layernorm." in absorbed
+    preprocess = _definition(_module(CHECKPOINTING), "preprocess_fsdp_dtensor_state_dict")
+    assert "apply(handle_mla_down_proj_in_state_dict)" in _top_level_calls(preprocess)
+    fused = _definition(_module(MULTI_LATENT_ATTENTION), "FusedMLASelfAttention")
+    torch_dist = ast.unparse(_definition(fused, "sharded_state_dict"))
+    for name in MLA_DOWN_PROJS:
+        assert f"{{prefix}}{name}.weight" in torch_dist
+    for path in MLA_LAYER_SPECS:
+        maps = {
+            key.value: value.value
+            for node in ast.walk(_module(path))
+            if isinstance(node, ast.Dict)
+            for key, value in zip(node.keys, node.values)
+            if isinstance(key, ast.Constant) and "_down_proj.layer_norm_" in str(key.value)
+        }
+        assert maps == {
+            f"self_attention.{name}.layer_norm_": "input_layernorm."
+            for name in (*MLA_DOWN_PROJS, MLA_FUSED_DOWN_PROJ)
+        }, f"{path.name} maps the fused MLA's keys otherwise; review the MLA conversion"
+    for name in MLA_DOWN_PROJS:
+        key = f"decoder.layers.0.self_attention.{name}.weight"
+        assert LAYER_FAMILIES["+"].pattern.search(key) and not FUSED_MLA_DOWN_PROJ_KEY.search(key)
