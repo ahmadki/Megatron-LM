@@ -39,7 +39,6 @@ from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
     FACTORY_PART,
     FUSED_MIXER,
-    GDN_PARAM,
     GLU_HALF,
     GROUPED_EXPERT_BIAS,
     LAYER_SEGMENT,
@@ -51,12 +50,11 @@ from .keys import (
     TORCH_DIST_EXPERT_BIAS,
     root_of,
 )
-from .mixers import GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, spec_name
+from .mixers import GDN_VARIANTS, GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, spec_name
 from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P09: "Gated DeltaNet and linear-attention layers",
     errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
     errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
     errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
@@ -66,11 +64,8 @@ PENDING_FAMILIES: Mapping[str, str] = {
 MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
 """Block prefixes of multi-token prediction."""
 
-PENDING_SYMBOLS = frozenset("G+")
-"""Hybrid layer symbols of pending families (Gated DeltaNet, MLA)."""
-
-GDN_VARIANTS = frozenset({"gdn", "gdn2", "gated_delta_net"})
-"""``experimental_attention_variant`` values of the Gated DeltaNet family."""
+PENDING_SYMBOLS = frozenset("+")
+"""Hybrid layer symbols of pending families (MLA)."""
 
 GTP_REMAT_ARGS = ("gtp_weight_remat_size", "expert_gtp_weight_remat_size")
 """Rematerialization sizes that enable grouped tensor parallelism when above 1."""
@@ -93,7 +88,8 @@ SINGLE_GROUPED_ARGS = ("moe_single_grouped_weight", "moe_single_grouped_bias")
 SINGLETON_LOCAL_SHARDS = "singleton_local_shards"
 """The ``content_metadata`` flag of a checkpoint saved one local shard per key."""
 
-REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E", "M")
+REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E", "M", "G")
+REGISTRY.allow(Allowlist.ATTENTION_VARIANTS, *sorted(GDN_VARIANTS))
 REGISTRY.allow(
     Allowlist.STACK_SPECS,
     *(
@@ -108,7 +104,7 @@ REGISTRY.sentinel(
         "parameter_parts",
         TORCH_DIST,
         FACTORY_PART,
-        ("gdp", "mamba2", errors.FC_P09),
+        ("gdn", "gdn2", "gdp", "mamba2"),
         "a parameter stored as parts can only be reassembled by its family's rule",
     )
 )
@@ -126,7 +122,7 @@ REGISTRY.sentinel(
         "fused_mixer_projections",
         FSDP_DTENSOR,
         FUSED_MIXER,
-        ("gdp", "mamba2", errors.FC_P09),
+        ("gdn", "gdn2", "gdp", "mamba2"),
         "a fused mixer projection is packed per tensor-parallel rank and needs its mixer rule",
     )
 )
@@ -346,7 +342,7 @@ def unverified_layers(facts: Facts) -> Iterator[Refusal]:
         )
     variant = facts.args.get("experimental_attention_variant", None)
     allowed = REGISTRY.allowed(Allowlist.ATTENTION_VARIANTS)
-    if variant is not None and variant not in allowed | GDN_VARIANTS:
+    if variant is not None and variant not in allowed:
         yield Refusal(
             errors.FC_R20,
             f"args.experimental_attention_variant={variant!r} has no verified conversion rules",
@@ -500,18 +496,6 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
     refusal = singleton_local_shards_refusal(facts.content_metadata, tuple(sorted(set(keys))))
     if refusal is not None:
         yield refusal
-
-
-@REGISTRY.detector
-def pending_linear_attention(facts: Facts) -> Iterator[Refusal]:
-    """FC-P09: Gated DeltaNet (hybrid symbol G) and linear attention."""
-    evidence = []
-    if "G" in _symbols(facts):
-        evidence.append("hybrid layer symbol G")
-    variant = facts.args.get("experimental_attention_variant", None)
-    if variant in GDN_VARIANTS:
-        evidence.append(f"args.experimental_attention_variant={variant!r}")
-    yield from _pending(errors.FC_P09, evidence, facts.keys_matching(GDN_PARAM))
 
 
 @REGISTRY.detector

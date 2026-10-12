@@ -867,7 +867,9 @@ def gdp_hybrid_tensors(
     """A per-layer hybrid model of ``pattern`` whose ``M`` layers are Gated DeltaProduct mixers of
     the dimensions ``mixer`` (:func:`gdp_mixer_tensors`), with an embedding, a final norm and an
     output layer: its mixers' fused projections by part, and every other tensor."""
-    return mixer_hybrid_tensors(pattern, gdp_mixer_tensors, mixer, hidden=hidden, bias=bias)
+    return mixer_hybrid_tensors(
+        pattern, {"M": mixer_builder(gdp_mixer_tensors, mixer, hidden=hidden, bias=bias)}, hidden
+    )
 
 
 def mamba_mixer_tensors(
@@ -917,7 +919,9 @@ def mamba_hybrid_tensors(
     pattern: str, mixer: Mapping[str, int], *, hidden: int = 8, bias: bool = False
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
     """:func:`gdp_hybrid_tensors` with Mamba-2 mixers (:func:`mamba_mixer_tensors`)."""
-    return mixer_hybrid_tensors(pattern, mamba_mixer_tensors, mixer, hidden=hidden, bias=bias)
+    return mixer_hybrid_tensors(
+        pattern, {"M": mixer_builder(mamba_mixer_tensors, mixer, hidden=hidden, bias=bias)}, hidden
+    )
 
 
 MAMBA_CONV_PARAMETERS = {
@@ -939,16 +943,36 @@ def mamba_fsdp_names(tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Ten
     return renamed
 
 
-def mixer_hybrid_tensors(
-    pattern: str,
+MixerBuilder = Callable[
+    [str, int], tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]
+]
+"""Builds the tensors of one mixer layer under a layer prefix with a seed: its fused projections by
+part and its other tensors."""
+
+
+def mixer_builder(
     mixer_tensors: Callable[..., tuple[dict, dict]],
-    mixer: Mapping[str, int],
+    dims: Mapping[str, Any],
     *,
+    module: str = "mixer",
     hidden: int,
     bias: bool,
+) -> MixerBuilder:
+    """A :data:`MixerBuilder` of ``mixer_tensors`` mixers of the dimensions ``dims`` under the
+    layer's ``module`` (``mixer``, or a Gated DeltaNet's ``self_attention``)."""
+
+    def build(layer: str, seed: int) -> tuple[dict, dict]:
+        return mixer_tensors(f"{layer}.{module}", hidden=hidden, bias=bias, seed=seed, **dims)
+
+    return build
+
+
+def mixer_hybrid_tensors(
+    pattern: str, builders: Mapping[str, MixerBuilder], hidden: int
 ) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
-    """A per-layer hybrid model of ``pattern`` whose ``M`` layers are ``mixer_tensors`` mixers of
-    the dimensions ``mixer``: its mixers' fused projections by part, and every other tensor."""
+    """A per-layer hybrid model of ``pattern`` whose layers of the symbols of ``builders`` are their
+    mixers, with an embedding, a final norm and an output layer: its mixers' fused projections by
+    part, and every other tensor."""
     generator = torch.Generator().manual_seed(31)
     fused: dict[str, dict[str, torch.Tensor]] = {}
     others = {
@@ -958,12 +982,101 @@ def mixer_hybrid_tensors(
     }
     for index, symbol in enumerate(pattern):
         layer = f"decoder.layers.{index}"
-        if symbol == "M":
-            projections, rest = mixer_tensors(
-                f"{layer}.mixer", hidden=hidden, bias=bias, seed=index, **mixer
-            )
+        if symbol in builders:
+            projections, rest = builders[symbol](layer, index)
             fused.update(projections)
             others.update(rest)
         else:
             others.update(hybrid_layer_tensors(layer, symbol, hidden=hidden, seed=index))
     return fused, others
+
+
+GDN_IN_PROJ = {
+    "gdn": (
+        ("query", "qk"),
+        ("key", "qk"),
+        ("value", "v"),
+        ("z", "v"),
+        ("beta", "nvh"),
+        ("alpha", "nvh"),
+    ),
+    "gdn2": (
+        ("query", "qk"),
+        ("key", "qk"),
+        ("value", "v"),
+        ("z", "v"),
+        ("f", "qk"),
+        ("b", "qk"),
+        ("w", "v"),
+    ),
+}
+"""The in_proj components of each Gated DeltaNet, in order, and the size of each, written out from
+``in_proj_split_names``/``in_proj_split_sections`` of ``GatedDeltaNet`` and ``GatedDeltaNet2``:
+``qk`` = key head dim x key heads, ``v`` = value head dim x value heads, ``nvh`` = value heads."""
+GDN_VECTORS = {
+    "gdn": (("A_log", "nvh"), ("dt_bias", "nvh")),
+    "gdn2": (("A_log", "nkh"), ("dt_bias", "qk")),
+}
+"""The rows of each Gated DeltaNet's ``A_log`` and ``dt_bias`` (``a_log_dim``, ``dt_bias_dim``):
+a value head each (GDN), a key head and a key channel (GDN2)."""
+
+
+def gdn_tensors(
+    module: str,
+    *,
+    variant: str = "gdn",
+    key_heads: int,
+    key_dim: int,
+    value_heads: int,
+    value_dim: int,
+    hidden: int = 8,
+    bias: bool = False,
+    seed: int,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """Random tensors of one Gated DeltaNet (``variant`` ``gdn``) or Gated DeltaNet 2 (``gdn2``)
+    under ``module`` (e.g. ``decoder.layers.0.self_attention``).
+
+    Returns its fused projections by part (:data:`GDN_IN_PROJ`; ``conv1d`` is ``query, key,
+    value``), named as torch_dist names them; the convolution has its bias (``conv_bias=True``) and
+    ``in_proj`` has one if ``bias``. Also its other tensors: ``in_proj``'s layer norm, ``A_log`` in
+    float32 and ``dt_bias`` (:data:`GDN_VECTORS`), the output norm (``value_dim`` rows) and
+    ``out_proj``. Weights are bfloat16; every part draws its own values.
+    """
+    sizes = {
+        "qk": key_heads * key_dim,
+        "v": value_heads * value_dim,
+        "nvh": value_heads,
+        "nkh": key_heads,
+    }
+    generator = torch.Generator().manual_seed(seed)
+    in_proj = {part: sizes[size] for part, size in GDN_IN_PROJ[variant]}
+    conv = {"query": sizes["qk"], "key": sizes["qk"], "value": sizes["v"]}
+    leaves = {"in_proj": (("weight", (hidden,)),) + ((("bias", ()),) if bias else ())}
+    leaves["conv1d"] = (("weight", (1, 4)), ("bias", ()))
+    fused = {}
+    for name, parts in (("in_proj", in_proj), ("conv1d", conv)):
+        for leaf, trailing in leaves[name]:
+            fused[f"{module}.{name}.{leaf}"] = {
+                part: torch.randn(rows, *trailing, generator=generator).bfloat16()
+                for part, rows in parts.items()
+            }
+    vectors = dict(GDN_VECTORS[variant])
+    others = {
+        f"{module}.in_proj.layer_norm_weight": torch.randn(hidden, generator=generator).bfloat16(),
+        f"{module}.A_log": torch.randn(sizes[vectors["A_log"]], generator=generator),
+        f"{module}.dt_bias": torch.randn(sizes[vectors["dt_bias"]], generator=generator).bfloat16(),
+        f"{module}.out_norm.weight": torch.randn(value_dim, generator=generator).bfloat16(),
+        f"{module}.out_proj.weight": torch.randn(
+            hidden, sizes["v"], generator=generator
+        ).bfloat16(),
+    }
+    return fused, others
+
+
+def gdn_hybrid_tensors(
+    pattern: str, gdn: Mapping[str, Any], *, hidden: int = 8, bias: bool = False
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, torch.Tensor]]:
+    """:func:`gdp_hybrid_tensors` with Gated DeltaNet ``G`` layers (:func:`gdn_tensors` of ``gdn``)
+    under ``self_attention``."""
+    build = mixer_builder(gdn_tensors, gdn, module="self_attention", hidden=hidden, bias=bias)
+    return mixer_hybrid_tensors(pattern, {"G": build}, hidden)

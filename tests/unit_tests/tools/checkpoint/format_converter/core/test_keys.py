@@ -17,6 +17,7 @@ from tools.checkpoint.format_converter.core.keys import (
     innermost_layer_key,
     is_fc1_path,
     is_glu_half,
+    is_linear_attention,
     is_swiglu_key,
     join_factory_part,
     join_glu_half,
@@ -352,6 +353,18 @@ def test_swiglu_halves_are_parts_of_first_projections_only():
             "conv1d_bias",
             MixerTensor("mixer", "conv1d", "bias", conv_parameter=True),
         ),
+        (
+            "decoder.layers.0.self_attention.in_proj.weight.beta",
+            "self_attention.in_proj",
+            "weight",
+            MixerTensor("self_attention", "in_proj", "weight"),
+        ),
+        (
+            "decoder.layers.3.attn_layer.self_attention.conv1d.bias",
+            "attn_layer.self_attention.conv1d",
+            "bias",
+            MixerTensor("attn_layer.self_attention", "conv1d", "bias"),
+        ),
     ],
 )
 def test_mixer_tensors_are_named_by_mixer_projection_and_leaf(key, path, leaf, tensor):
@@ -372,10 +385,34 @@ def test_only_a_convolution_is_a_mixer_parameter():
         ("decoder.layers.0.mixer.in_proj.layer_norm_weight", "mixer.in_proj", "layer_norm_weight"),
         ("decoder.layers.0.mixer.out_proj.weight", "mixer.out_proj", "weight"),
         ("decoder.layers.0.mixer.A_log", "mixer", "A_log"),
-        ("decoder.layers.0.self_attention.in_proj.weight", "self_attention.in_proj", "weight"),
         ("decoder.layers.0.mixer.norm.weight", "mixer.norm", "weight"),
+        ("decoder.layers.0.self_attention.A_log", "self_attention", "A_log"),
+        ("decoder.layers.0.self_attention.out_norm.weight", "self_attention.out_norm", "weight"),
+        ("decoder.layers.0.self_attention.conv1d_weight", "self_attention", "conv1d_weight"),
+        (
+            "decoder.layers.0.self_attention.linear_qkv.weight",
+            "self_attention.linear_qkv",
+            "weight",
+        ),
+        ("decoder.layers.0.self_attention.linear_proj.bias", "self_attention.linear_proj", "bias"),
+        (
+            "decoder.layers.0.self_attention.linear_kv_down_proj.weight",
+            "self_attention.linear_kv_down_proj",
+            "weight",
+        ),
+        ("vision_model.decoder.layers.self_attention.linear_qkv.weight", "x", "weight"),
     ],
 )
 def test_other_mixer_tensors_are_no_fused_projections(key, path, leaf):
+    """Only ``in_proj`` and ``conv1d`` of a mixer or a Gated DeltaNet are; standard and
+    multi-latent attention's projections under ``self_attention`` never are, and only Mamba-2's
+    ``mixer`` owns its convolution as ``conv1d_weight``."""
     assert MIXER_TENSOR.search(key) is None
     assert split_mixer_tensor(path, leaf) is None
+
+
+def test_a_gated_deltanets_module_is_linear_attention():
+    assert is_linear_attention("self_attention") and is_linear_attention(
+        "attn_layer.self_attention"
+    )
+    assert not is_linear_attention("mixer") and not is_linear_attention("self_attention.in_proj")

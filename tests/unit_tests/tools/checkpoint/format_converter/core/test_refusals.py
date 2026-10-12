@@ -276,12 +276,6 @@ CASES = {
         errors.FC_R03,
         facts(args={"spec": ["my_package.specs", "gdp_stack_spec"]}),
     ),
-    "P09 symbol": (errors.FC_P09, facts(args={"hybrid_layer_pattern": "G-*-"})),
-    "P09 variant": (errors.FC_P09, facts(args={"experimental_attention_variant": "gdn2"})),
-    "P09 keys": (
-        errors.FC_P09,
-        facts(keys={"decoder.layers.0.self_attention.in_proj.weight": (4 * H, H)}),
-    ),
     "P10 gpt mtp": (errors.FC_P10, facts(args={**GPT_ARGS, "mtp_num_layers": 1})),
     "P10 mla": (errors.FC_P10, facts(args={"multi_latent_attention": True})),
     "P10 symbol": (errors.FC_P10, facts(args={"hybrid_layer_pattern": "+-+-"})),
@@ -330,6 +324,22 @@ def test_every_detector_code_has_a_case():
         errors.FC_R17,
         errors.FC_R20,
     }
+
+
+@pytest.mark.parametrize("variant", [None, "gdn", "gdn2", "gated_delta_net"])
+def test_gated_deltanet_models_pass(variant):
+    """Gated DeltaNet layers (hybrid symbol G, or GPT linear attention) and their keys, under every
+    variant that builds them (``gated_delta_net`` is the deprecated spelling of ``gdn``)."""
+    keys = {
+        "decoder.layers.0.self_attention.in_proj.weight.query": (H, H),
+        "decoder.layers.0.self_attention.conv1d.weight.query": (H, 1, 4),
+    }
+    args = {"hybrid_layer_pattern": "G-*-", "experimental_attention_variant": variant}
+    assert codes(facts(args=args, keys=keys)) == []
+    linear = {**GPT_ARGS, "experimental_attention_variant": variant, "linear_attention_freq": 2}
+    assert codes(facts(args=linear, keys=keys)) == []
+    fsdp = {"decoder.layers.0.self_attention.in_proj.weight": (4 * H, H)}
+    assert codes(facts(args=args, keys=fsdp, source=FSDP_DTENSOR, target=TORCH_DIST)) == []
 
 
 def test_mixture_of_experts_models_pass():
@@ -531,16 +541,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P09, "mixers", hint="later")
+    pending = Refusal(errors.FC_P10, "mla", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P09)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P10)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P09: mixers hint: later",
+        "FC-P10: mla hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

@@ -105,7 +105,7 @@ def test_torch_dist_to_fsdp_context_and_its_log():
         {
             "field": "mixers",
             "value": {},
-            "evidence": "no state-space mixer (mixer.in_proj or mixer.conv1d tensors)",
+            "evidence": "no mixer (in_proj or conv1d of a mixer or a Gated DeltaNet)",
         },
         {"field": "pack_tp", "value": None, "evidence": "no fused tensor to pack per rank"},
         {"field": "pack_etp", "value": None, "evidence": "no fused tensor to pack per rank"},

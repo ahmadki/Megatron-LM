@@ -26,13 +26,14 @@ from tools.checkpoint.format_converter.core.mixers import (
     GDP,
     MAMBA2,
     FusedProjection,
-    _check_vectors,
+    built_family,
     check_tp_bound,
     family_layouts,
     gdn2_parts,
     gdn_parts,
     gdp_parts,
     is_gdp_spec,
+    linear_attention_layers,
     mamba2_parts,
     megatron_fsdp_warnings,
     mixer_layout,
@@ -235,7 +236,7 @@ def test_mixers_of_shortcut_pairs_and_multi_token_prediction_layers():
 def test_no_mixer_no_layout():
     layout, evidence = derive({"decoder.layers.1.self_attention.linear_qkv.weight": (24, 8)})
     assert not layout.families and not layout.projections
-    assert evidence == "no state-space mixer (mixer.in_proj or mixer.conv1d tensors)"
+    assert evidence == "no mixer (in_proj or conv1d of a mixer or a Gated DeltaNet)"
 
 
 def test_torch_dist_parts_must_be_the_specs_family():
@@ -709,9 +710,344 @@ def test_torch_dist_names_no_convolution_conv1d_weight():
     assert found.keys == (f"{MIXER}.conv1d_bias", f"{MIXER}.conv1d_weight")
 
 
-def test_a_family_without_vector_sizes_has_none_checked():
-    """Gated DeltaNet's per-head parameters have no sizes yet: its mixers pass the vector check
-    instead of failing it with a KeyError."""
-    gdn = family_layouts(ArgsView(argparse.Namespace(**MEGATRON_LINEAR_DEFAULTS)))[GDN]
-    assert not isinstance(gdn, str)
-    _check_vectors("decoder[0].mixer", {}, gdn)
+ATTENTION = "decoder.layers.0.self_attention"
+GDN_DIMS = {
+    "linear_key_head_dim": 3,
+    "linear_num_key_heads": 2,
+    "linear_value_head_dim": 2,
+    "linear_num_value_heads": 4,
+}
+"""qk = 3 x 2 = 6, v = 2 x 4 = 8, 2 key heads and 4 value heads."""
+GDN_IN_PROJ = {
+    GDN: {"query": 6, "key": 6, "value": 8, "z": 8, "beta": 4, "alpha": 4},
+    GDN2: {"query": 6, "key": 6, "value": 8, "z": 8, "f": 6, "b": 6, "w": 8},
+}
+"""The in_proj parts of a Gated DeltaNet (36 rows) and a Gated DeltaNet 2 (48 rows) of
+:data:`GDN_DIMS`, written out from ``in_proj_split_names`` and ``in_proj_split_sections``."""
+GDN_CONV = {"query": 6, "key": 6, "value": 8}
+"""Their conv1d parts (20 rows)."""
+GDN_VECTORS = {GDN: {"A_log": 4, "dt_bias": 4}, GDN2: {"A_log": 2, "dt_bias": 6}}
+"""``A_log`` and ``dt_bias`` rows: a value head each (GDN); a key head and a key channel (GDN2)."""
+
+
+def gdn_shapes(
+    parts: bool, *, family=GDN, module=ATTENTION, in_proj_bias: str | None = None
+) -> dict[str, tuple[int, ...]]:
+    """A Gated DeltaNet of :data:`GDN_DIMS` under ``module``: torch_dist parts (``parts``) or
+    fsdp_dtensor whole tensors, with its convolution's bias and ``in_proj_bias`` ``"whole"`` or
+    ``"parts"``."""
+    tensors = [(f"{module}.in_proj.weight", GDN_IN_PROJ[family], (HIDDEN,), parts)]
+    if in_proj_bias is not None:
+        tensors.append((f"{module}.in_proj.bias", GDN_IN_PROJ[family], (), in_proj_bias == "parts"))
+    tensors.append((f"{module}.conv1d.weight", GDN_CONV, (1, 4), parts))
+    tensors.append((f"{module}.conv1d.bias", GDN_CONV, (), parts))
+    shapes: dict[str, tuple[int, ...]] = {}
+    for name, layout, rest, split in tensors:
+        if split:
+            shapes.update({f"{name}.{part}": (rows, *rest) for part, rows in layout.items()})
+        else:
+            shapes[name] = (sum(layout.values()), *rest)
+    shapes.update({f"{module}.{name}": (rows,) for name, rows in GDN_VECTORS[family].items()})
+    shapes[f"{module}.in_proj.layer_norm_weight"] = (HIDDEN,)
+    shapes[f"{module}.out_norm.weight"] = (2,)
+    shapes[f"{module}.out_proj.weight"] = (HIDDEN, 8)
+    return shapes
+
+
+def derive_gdn(shapes, *, source=TORCH_DIST, variant="gdn", **fields):
+    fields = {"spec": None, "experimental_attention_variant": variant, **GDN_DIMS, **fields}
+    return derive(shapes, source=source, **fields)
+
+
+def refused_gdn(shapes, **kwargs):
+    with pytest.raises(RefusedError) as caught:
+        derive_gdn(shapes, **kwargs)
+    assert caught.value.refusal.code == errors.FC_R10
+    return caught.value.refusal
+
+
+@pytest.mark.parametrize(
+    ("variant", "family"),
+    [(None, GDN), ("gdn", GDN), ("gated_delta_net", GDN), ("gdn2", GDN2), ("dsa", GDN)],
+)
+def test_the_variant_builds_the_gated_deltanet(variant, family):
+    """``HybridBlock`` builds its ``gdn2_layer`` iff the variant is ``gdn2`` (else ``gdn_layer``),
+    and so does the GPT linear-attention spec; ``mixer`` modules follow the spec."""
+    args = ArgsView(argparse.Namespace(experimental_attention_variant=variant, spec=None))
+    assert built_family("self_attention", args)[0] == family
+    assert built_family("attn_layer.self_attention", args)[0] == family
+    assert built_family("mixer", args)[0] == MAMBA2
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+@pytest.mark.parametrize(("variant", "family"), [("gdn", GDN), ("gdn2", GDN2)])
+def test_a_gated_deltanet_in_either_format(source, variant, family):
+    shapes = gdn_shapes(source == TORCH_DIST, family=family)
+    layout, evidence = derive_gdn(shapes, source=source, variant=variant)
+    assert layout.families_json() == {"decoder": {family: 1}}
+    expected = {
+        LogicalId("decoder", 0, f"self_attention.{name}", leaf): parts
+        for name, leaf, parts in (
+            ("in_proj", "weight", GDN_IN_PROJ[family]),
+            ("conv1d", "weight", GDN_CONV),
+            ("conv1d", "bias", GDN_CONV),
+        )
+    }
+    assert {
+        lid: dict(zip(fused.parts.parts, fused.parts.sizes))
+        for lid, fused in layout.projections.items()
+    } == expected
+    rows = sum(GDN_IN_PROJ[family].values())
+    name = "Gated DeltaNet" if family == GDN else "Gated DeltaNet 2"
+    assert evidence.startswith(
+        f"args.experimental_attention_variant={variant!r} builds {name} layers; 1 layers stored "
+        + ("as parts" if source == TORCH_DIST else "whole")
+        + f"; qk=6, v=8, key heads=2, value heads=4 (args.linear_*): in_proj {rows} rows, conv1d "
+        "20 rows, the only family whose widths the stored ones match"
+    )
+    fused = layout.of(LogicalId("decoder", 0, "self_attention.in_proj", "weight"))
+    assert fused is not None and fused.kind == f"{name} in_proj/conv1d"
+    assert layout.of(LogicalId("decoder", 0, "self_attention.in_proj", "layer_norm_weight")) is None
+
+
+def test_gated_deltanet_parts_must_be_the_variants():
+    """torch_dist parts name the Gated DeltaNet: GDN2's ``f, b, w`` under a ``gdn`` variant are a
+    contradiction, and so are GDN's ``beta, alpha`` under ``gdn2``."""
+    found = refused_gdn(gdn_shapes(True, family=GDN2), variant="gdn")
+    assert found.message == (
+        "decoder[0].self_attention is a Gated DeltaNet 2 layer by its in_proj parts query, key, "
+        "value, z, f, b, w, but args.experimental_attention_variant='gdn' builds Gated DeltaNet "
+        "layers"
+    )
+    assert found.hint == (
+        "check args.experimental_attention_variant against the model that saved the store"
+    )
+    found = refused_gdn(gdn_shapes(True), variant="gdn2")
+    assert found.message.startswith("decoder[0].self_attention is a Gated DeltaNet layer by its")
+
+
+def test_fsdp_dtensor_widths_tell_the_two_gated_deltanets_apart():
+    """fsdp_dtensor's ``self_attention.in_proj`` names both Gated DeltaNets: the widths the
+    arguments give them (36 and 48 rows) must leave the variant's."""
+    layout, _ = derive_gdn(gdn_shapes(False, family=GDN2), source=FSDP_DTENSOR, variant="gdn2")
+    assert layout.families_json() == {"decoder": {GDN2: 1}}
+    found = refused_gdn(gdn_shapes(False), source=FSDP_DTENSOR, variant="gdn2")
+    assert found.message == (
+        "decoder[0].self_attention: its widths (conv1d.bias 20 rows, conv1d.weight 20 rows, "
+        "in_proj.weight 36 rows) are not what the arguments give Gated DeltaNet 2 layers (qk=6, "
+        "v=8, key heads=2, value heads=4 (args.linear_*): in_proj 48 rows, conv1d 20 rows), which "
+        "args.experimental_attention_variant='gdn2' builds Gated DeltaNet 2 layers; they are what "
+        "the arguments give Gated DeltaNet layers"
+    )
+
+
+def test_gated_deltanet_widths_both_variants_share_are_refused():
+    """With 1-row value heads, 2 key heads of 1 and 4 value heads (qk = 2, v = 4), both in_proj are
+    2 x 2 + 2 x 4 + 2 x 4 = 4 x 2 + 3 x 4 = 20 rows and both conv1d 8: the widths cannot tell."""
+    dims = {
+        "linear_key_head_dim": 1,
+        "linear_num_key_heads": 2,
+        "linear_value_head_dim": 1,
+        "linear_num_value_heads": 4,
+    }
+    store = {f"{ATTENTION}.in_proj.weight": (20, HIDDEN), f"{ATTENTION}.conv1d.weight": (8, 1, 4)}
+    found = refused_gdn(store, source=FSDP_DTENSOR, **dims)
+    assert found.message.startswith(
+        "decoder[0].self_attention: its widths (conv1d.weight 8 rows, in_proj.weight 20 rows) are "
+        "what the arguments give Gated DeltaNet layers (qk=2, v=4, key heads=2, value heads=4 "
+        "(args.linear_*)) and Gated DeltaNet 2 layers alike, so they cannot tell the family"
+    )
+
+
+def test_each_mixer_has_the_family_megatron_builds_at_its_module():
+    """A Gated DeltaProduct stack spec builds its ``G`` layers as Gated DeltaNets: a model may hold
+    both families, as a Mamba-2 hybrid may hold Gated DeltaNet 2 layers (here in a shortcut pair,
+    as fsdp_dtensor stores it)."""
+    shapes = {**mixer_shapes(True), **gdn_shapes(True, module="decoder.layers.1.self_attention")}
+    layout, evidence = derive_gdn(shapes, spec=GDP_SPEC)
+    assert layout.families_json() == {"decoder": {GDN: 1, GDP: 1}}
+    assert layout.families == {("decoder", 0, "mixer"): GDP, ("decoder", 1, "self_attention"): GDN}
+    gdn, gdp = evidence.split(" | ")
+    assert gdn.startswith("args.experimental_attention_variant='gdn' builds Gated DeltaNet layers")
+    assert gdp.startswith(f"args.spec={'.'.join(GDP_SPEC)!r} builds Gated DeltaProduct mixers")
+    pair = "decoder.layers.1.attn_layer.self_attention"
+    shapes = {**mamba_shapes(False), **gdn_shapes(False, family=GDN2, module=pair)}
+    layout, _ = derive_gdn(
+        shapes, source=FSDP_DTENSOR, variant="gdn2", mamba_num_heads=4, **MAMBA_DIMS
+    )
+    assert layout.families == {
+        ("decoder", 0, "mixer"): MAMBA2,
+        ("decoder", 1, "attn_layer.self_attention"): GDN2,
+    }
+
+
+def test_a_family_under_the_other_module_is_refused():
+    """Megatron builds Gated DeltaNets under ``self_attention`` only, and its state-space mixers
+    under ``mixer`` only."""
+    mamba = {
+        key.replace(".mixer.", ".self_attention."): shape
+        for key, shape in mamba_shapes(True).items()
+    }
+    found = refused_gdn(mamba, mamba_num_heads=4, **MAMBA_DIMS)
+    assert found.message == (
+        "decoder[0].self_attention is a Mamba-2 mixer by its in_proj parts z, x, B, C, dt, but "
+        "args.experimental_attention_variant='gdn' builds Gated DeltaNet layers"
+    )
+    found = refused_gdn(gdn_shapes(True, module=MIXER))
+    assert found.message == (
+        "decoder[0].mixer is a Gated DeltaNet layer by its in_proj parts query, key, value, z, "
+        "beta, alpha, but args.spec=None builds Mamba-2 mixers"
+    )
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+def test_a_gated_deltanet_in_proj_bias_is_whole_in_both_formats(source):
+    """``_GDNBase.sharded_state_dict`` splits in_proj.weight and the convolution, not an
+    in_proj.bias (``bias=True``): torch_dist holds it whole, bound to the size it was saved at."""
+    layout, _ = derive_gdn(gdn_shapes(source == TORCH_DIST, in_proj_bias="whole"), source=source)
+    bias = layout.of(LogicalId("decoder", 0, "self_attention.in_proj", "bias"))
+    assert bias is not None and bias.torch_dist_whole
+    assert bias.keys == (f"{ATTENTION}.in_proj.bias",)
+    assert dict(zip(bias.parts.parts, bias.parts.sizes)) == GDN_IN_PROJ[GDN]
+    if source == TORCH_DIST:
+        with pytest.raises(RefusedError) as caught:
+            check_tp_bound(layout, TORCH_DIST, 2, 1)
+        assert caught.value.refusal.message.startswith(
+            "1 Gated DeltaNet layer in_proj.bias tensors (such as "
+            "decoder[0].self_attention.in_proj.bias) are stored whole"
+        )
+    found = refused_gdn(gdn_shapes(True, family=GDN2, in_proj_bias="parts"), variant="gdn2")
+    assert found.message == (
+        "decoder[0].self_attention: torch_dist stores a Gated DeltaNet 2 layer's in_proj.bias "
+        "whole, but the store holds it as parts"
+    )
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+@pytest.mark.parametrize(
+    ("variant", "family", "rows"),
+    [
+        ("gdn", GDN, "A_log and dt_bias have 4 rows"),
+        ("gdn2", GDN2, "A_log has 2 rows and its dt_bias 6"),
+    ],
+)
+def test_a_gated_deltanets_per_head_parameters_are_whole(source, variant, family, rows):
+    """A store that holds one rank's shard of a Gated DeltaNet's A_log or dt_bias cannot be
+    completed (Megatron-FSDP shards them along their partition_dim, so its saves hold them
+    whole)."""
+    shapes = gdn_shapes(source == TORCH_DIST, family=family)
+    shapes[f"{ATTENTION}.dt_bias"] = (GDN_VECTORS[family]["dt_bias"] // 2,)
+    found = refused_gdn(shapes, source=source, variant=variant)
+    name = "Gated DeltaNet" if family == GDN else "Gated DeltaNet 2"
+    assert found.message == (
+        f"decoder[0].self_attention: dt_bias ({GDN_VECTORS[family]['dt_bias'] // 2},), but a "
+        f"{name} layer's {rows} (qk=6, v=8, key heads=2, value heads=4 (args.linear_*))"
+    )
+    assert found.hint.startswith("a store that holds one tensor-parallel rank's shard")
+    assert found.keys == (f"{ATTENTION}.dt_bias",)
+
+
+def test_an_fsdp_dtensor_gated_deltanet_is_never_taken_for_a_state_space_mixer():
+    """fsdp_dtensor's ``self_attention.in_proj`` names only the two Gated DeltaNets: Mamba-2's
+    widths do not count, even when the ``mamba_*`` arguments every namespace carries give it
+    the same ones (8 heads of 1, GN = 2 x 3: in_proj 2 x 8 + 2 x 6 + 8 = 36 rows, conv1d
+    8 + 2 x 6 = 20, a Gated DeltaNet's)."""
+    mamba = {"mamba_num_heads": 8, "mamba_head_dim": 1, "mamba_num_groups": 2, "mamba_state_dim": 3}
+    layouts = family_layouts(ArgsView(argparse.Namespace(**mamba, **GDN_DIMS)))
+    mamba2, gdn = layouts[MAMBA2], layouts[GDN]
+    assert mamba2.widths == gdn.widths == "in_proj 36 rows, conv1d 20 rows"
+    layout, _ = derive_gdn(gdn_shapes(False), source=FSDP_DTENSOR, **mamba)
+    assert layout.families == {("decoder", 0, "self_attention"): GDN}
+
+
+def test_gated_deltanets_of_shortcut_pairs_and_multi_token_prediction_layers():
+    """A ``G`` layer's Gated DeltaNet is found under a pair's child and in an MTP inner layer
+    list, a block of its own."""
+    inner = BlockLayout(
+        "mtp.layers.0.mtp_model_layer", "hybrid_mtp_inner", 1, "per_layer", (0,), ("G",), ""
+    )
+    shapes = {
+        **gdn_shapes(True, module="decoder.layers.1.attn_layer.self_attention"),
+        **gdn_shapes(True, module="mtp.layers.0.mtp_model_layer.layers.0.self_attention"),
+    }
+    layout, _ = derive_gdn(shapes, blocks=(DECODER, inner))
+    assert layout.families == {
+        ("decoder", 1, "attn_layer.self_attention"): GDN,
+        ("mtp.layers.0.mtp_model_layer", 0, "self_attention"): GDN,
+    }
+    assert {lid for lid in layout.projections} == {
+        LogicalId(block, layer, f"{module}.{name}", leaf)
+        for block, layer, module in (
+            ("decoder", 1, "attn_layer.self_attention"),
+            ("mtp.layers.0.mtp_model_layer", 0, "self_attention"),
+        )
+        for name, leaf in (("in_proj", "weight"), ("conv1d", "weight"), ("conv1d", "bias"))
+    }
+
+
+GPT_DECODER = BlockLayout("decoder", "transformer_block", 3, "per_layer", (0, 1, 2), None, "")
+"""A GPT decoder of 3 layers."""
+
+
+@pytest.mark.parametrize(
+    ("variant", "freq", "layer"),
+    [("gdn", 3, 0), ("gdn", 3, 1), ("gated_delta_net", 3, 1), ("gdn2", [0, 1, 0], 1)],
+)
+def test_a_gpt_decoder_holds_gated_deltanets_where_the_arguments_place_them(variant, freq, layer):
+    """``get_linear_attention_pattern``: ``linear_attention_freq`` 3 makes layers 0 and 1 linear
+    attention and layer 2 standard attention; a list marks the linear-attention layers with 1."""
+    family = GDN2 if variant == "gdn2" else GDN
+    shapes = gdn_shapes(True, family=family, module=f"decoder.layers.{layer}.self_attention")
+    layout, _ = derive_gdn(
+        shapes, blocks=(GPT_DECODER,), variant=variant, linear_attention_freq=freq
+    )
+    assert layout.families == {("decoder", layer, "self_attention"): family}
+
+
+@pytest.mark.parametrize(("variant", "freq"), [(None, None), (None, 3), ("gdn", None), ("dsa", 3)])
+def test_a_gpt_decoder_without_linear_attention_arguments_is_refused(variant, freq):
+    """A ``TransformerBlock`` builds Gated DeltaNets only for a Gated DeltaNet variant with
+    ``linear_attention_freq`` (a hybrid stack builds one at every ``G`` whatever the variant)."""
+    found = refused_gdn(
+        gdn_shapes(True), blocks=(GPT_DECODER,), variant=variant, linear_attention_freq=freq
+    )
+    assert found.message == (
+        "decoder[0].self_attention holds a Gated DeltaNet's in_proj and conv1d, but a "
+        "TransformerBlock builds Gated DeltaNet layers only for "
+        "args.experimental_attention_variant 'gated_delta_net' or 'gdn' or 'gdn2' with "
+        "args.linear_attention_freq placing them among its 3 layers, and the arguments give "
+        f"experimental_attention_variant={variant!r}, linear_attention_freq={freq!r}"
+    )
+    assert found.hint == (
+        "check args.experimental_attention_variant and args.linear_attention_freq against the "
+        "model that saved the store"
+    )
+    layout, _ = derive_gdn(gdn_shapes(True), variant=variant, linear_attention_freq=freq)
+    assert layout.families == {("decoder", 0, "self_attention"): GDN}
+
+
+@pytest.mark.parametrize(("freq", "layer"), [(3, 2), (1, 0), ([1, 0, 1], 1), ([1, 1], 0)])
+def test_a_gated_deltanet_at_a_standard_attention_layer_is_refused(freq, layer):
+    """Layer 2 of 3 is standard attention for ``linear_attention_freq`` 3, every layer for 1,
+    and a list that is not one entry per layer places nothing."""
+    module = f"decoder.layers.{layer}.self_attention"
+    found = refused_gdn(
+        gdn_shapes(True, module=module), blocks=(GPT_DECODER,), linear_attention_freq=freq
+    )
+    if isinstance(freq, list) and len(freq) != 3:
+        assert "args.linear_attention_freq placing them among its 3 layers" in found.message
+    else:
+        assert found.message == (
+            f"decoder[{layer}].self_attention holds a Gated DeltaNet's in_proj and conv1d, but "
+            f"args.linear_attention_freq={freq!r} makes layer {layer} of decoder standard "
+            "attention"
+        )
+
+
+def test_the_linear_attention_layers():
+    assert linear_attention_layers(4, 8) == (True, True, True, False) * 2
+    assert linear_attention_layers(1, 2) == (False, False)
+    assert linear_attention_layers([1, 0], 2) == (True, False)
+    assert linear_attention_layers([1, 0], 3) is None
+    for wrong in (None, 0, True, "3"):
+        assert linear_attention_layers(wrong, 2) is None

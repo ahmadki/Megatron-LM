@@ -90,9 +90,6 @@ FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant), or
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
-FC_P09 = "FC-P09"
-"""Pending: Gated DeltaNet and linear-attention layers."""
-
 FC_P10 = "FC-P10"
 """Pending: GPT multi-token prediction or multi-latent attention."""
 

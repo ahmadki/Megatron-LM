@@ -48,9 +48,10 @@ Megatron-FSDP may store the weight and bias of a gated MLP's ``linear_fc1``
 as two SwiGLU halves, ``<name>_w`` and ``<name>_v`` (``linear_fc1.weight<e>_w``
 for a grouped expert): :func:`split_glu_half` names the whole tensor and the
 half, and :data:`SWIGLU_KEYS` are the names it splits. The other way round,
-torch_dist stores the weight and bias of a state-space mixer's fused
-projections (:data:`FUSED_PROJECTION`) as one tensor per component, e.g.
-``mixer.in_proj.weight.V0``, while fsdp_dtensor stores them whole:
+torch_dist stores the weight and bias of the fused projections of a
+state-space mixer or a Gated DeltaNet (:data:`FUSED_PROJECTION`) as one tensor
+per component, e.g. ``mixer.in_proj.weight.V0`` or
+``self_attention.conv1d.weight.query``, while fsdp_dtensor stores them whole:
 :func:`split_factory_part` names the whole tensor and the part.
 """
 
@@ -357,8 +358,18 @@ GLU_HALF = re.compile(r"\.(?:weight|bias)[0-9]*_[wv]$")
 """A SwiGLU half of ``linear_fc1`` (``weight_w``, ``weight3_v``, ``bias_w``): as Megatron-FSDP
 splits it, or as a torch_dist save with ``singleton_local_shards`` names it."""
 
+MIXER_MODULE = "mixer"
+"""The module a state-space mixer layer holds its fused projections in."""
+
+LINEAR_ATTENTION = "self_attention"
+"""The module a Gated DeltaNet layer holds its fused projections in (a state-space mixer layer's
+is :data:`MIXER_MODULE`)."""
+
+MIXER_MODULES = rf"(?:{re.escape(MIXER_MODULE)}|{re.escape(LINEAR_ATTENTION)})"
+"""A regular expression of either module (every pattern of fused projections is built from it)."""
+
 FUSED_MIXER = re.compile(
-    r"\.(?:mixer|self_attention)\."
+    r"\." + MIXER_MODULES + r"\."
     r"(?:in_proj\.(?:weight|bias)|conv1d(?:_weight|_bias|\.weight|\.bias))$"
 )
 """A fused state-space or linear-attention projection as fsdp_dtensor stores it."""
@@ -367,7 +378,7 @@ IN_PROJ, CONV1D = "in_proj", "conv1d"
 """The fused projections of a state-space mixer (and of a Gated DeltaNet): the input projection,
 which concatenates one projection per component, and the depthwise convolution over some of them."""
 
-FUSED_PROJECTION = re.compile(r"(?:^|\.)(?:mixer|self_attention)\.(?:in_proj|conv1d)$")
+FUSED_PROJECTION = re.compile(r"(?:^|\.)" + MIXER_MODULES + r"\.(?:in_proj|conv1d)$")
 """The module path of a fused projection (``<...>.mixer.in_proj``, ``<...>.self_attention.conv1d``).
 Megatron's split factory saves its weight and bias in torch_dist as one tensor per component
 (``mixer.in_proj.weight.z``); fsdp_dtensor stores them whole."""
@@ -408,24 +419,35 @@ def is_fused_projection(path: str) -> bool:
 
 
 MIXER_TENSOR = re.compile(
-    r"(?:^|\.)mixer\.(?:(?:in_proj|conv1d)\.(?:weight|bias)(?:\.[A-Za-z_][A-Za-z0-9_]*)?"
-    r"|conv1d_(?:weight|bias))$"
+    r"(?:^|\.)" + MIXER_MODULES + r"\.(?:in_proj|conv1d)\.(?:weight|bias)"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)?$"
+    r"|(?:^|\.)" + re.escape(MIXER_MODULE) + r"\.conv1d_(?:weight|bias)$"
 )
-"""A fused projection tensor of a state-space mixer, whole or one torch_dist part of it; Mamba-2's
-fsdp_dtensor stores name its convolution ``mixer.conv1d_weight`` and ``mixer.conv1d_bias``."""
+"""A fused projection tensor of a state-space mixer or a Gated DeltaNet, whole or one torch_dist
+part of it; Mamba-2's fsdp_dtensor stores name its convolution ``mixer.conv1d_weight`` and
+``mixer.conv1d_bias``. Standard and multi-latent attention have no ``in_proj`` or ``conv1d``."""
 
-_MIXER_PROJECTION = re.compile(r"(?P<mixer>(?:.+\.)?mixer)\.(?P<projection>in_proj|conv1d)")
-_MIXER_MODULE = re.compile(r"(?:.+\.)?mixer")
+_MIXER_PROJECTION = re.compile(
+    r"(?P<mixer>(?:.+\.)?" + MIXER_MODULES + r")\.(?P<projection>in_proj|conv1d)"
+)
+_MIXER_MODULE = re.compile(r"(?:.+\.)?" + re.escape(MIXER_MODULE))
+_LINEAR_ATTENTION_MODULE = re.compile(r"(?:.+\.)?" + re.escape(LINEAR_ATTENTION))
 _MAMBA_CONV_LEAVES = {"conv1d_weight": "weight", "conv1d_bias": "bias"}
+
+
+def is_linear_attention(mixer: str) -> bool:
+    """Whether the mixer module path ``mixer`` is a Gated DeltaNet's (``<...>.self_attention``)."""
+    return _LINEAR_ATTENTION_MODULE.fullmatch(mixer) is not None
 
 
 @dataclass(frozen=True, slots=True)
 class MixerTensor:
-    """A fused projection tensor of a state-space mixer, by its logical name.
+    """A fused projection tensor of a state-space mixer or a Gated DeltaNet, by its logical name.
 
     Attributes:
         mixer: The module path of the mixer inside its layer (``mixer``, or
-            ``<child>.mixer`` in a shortcut pair).
+            ``<child>.mixer`` in a shortcut pair; a Gated DeltaNet's
+            ``self_attention`` or ``<child>.self_attention``).
         projection: ``in_proj`` or ``conv1d``.
         leaf: ``weight`` or ``bias``.
         conv_parameter: Stored as the mixer's own parameter ``conv1d_weight``
@@ -479,9 +501,6 @@ LEGACY_GROUPED_EXPERTS = re.compile(r"(?:^|\.)mlp\.experts\.weight[12]$")
 
 SINGLETON_EXPERT_SHARD = re.compile(r"(?:^|\.)mlp\.experts\.experts\.(?:0|[1-9][0-9]*)\.")
 """An expert saved with ``singleton_local_shards`` (torch_dist ``experts.experts.<e>.<name>``)."""
-
-GDN_PARAM = re.compile(r"\.self_attention\.(?:in_proj|conv1d)\.")
-"""A projection of a Gated DeltaNet attention (standard attention has ``linear_qkv``)."""
 
 _MLA_PROJECTION = r"self_attention\.(?:linear_q_proj|linear_(?:q|kv|qkv)_(?:down|up)_proj)\."
 

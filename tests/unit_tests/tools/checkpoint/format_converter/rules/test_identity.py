@@ -101,7 +101,7 @@ def test_sentinel_keys_are_declined_with_their_reason():
     assert [instance.inputs for instance in taken] == [(plain,)]
     assert pool.remaining() == [part]
     (reason,) = pool.declined(part.lid)
-    assert reason.startswith("a parameter stored as parts") and "gdp, mamba2, FC-P09" in reason
+    assert reason.startswith("a parameter stored as parts") and "gdn, gdn2, gdp, mamba2" in reason
 
 
 def test_sentinels_apply_to_their_source_format_only():

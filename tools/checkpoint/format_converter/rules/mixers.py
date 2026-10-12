@@ -2,11 +2,14 @@
 
 """The mixer rules: a mixer's fused ``in_proj`` and ``conv1d``, component by component.
 
-torch_dist stores the weight and bias of a state-space mixer's ``in_proj`` and
-``conv1d`` as one TP-canonical tensor per component (Megatron's split factory):
-a Gated DeltaProduct mixer's ``in_proj`` is ``z, V0..V(M-1), K0..K(M-1), Q,
-b0..b(M-1), a`` and its ``conv1d`` ``V0..V(M-1), K0..K(M-1), Q``; a Mamba-2
-mixer's are ``z, x, B, C, dt`` and ``x, B, C``. fsdp_dtensor stores each of
+torch_dist stores the weight and bias of the ``in_proj`` and ``conv1d`` of a
+state-space mixer or a Gated DeltaNet as one TP-canonical tensor per component
+(Megatron's split factory): a Gated DeltaProduct mixer's ``in_proj`` is ``z,
+V0..V(M-1), K0..K(M-1), Q, b0..b(M-1), a`` and its ``conv1d`` ``V0..V(M-1),
+K0..K(M-1), Q``; a Mamba-2 mixer's are ``z, x, B, C, dt`` and ``x, B, C``; a
+Gated DeltaNet's ``query, key, value, z, beta, alpha`` and ``query, key,
+value``; a Gated DeltaNet 2's ``query, key, value, z, f, b, w`` and ``query,
+key, value``. fsdp_dtensor stores each of
 them whole: the tensor-parallel ranks' local tensors one after the other, each
 rank's holding its shard of every component in order (``core/mixers.py``
 derives the components and their sizes from the arguments). A rule takes
@@ -18,8 +21,9 @@ size. At pack size 1 the fused tensor is the parts' concatenation.
 
 The names follow the target format (a Mamba-2 mixer's convolution is its own
 ``conv1d_weight`` and ``conv1d_bias`` in fsdp_dtensor), and a tensor torch_dist
-stores whole (a Mamba-2 ``in_proj.bias``) is copied as is: the context has
-checked that it is packed at the size it was saved at.
+stores whole (an ``in_proj.bias`` of a Mamba-2 mixer or a Gated DeltaNet) is
+copied as is: the context has checked that it is packed at the size it was
+saved at.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from collections.abc import Iterator, Sequence
 
 from ..core.context import ArchContext
 from ..core.logical import LogicalCopy, LogicalId, LogicalOutput, LogicalSlice
-from ..core.mixers import GDP, MAMBA2, FusedProjection
+from ..core.mixers import GDN, GDN2, GDP, MAMBA2, FusedProjection
 from ..core.names import FSDP_DTENSOR, TORCH_DIST
 from ..core.part_layout import pack_copies, unpack_copies
 from ..core.registry import REGISTRY
@@ -77,6 +81,22 @@ class Mamba2Rule(_MixerRule):
 
     name = "mamba2"
     family = MAMBA2
+
+
+@REGISTRY.rule
+class GdnRule(_MixerRule):
+    """Fuse and split the ``in_proj`` and ``conv1d`` weights and biases of Gated DeltaNets."""
+
+    name = "gdn"
+    family = GDN
+
+
+@REGISTRY.rule
+class Gdn2Rule(_MixerRule):
+    """Fuse and split the ``in_proj`` and ``conv1d`` weights and biases of Gated DeltaNet 2s."""
+
+    name = "gdn2"
+    family = GDN2
 
 
 def _outputs(
