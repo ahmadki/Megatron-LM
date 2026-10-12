@@ -501,8 +501,15 @@ SINGLETON_EXPERT_SHARD = re.compile(r"(?:^|\.)mlp\.experts\.experts\.(?:0|[1-9][
 
 _MLA_PROJECTION = r"self_attention\.(?:linear_q_proj|linear_(?:q|kv|qkv)_(?:down|up)_proj)\."
 
-MLA_PARAM = re.compile(r"\." + _MLA_PROJECTION)
-"""A projection of multi-latent attention."""
+MLA_FUSED_DOWN_PROJ = "linear_qkv_down_proj"
+"""The q and kv down-projections of multi-latent attention in one module, as
+``FusedMLASelfAttention`` (``--mla-down-proj-fusion``) builds them (``MLA_FUSED_DOWN_PROJ`` of
+``fsdp_dtensor_checkpoint.py``, pinned by a test). Both formats store them unfused,
+``linear_q_down_proj`` and ``linear_kv_down_proj``, and its absorbed input layer norm as the
+layer's ``input_layernorm``."""
+
+FUSED_MLA_DOWN_PROJ_KEY = re.compile(r"(?:^|\.)self_attention\." + MLA_FUSED_DOWN_PROJ + r"\.")
+"""A tensor of the fused down-projection of multi-latent attention under its live name."""
 
 
 @dataclass(frozen=True, slots=True)

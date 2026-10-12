@@ -39,10 +39,11 @@ from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
     FACTORY_PART,
     FUSED_MIXER,
+    FUSED_MLA_DOWN_PROJ_KEY,
     GLU_HALF,
     GROUPED_EXPERT_BIAS,
     LEGACY_GROUPED_EXPERTS,
-    MLA_PARAM,
+    MLA_FUSED_DOWN_PROJ,
     SINGLE_GROUPED_EXPERTS,
     SINGLETON_EXPERT_SHARD,
     TE_OP_FUSER_MLP,
@@ -61,14 +62,10 @@ from .names import (
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P10: "multi-latent attention",
     errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
     errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
 }
 """Every pending-family code and the family it stands for."""
-
-PENDING_SYMBOLS = frozenset("+")
-"""Hybrid layer symbols of pending families (MLA)."""
 
 GTP_REMAT_ARGS = ("gtp_weight_remat_size", "expert_gtp_weight_remat_size")
 """Rematerialization sizes that enable grouped tensor parallelism when above 1."""
@@ -91,7 +88,7 @@ SINGLE_GROUPED_ARGS = ("moe_single_grouped_weight", "moe_single_grouped_bias")
 SINGLETON_LOCAL_SHARDS = "singleton_local_shards"
 """The ``content_metadata`` flag of a checkpoint saved one local shard per key."""
 
-REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E", "M", "G")
+REGISTRY.allow(Allowlist.HYBRID_SYMBOLS, "*", "-", "E", "M", "G", "+")
 REGISTRY.allow(Allowlist.ATTENTION_VARIANTS, *sorted(GDN_VARIANTS))
 REGISTRY.allow(
     Allowlist.STACK_SPECS,
@@ -334,7 +331,7 @@ def unknown_roots(facts: Facts) -> Iterator[Refusal]:
 def unverified_layers(facts: Facts) -> Iterator[Refusal]:
     """FC-R20: hybrid symbols or attention variants no rule has been verified for."""
     verified = REGISTRY.allowed(Allowlist.HYBRID_SYMBOLS)
-    unverified = sorted(_symbols(facts) - verified - PENDING_SYMBOLS)
+    unverified = sorted(_symbols(facts) - verified)
     if unverified:
         unknown = [s for s in unverified if s not in LAYER_SYMBOLS]
         yield Refusal(
@@ -554,15 +551,37 @@ def _mtp_inner_name_refusal(
 
 
 @REGISTRY.detector
-def pending_multi_latent_attention(facts: Facts) -> Iterator[Refusal]:
-    """FC-P10: multi-latent attention."""
-    evidence = []
-    keys = facts.keys_matching(MLA_PARAM)
-    if facts.args.get("multi_latent_attention", False):
-        evidence.append("args.multi_latent_attention=True")
-    if "+" in _symbols(facts):
-        evidence.append("hybrid layer symbol +")
-    yield from _pending(errors.FC_P10, evidence, tuple(sorted(set(keys))))
+def fused_mla_down_projection(facts: Facts) -> Iterator[Refusal]:
+    """FC-R08: multi-latent attention's fused down-projection under its live name.
+
+    Megatron stores it unfused in both formats (``FusedMLASelfAttention.
+    sharded_state_dict``, ``handle_mla_down_proj_in_state_dict``), so multi-latent
+    attention converts unchanged; a Megatron-FSDP store saved before that
+    handler holds the fused tensor, which no current job requests and no real
+    store is known to pin, so it is refused rather than split.
+    """
+    keys = facts.keys_matching(FUSED_MLA_DOWN_PROJ_KEY)
+    if not keys:
+        return
+    if facts.source == FSDP_DTENSOR:
+        what = (
+            "a Megatron-FSDP store saved before handle_mla_down_proj_in_state_dict: it holds "
+            f"multi-latent attention's fused {MLA_FUSED_DOWN_PROJ}, which current Megatron saves "
+            "and loads unfused (linear_q_down_proj, linear_kv_down_proj and input_layernorm)"
+        )
+        hint = (
+            "load it with the Megatron version that saved it, in a job with "
+            "--mla-down-proj-fusion, save it as torch_dist and convert that"
+        )
+    else:
+        what = (
+            f"torch_dist stores multi-latent attention's {MLA_FUSED_DOWN_PROJ} unfused "
+            "(FusedMLASelfAttention.sharded_state_dict), but the store holds it fused"
+        )
+        hint = "check that the store is a Megatron torch_dist checkpoint"
+    yield Refusal(
+        errors.FC_R08, f"{what} ({len(keys)} model key(s) such as {keys[0]})", keys=keys, hint=hint
+    )
 
 
 @REGISTRY.detector

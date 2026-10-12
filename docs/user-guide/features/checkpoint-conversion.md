@@ -74,7 +74,6 @@ with a pending-family code:
 
 | Code | Family |
 |---|---|
-| `FC-P10` | multi-latent attention |
 | `FC-P11`, `FC-P12` | optimizer state (`--optimizer convert`) |
 
 A `torch_dist` source may have been saved with any tensor-, pipeline- or
@@ -623,6 +622,7 @@ condition of every code.
 | `FC-R05` | grouped expert biases in `fsdp_dtensor` with expert parallelism (Megatron-FSDP keeps their expert-parallel-local indices) |
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
+| `FC-R08` | multi-latent attention's fused down-projection stored under its live name `linear_qkv_down_proj` (a Megatron-FSDP store saved before Megatron stored it unfused) |
 | `FC-R09` | the inner layers of multi-token prediction layers under names no save of the model gives them (both `transformer_layer` and `mtp_model_layer` for GPT MTP layers, `mtp_model_layer` in a GPT `torch_dist` store, `transformer_layer` in a hybrid model) |
 | `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size, or whose pack size the manifest records otherwise; a padded vocabulary that does not divide by `--fsdp-tp`; a state-space mixer whose family the names, the spec and the widths do not tell alike, whose dimensions the arguments do not give, whose `torch_dist` parts are not its family's, whose `A_log`, `dt_bias`, `D` or `norm.weight` is one rank's shard, or whose convolution is stored under both its names; a Gated DeltaNet layer whose variant the names, `--experimental-attention-variant` and the widths do not tell alike, or whose `A_log` or `dt_bias` is one rank's shard; a Gated DeltaNet in a GPT decoder where `--experimental-attention-variant` and `--linear-attention-freq` build none; a Mamba-2 or Gated DeltaNet `in_proj.bias` stored whole in `torch_dist` converted with `--fsdp-tp` other than the source's tensor-parallel size |
 | `FC-R11` | layer indices or layer tensors that contradict the hybrid layer pattern, or a pattern whose shortcut-MoE layers Megatron cannot group |

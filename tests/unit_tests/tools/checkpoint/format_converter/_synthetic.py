@@ -307,10 +307,41 @@ def hybrid_args(pattern: str = "*-|*-", **overrides: Any) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
+MLA_SHAPES = {
+    "input_layernorm.weight": (8,),
+    "self_attention.linear_q_down_proj.weight": (6, 8),
+    "self_attention.linear_q_up_proj.layer_norm_weight": (6,),
+    "self_attention.linear_q_up_proj.weight": (10, 6),
+    "self_attention.linear_kv_down_proj.weight": (6, 8),
+    "self_attention.linear_kv_up_proj.layer_norm_weight": (4,),
+    "self_attention.linear_kv_up_proj.weight": (12, 4),
+    "self_attention.linear_proj.weight": (8, 6),
+}
+"""A multi-latent attention layer's tensors, as both formats name them (``MLASelfAttention``
+with q and kv layer norms; ``FusedMLASelfAttention``'s are saved under these names too): hidden
+8, 2 heads, q LoRA rank 6, kv LoRA rank 4, rotary head dimension 2, qk and v head dimensions 3."""
+
+
+def mla_gpt_tensors(layers: int = 3, hidden: int = 8, ffn: int = 16) -> dict[str, torch.Tensor]:
+    """A GPT model (:func:`gpt_tensors`) whose attention is multi-latent attention
+    (:data:`MLA_SHAPES`, the layer norms float32), one layer per key."""
+    tensors = {
+        k: v for k, v in gpt_tensors(layers, hidden, ffn).items() if "self_attention" not in k
+    }
+    generator = torch.Generator().manual_seed(4321)
+    for layer in range(layers):
+        for name, shape in MLA_SHAPES.items():
+            value = torch.randn(shape, generator=generator)
+            dtype = torch.float32 if "norm" in name else torch.bfloat16
+            tensors[f"decoder.layers.{layer}.{name}"] = value.to(dtype)
+    return tensors
+
+
 def hybrid_tensors(
     pattern: str = "*-*-", hidden: int = 8, ffn: int = 16
 ) -> dict[str, torch.Tensor]:
-    """Random model tensors of a per-layer hybrid model, by model-relative key.
+    """Random model tensors of a per-layer hybrid model, by model-relative key: ``*`` attention,
+    ``+`` multi-latent attention (:data:`MLA_SHAPES`, hidden 8) and MLP layers.
 
     Weights are bfloat16 drawn from a fixed seed; ``decoder.final_norm.weight``
     is float32.
@@ -318,7 +349,9 @@ def hybrid_tensors(
     shapes = {"embedding.word_embeddings.weight": (32, hidden)}
     for index, symbol in enumerate(pattern):
         layer = f"decoder.layers.{index}."
-        if symbol == "*":
+        if symbol == "+":
+            shapes.update({layer + name: shape for name, shape in MLA_SHAPES.items()})
+        elif symbol == "*":
             shapes[layer + "self_attention.linear_qkv.weight"] = (3 * hidden, hidden)
             shapes[layer + "self_attention.linear_qkv.layer_norm_weight"] = (hidden,)
             shapes[layer + "self_attention.linear_proj.weight"] = (hidden, hidden)
@@ -659,14 +692,16 @@ def hybrid_layer_tensors(
 ) -> dict[str, torch.Tensor]:
     """Random tensors of one hybrid layer under ``layer`` (e.g. ``decoder.layers.2``).
 
-    Attention (``*``: fused QKV with its norm, and the output projection), a
-    dense MLP (``-``) or a mixture-of-experts layer (``E``: see
-    :func:`moe_layer_tensors`, grouped expert names without biases); bfloat16
-    weights, float32 norms and router bias.
+    Attention (``*``: fused QKV with its norm, and the output projection),
+    multi-latent attention (``+``: :data:`MLA_SHAPES`, hidden 8), a dense MLP
+    (``-``) or a mixture-of-experts layer (``E``: see :func:`moe_layer_tensors`,
+    grouped expert names without biases); bfloat16 weights, float32 norms and
+    router bias.
     """
     if symbol == "E":
         return moe_layer_tensors(layer, experts, hidden, bias=False, seed=seed)
     shapes = {
+        "+": MLA_SHAPES,
         "*": {
             "self_attention.linear_qkv.weight": (3 * hidden, hidden),
             "self_attention.linear_qkv.layer_norm_weight": (hidden,),

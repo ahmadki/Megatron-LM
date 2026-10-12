@@ -58,6 +58,11 @@ FC_R06 = "FC-R06"
 FC_R07 = "FC-R07"
 """A torch_dist target would lose FP8 delayed-scaling state that its loader requires."""
 
+FC_R08 = "FC-R08"
+"""The store holds multi-latent attention's fused down-projection (``linear_qkv_down_proj``),
+which Megatron stores unfused in both formats (a Megatron-FSDP store saved before
+``handle_mla_down_proj_in_state_dict``)."""
+
 FC_R09 = "FC-R09"
 """The inner layers of multi-token prediction layers are stored under names no save of the model
 gives them (both GPT names in one store, the live name in torch_dist, ``transformer_layer`` in a
@@ -94,9 +99,6 @@ FC_R19 = "FC-R19"
 FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant), or
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
-
-FC_P10 = "FC-P10"
-"""Pending: multi-latent attention."""
 
 FC_P11 = "FC-P11"
 """Pending: converting optimizer state from fsdp_dtensor to torch_dist."""

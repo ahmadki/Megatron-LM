@@ -145,6 +145,20 @@ LIVE_MTP = {"mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight": (3 
 """Inner-layer keys of an MTP layer under the name both formats store (``transformer_layer``) and
 under the live name (``mtp_model_layer``, a legacy Megatron-FSDP store's)."""
 TO_TORCH_DIST = {"source": FSDP_DTENSOR, "target": TORCH_DIST}
+MLA = {"multi_latent_attention": True, "mla_down_proj_fusion": True}
+MLA_KEYS = {
+    "decoder.layers.0.input_layernorm.weight": (H,),
+    "decoder.layers.0.self_attention.linear_q_down_proj.weight": (6, H),
+    "decoder.layers.0.self_attention.linear_kv_down_proj.weight": (6, H),
+    "decoder.layers.0.self_attention.linear_q_up_proj.weight": (10, 6),
+}
+"""Multi-latent attention as both formats store it (unfused, whatever the job fused)."""
+FUSED_MLA = {
+    "decoder.layers.0.self_attention.linear_qkv_down_proj.weight": (12, H),
+    "decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight": (H,),
+}
+"""Its fused down-projection and absorbed input layer norm under their live names (a Megatron-FSDP
+store saved before handle_mla_down_proj_in_state_dict)."""
 FSDP_SWIGLU_KEYS = {
     **{f"decoder.layers.{layer}.mlp.linear_fc1.weight": None for layer in (1, 3)},
     **{
@@ -300,8 +314,11 @@ CASES = {
         errors.FC_R09,
         facts(args={"hybrid_layer_pattern": "*-*-/-", "mtp_num_layers": 1}, keys=CURRENT_MTP),
     ),
-    "P10 mla": (errors.FC_P10, facts(args={"multi_latent_attention": True})),
-    "P10 symbol": (errors.FC_P10, facts(args={"hybrid_layer_pattern": "+-+-"})),
+    "R08 fused mla down projection in fsdp_dtensor": (
+        errors.FC_R08,
+        facts(args=MLA, keys=FUSED_MLA, **TO_TORCH_DIST),
+    ),
+    "R08 fused mla down projection in torch_dist": (errors.FC_R08, facts(args=MLA, keys=FUSED_MLA)),
     "P11 optimizer": (
         errors.FC_P11,
         facts(source=FSDP_DTENSOR, target=TORCH_DIST, optimizer="convert"),
@@ -343,6 +360,7 @@ def test_every_detector_code_has_a_case():
         errors.FC_R05,
         errors.FC_R06,
         errors.FC_R07,
+        errors.FC_R08,
         errors.FC_R09,
         errors.FC_R13,
         errors.FC_R17,
@@ -358,6 +376,23 @@ def test_gpt_mtp_models_pass(source):
     assert codes(facts(args=GPT_MTP, keys=mtp, source=source, target=target)) == []
     vlm = {f"language_model.{key}": shape for key, shape in mtp.items()}
     assert codes(facts(args=GPT_MTP, keys=vlm, source=source, target=target)) == []
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+@pytest.mark.parametrize(
+    "args",
+    [
+        {**GPT_ARGS, **MLA},
+        {**GPT_ARGS, "multi_latent_attention": True},
+        {"hybrid_layer_pattern": "+-*-", **MLA},
+    ],
+    ids=["gpt-fused", "gpt", "hybrid"],
+)
+def test_multi_latent_attention_passes(source, args):
+    """Both formats store MLA unfused (symbol ``+`` of hybrid models too), whether or not the job
+    fused its down-projection."""
+    target = TORCH_DIST if source == FSDP_DTENSOR else FSDP_DTENSOR
+    assert codes(facts(args=args, keys=MLA_KEYS, source=source, target=target)) == []
 
 
 def test_a_legacy_fsdp_gpt_mtp_store_passes():
@@ -596,10 +631,17 @@ def test_mixers_pass_the_fence(args, keys, source):
 
 
 def test_refusals_carry_the_evidence():
-    (refusal,) = detect_refusals(facts(args={"multi_latent_attention": True}))
+    (refusal,) = detect_refusals(facts(optimizer="convert"))
     assert refusal.message == (
-        "not supported yet: multi-latent attention (args.multi_latent_attention=True)"
+        "not supported yet: optimizer state from torch_dist to fsdp_dtensor (--optimizer convert)"
     )
+    (refusal,) = detect_refusals(CASES["R08 fused mla down projection in torch_dist"][1])
+    assert refusal.message == (
+        "torch_dist stores multi-latent attention's linear_qkv_down_proj unfused "
+        "(FusedMLASelfAttention.sharded_state_dict), but the store holds it fused (2 model "
+        "key(s) such as decoder.layers.0.self_attention.linear_qkv_down_proj.layer_norm_weight)"
+    )
+    assert refusal.keys == tuple(sorted(FUSED_MLA))
     (refusal,) = detect_refusals(CASES["R05 grouped biases for fsdp"][1])
     assert refusal.message == (
         "grouped expert biases with args.expert_model_parallel_size=2: Megatron-FSDP names them "
@@ -617,16 +659,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P10, "mla", hint="later")
+    pending = Refusal(errors.FC_P11, "optimizer", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P10)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P11)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P10: mla hint: later",
+        "FC-P11: optimizer hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):
