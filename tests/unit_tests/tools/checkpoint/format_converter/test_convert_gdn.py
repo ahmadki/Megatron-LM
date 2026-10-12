@@ -23,7 +23,10 @@ import pytest
 import torch
 
 from tools.checkpoint.format_converter.api import plan_conversion, verify_checkpoint
+from tools.checkpoint.format_converter.core import mixers
+from tools.checkpoint.format_converter.core.part_layout import PartLayout, pack_copies
 from tools.checkpoint.format_converter.options import PlanOptions, VerifyOptions
+from tools.checkpoint.format_converter.rules import mixers as mixer_rules
 
 from ._synthetic import (
     dim0_grid,
@@ -42,6 +45,7 @@ from ._synthetic import (
 )
 from .test_convert_blocks import ITER, expect_fsdp_store, grid_of, run, write_gpt_source
 from .test_convert_cross import read_items
+from .test_convert_gdp import ARCHETYPE, archetype, archetype_args
 from .test_convert_glu import assert_store, to_fsdp, to_torch_dist
 
 pytestmark = [pytest.mark.covers("gdn", "ground_truth"), pytest.mark.covers("gdn2", "ground_truth")]
@@ -370,3 +374,94 @@ def test_a_gpt_model_the_arguments_build_no_linear_attention_for_is_refused(
         "a TransformerBlock builds Gated DeltaNet layers only for "
         "args.experimental_attention_variant"
     ) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_vision_language_archetype_round_trips(tmp_path, tp):
+    """Every family at once, with Gated DeltaNet ``G`` layers: the pair's Gated DeltaNet is found
+    under its opaque child, the sparse indices map to dense ones, experts split, the vision layers
+    unstack, and both the gated vision linear_fc1 and the Gated DeltaNets' projections are packed
+    at the loading job's size."""
+    fsdp, source, grids = archetype(tp, gdn_tensors, GDN, module="self_attention")
+    args = archetype_args(tp, ARCHETYPE.replace("M", "G"), spec=None, **LINEAR)
+    src = write_gpt_source(tmp_path / "src", source, grids=grids, args=args)
+    out, report = to_fsdp(tmp_path, src, fsdp_tp=tp)
+    expect_fsdp_store(out, fsdp)
+    assert "language_model.decoder.layers.3.attn_layer.self_attention.in_proj.weight" in fsdp
+    assert "language_model.decoder.layers.4.attn_layer.self_attention.conv1d.bias.key" in source
+    values = derived(report)
+    assert values["mixers"] == {"language_model.decoder": {"gdn": 3}}
+    assert values["pack_tp"] == tp
+    assert report["claims"]["gdn"] == 3 * 12  # 6 in_proj and 2 x 3 conv1d parts per layer
+    back, _ = to_torch_dist(tmp_path, out)
+    assert_store(back, source)
+    options = VerifyOptions(expected_diff="D", layout=True)
+    assert verify_checkpoint(back, src / ITER, options).ok
+
+
+CONVERTER_PARTS = mixers.gdn_parts
+CONVERTER_BUILT_FAMILY = mixers.built_family
+"""The converter's functions that the mutations below replace."""
+
+
+def _swapped_value_and_z(qk: int, v: int, value_heads: int) -> tuple[PartLayout, PartLayout]:
+    """Gated DeltaNet parts with ``z`` before ``value`` (a layout that is not GatedDeltaNet's)."""
+    in_proj, conv = CONVERTER_PARTS(qk, v, value_heads)
+    order = ("query", "key", "z", "value", "beta", "alpha")
+    assert set(order) == set(in_proj.parts)
+    return PartLayout(order, in_proj.sizes), conv
+
+
+def _aggregated(layout: PartLayout, tp: int, parts, rest):
+    """Each rank's section of the parts' concatenation (an aggregate of components), not its
+    shard of every part: the packing of a converter that slices aggregated sections by rank."""
+    del tp
+    return pack_copies(layout, 1, parts, rest)
+
+
+MUTATIONS = {
+    "part-order swap": (mixers, "gdn_parts", _swapped_value_and_z),
+    "aggregated-section pack": (mixer_rules, "pack_copies", _aggregated),
+}
+"""Converters that get one Gated DeltaNet fact wrong and still convert."""
+
+
+@pytest.mark.parametrize("mutation", list(MUTATIONS))
+def test_a_converter_that_gets_the_layout_wrong_fails_these_tests(tmp_path, monkeypatch, mutation):
+    """Each mutation still converts a TP 2 source without error, and the hand-built fsdp_dtensor
+    store catches it."""
+    store = torch_dist_store()
+    src = write_gpt_source(tmp_path / "src", store, grids=tp_grids(store, 2), args=tp_args(2))
+    monkeypatch.setattr(*MUTATIONS[mutation])
+    out, _ = to_fsdp(tmp_path, src, fsdp_tp=2)
+    with pytest.raises(AssertionError):
+        expect_fsdp_store(out, fsdp_expected(2))
+
+
+def _other_variant(mixer: str, args):
+    """The family of the other Gated DeltaNet (Gated DeltaNet 2 for Gated DeltaNet)."""
+    family, reason = CONVERTER_BUILT_FAMILY(mixer, args)
+    return {"gdn": "gdn2", "gdn2": "gdn"}.get(family, family), reason
+
+
+@pytest.mark.parametrize("variant", ["gdn", "gdn2"])
+@pytest.mark.parametrize("source", ["torch_dist", "fsdp_dtensor"])
+def test_a_converter_that_confuses_the_two_gated_deltanets_is_refused(
+    tmp_path, monkeypatch, capsys, variant, source
+):
+    """A converter that takes one Gated DeltaNet for the other never converts: torch_dist parts
+    name the variant, and fsdp_dtensor widths (48 against 72 rows) leave only the variant's."""
+    fused, others = gdn_hybrid_tensors(PATTERN, {**GDN, "variant": variant})
+    args = gdn_args(experimental_attention_variant=None if variant == "gdn" else "gdn2")
+    if source == "torch_dist":
+        store = write_gpt_source(tmp_path / "src", torch_dist_store(fused, others), args=args)
+    else:
+        args.ckpt_format = "fsdp_dtensor"
+        store = write_fsdp_store(
+            tmp_path / "fsdp" / ITER, fsdp_expected(1, fused, others), args=args
+        )
+    target = "fsdp_dtensor" if source == "torch_dist" else "torch_dist"
+    assert run("plan", store, "--to", target) == 0
+    monkeypatch.setattr(mixers, "built_family", _other_variant)
+    assert run("plan", store, "--to", target) == 3
+    assert "error: FC-R10: decoder[0].self_attention" in capsys.readouterr().err

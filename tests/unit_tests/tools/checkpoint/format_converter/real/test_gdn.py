@@ -1,7 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Gated DeltaNets (GDN and GDN2) against Megatron's own modules.
+"""Gated DeltaNets (GDN and GDN2) against Megatron's own modules, saves and loads.
 
+* T3 real-save chains (``run_chain`` in ``_real_harness.py``) at TP 1 of
+  hybrid models of Gated DeltaNet and Gated DeltaNet 2 layers (``G*-``) and of
+  a GPT model whose linear-attention layers are Gated DeltaNets: Megatron saves
+  and strictly loads every store in both formats, every parameter must equal
+  model A's after each load, and every store is checked against a real save
+  under its contract (A, B, C, D). The TP 2 chains (``--fsdp-tp 2``: Megatron-FSDP
+  shards a Gated DeltaNet's ``A_log`` and ``dt_bias`` along their
+  ``partition_dim``, so a TP 2 job holds them whole), a Gated DeltaNet 2 GPT
+  model and a ``G*E`` hybrid with a mixture-of-experts layer run in the
+  extended matrix.
 * ``GatedDeltaNet.sharded_state_dict`` and ``GatedDeltaNet2``'s at
   tensor-parallel sizes 1 and 2 (split factories applied), built with
   ``bias=True`` and ``conv_bias=True``: the parts of ``in_proj.weight`` and of
@@ -29,6 +39,8 @@ Runs only in the Megatron container with GPUs and flash-linear-attention
 from __future__ import annotations
 
 import argparse
+import os
+from functools import partial
 
 import pytest
 import torch
@@ -46,6 +58,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_GDN2, GatedDeltaNet, GatedDeltaNet2
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.context import build_arch_context
 from tools.checkpoint.format_converter.core.keys import EXTRA_STATE
@@ -56,9 +69,13 @@ from tools.checkpoint.format_converter.core.structure import compose, decompose
 from tools.checkpoint.format_converter.engine.metadata import TensorEntry
 
 from .._real_harness import (
+    CHAIN_CHECKS,
     GPT_LAYERS,
     HYBRID_HIDDEN,
+    MOE_CONFIG,
     Utils,
+    build_hybrid,
+    build_linear_attention_gpt,
     canonical_tensors,
     gathered_ranks,
     hybrid_provider,
@@ -67,10 +84,19 @@ from .._real_harness import (
     main_layers,
     randomize_parameters,
     rank_major_pack,
+    run_chain,
+    set_format,
+    set_moe_format,
     sharded_tensors,
 )
 
-pytestmark = [pytest.mark.covers("gdn", "parity"), pytest.mark.covers("gdn2", "parity")]
+pytestmark = [
+    pytest.mark.covers("gdn", "parity"),
+    pytest.mark.covers("gdn2", "parity"),
+    pytest.mark.covers("gdn", "real_save"),
+    pytest.mark.covers("gdn2", "real_save"),
+]
+EXTENDED = os.environ.get("MCORE_FORMAT_CONVERTER_EXTENDED") == "1"
 NEEDS_GDN2 = pytest.mark.skipif(not HAVE_FLA_GDN2, reason="GatedDeltaNet2 needs fla.ops.gdn2")
 FAMILIES = [GDN, pytest.param(GDN2, marks=NEEDS_GDN2)]
 PATTERN = "G*G-"
@@ -109,6 +135,120 @@ def _args(tp: int, variant: str | None, **fields) -> ArgsView:
             **{**LINEAR, **fields},
         )
     )
+
+
+@pytest.fixture(name="shared_dir")
+def fixture_shared_dir(request):
+    """The root conftest's directory shared by all ranks (absent under ``--confcutdir``)."""
+    try:
+        return request.getfixturevalue("tmp_path_dist_ckpt")
+    except pytest.FixtureLookupError:
+        pytest.skip("needs the root tests/unit_tests/conftest.py (run without --confcutdir)")
+
+
+def _set_linear(args, variant: str | None) -> None:
+    """The Gated DeltaNet arguments of a job: its variant and :data:`LINEAR` dimensions."""
+    args.experimental_attention_variant = variant
+    for name, value in LINEAR.items():
+        setattr(args, name, value)
+
+
+def _configure_hybrid(args, *, fsdp: bool, pattern: str, variant, bf16: bool = True) -> None:
+    """A job of a tiny hybrid model of ``pattern`` (default stack spec, :data:`LINEAR` Gated
+    DeltaNets of ``variant``; one routed-expert module per ``E``)."""
+    if "E" in pattern:
+        set_moe_format(args, fsdp=fsdp, grouped=False, ep=1, pattern=pattern, bf16=bf16)
+    else:
+        set_format(args, fsdp=fsdp, pattern=pattern, bf16=bf16)
+    args.spec = None
+    _set_linear(args, variant)
+
+
+def _configure_gpt(args, *, fsdp: bool, variant: str, bf16: bool = True) -> None:
+    """A job of the tiny linear-attention GPT model (Gated DeltaNets of ``variant`` in layers 0
+    and 1)."""
+    set_format(args, fsdp=fsdp, bf16=bf16)
+    _set_linear(args, variant)
+    args.linear_attention_freq = LINEAR_ATTENTION_FREQ
+
+
+def _hybrid_chain(shared_dir, name: str, *, tp: int, pattern: str, family: str):
+    """:func:`run_chain` of a tiny hybrid model of ``pattern`` whose ``G`` layers are ``family``'s
+    Gated DeltaNets, at ``tp``."""
+    initialize_tensor_parallel(tp)
+    variant = VARIANTS[family]
+    config = {
+        **LINEAR,
+        "experimental_attention_variant": variant,
+        **(MOE_CONFIG if "E" in pattern else {}),
+    }
+    with TempNamedDir(shared_dir / name) as root:
+        return run_chain(
+            root,
+            tp=tp,
+            build=partial(build_hybrid, tp=tp, pattern=pattern, **config),
+            configure=partial(_configure_hybrid, pattern=pattern, variant=variant),
+            buffers="E" in pattern,
+            options={"fsdp_tp": tp},
+        )
+
+
+def _gpt_chain(shared_dir, name: str, *, tp: int, variant: str):
+    """:func:`run_chain` of the tiny linear-attention GPT model at ``tp``."""
+    initialize_tensor_parallel(tp)
+    config = {
+        **LINEAR,
+        "experimental_attention_variant": variant,
+        "linear_attention_freq": LINEAR_ATTENTION_FREQ,
+    }
+    with TempNamedDir(shared_dir / name) as root:
+        return run_chain(
+            root,
+            tp=tp,
+            build=partial(build_linear_attention_gpt, tp=tp, **config),
+            configure=partial(_configure_gpt, variant=variant),
+            options={"fsdp_tp": tp},
+        )
+
+
+NO_FINDINGS = {check: [] for check in CHAIN_CHECKS}
+
+
+class TestGdnChains:
+    """Models of Gated DeltaNets through Megatron's saves and strict loads."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("family", FAMILIES)
+    def test_gated_deltanet_hybrid(self, shared_dir, family):
+        assert _hybrid_chain(shared_dir, f"fc_{family}", tp=1, pattern="G*-", family=family) == (
+            NO_FINDINGS
+        )
+
+    def test_gpt_linear_attention(self, shared_dir):
+        assert _gpt_chain(shared_dir, "fc_gdn_gpt", tp=1, variant="gdn") == NO_FINDINGS
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    @pytest.mark.parametrize("family", FAMILIES)
+    def test_gated_deltanet_hybrid_at_two_ranks(self, shared_dir, family):
+        findings = _hybrid_chain(shared_dir, f"fc_{family}_tp2", tp=2, pattern="G*-", family=family)
+        assert findings == NO_FINDINGS
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    def test_gated_deltanet_hybrid_with_experts(self, shared_dir):
+        findings = _hybrid_chain(shared_dir, "fc_gdn_moe", tp=1, pattern="G*E", family=GDN)
+        assert findings == NO_FINDINGS
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    @pytest.mark.parametrize("tp", [1, 2])
+    @NEEDS_GDN2
+    def test_gpt_linear_attention_of_gated_deltanet_2s(self, shared_dir, tp):
+        assert _gpt_chain(shared_dir, f"fc_gdn2_gpt_{tp}", tp=tp, variant="gdn2") == NO_FINDINGS
+
+    @pytest.mark.skipif(not EXTENDED, reason="extended matrix")
+    def test_gpt_linear_attention_at_two_ranks(self, shared_dir):
+        assert _gpt_chain(shared_dir, "fc_gdn_gpt_tp2", tp=2, variant="gdn") == NO_FINDINGS
 
 
 def _module(family: str, seed: int):

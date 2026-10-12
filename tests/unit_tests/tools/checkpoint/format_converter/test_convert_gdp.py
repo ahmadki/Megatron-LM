@@ -269,11 +269,13 @@ EXPERTS = 4
 LANGUAGE_MODEL = "language_model."
 
 
-def archetype_language_model(mixer_tensors=gdp_mixer_tensors, mixer=None) -> tuple[dict, dict]:
+def archetype_language_model(
+    mixer_tensors=gdp_mixer_tensors, mixer=None, module: str = "mixer"
+) -> tuple[dict, dict]:
     """The archetype's language model as fsdp_dtensor stores it (dense module indices, grouped
     experts): its mixers' fused projections by part, and every other tensor. Its mixers are
     ``mixer_tensors`` mixers of the dimensions ``mixer`` (Gated DeltaProduct ones of
-    :data:`MIXER` by default)."""
+    :data:`MIXER` by default) under their layer's ``module``."""
     generator = torch.Generator().manual_seed(41)
     fused: dict = {}
     tensors = {
@@ -282,31 +284,33 @@ def archetype_language_model(mixer_tensors=gdp_mixer_tensors, mixer=None) -> tup
         "output_layer.weight": torch.randn(32, 8, generator=generator).bfloat16(),
     }
     for dense, symbols in enumerate(MODULES):
-        module = f"decoder.layers.{dense}"
+        layer = f"decoder.layers.{dense}"
         if "M" in symbols:
-            path = f"{module}.attn_layer.mixer" if len(symbols) == 2 else f"{module}.mixer"
+            path = f"{layer}.attn_layer.{module}" if len(symbols) == 2 else f"{layer}.{module}"
             projections, rest = mixer_tensors(path, seed=10 + dense, **(mixer or MIXER))
             fused.update(projections)
             tensors.update(rest)
             if len(symbols) == 2:
                 tensors.update(
-                    moe_layer_tensors(f"{module}.moe_layer", EXPERTS, bias=False, seed=dense)
+                    moe_layer_tensors(f"{layer}.moe_layer", EXPERTS, bias=False, seed=dense)
                 )
                 norm = torch.randn(8, generator=generator)
-                tensors[f"{module}.shortcut_pre_mlp_layernorm.weight"] = norm
+                tensors[f"{layer}.shortcut_pre_mlp_layernorm.weight"] = norm
         else:
-            tensors.update(hybrid_module_tensors(module, symbols, seed=100 * dense))
+            tensors.update(hybrid_module_tensors(layer, symbols, seed=100 * dense))
     tensors.update(hybrid_mtp_tensors(("*E",), layers=1, experts=EXPERTS))
     return fused, tensors
 
 
-def archetype(tp: int, mixer_tensors=gdp_mixer_tensors, mixer=None) -> tuple[dict, dict, dict]:
+def archetype(
+    tp: int, mixer_tensors=gdp_mixer_tensors, mixer=None, module: str = "mixer"
+) -> tuple[dict, dict, dict]:
     """The vision-language archetype: its fsdp_dtensor store packed at ``tp`` (fused mixer
     projections and the gated vision encoder's linear_fc1 packed rank after rank), its torch_dist
     store (sparse decoder indices, stacked experts and vision layers, mixer parts) and that
     store's grid (one chunk per layer, expert and SwiGLU half); with the mixers of
     :func:`archetype_language_model`, named by their modules (``conv1d.weight``)."""
-    fused, language_model = archetype_language_model(mixer_tensors, mixer)
+    fused, language_model = archetype_language_model(mixer_tensors, mixer, module)
     fused = {LANGUAGE_MODEL + key: parts for key, parts in fused.items()}
     halves, glu = gated_units(vision_language_tensors(language_model), prefix="vision_model.")
     fsdp = {**packed_units(halves, lambda key: tp), **packed_projections(fused, tp)}
@@ -322,9 +326,11 @@ def archetype(tp: int, mixer_tensors=gdp_mixer_tensors, mixer=None) -> tuple[dic
     return fsdp, source, grids
 
 
-def archetype_args(tp: int, **overrides):
+def archetype_args(tp: int, pattern: str = ARCHETYPE, **overrides):
+    """The archetype's arguments, its language model of ``pattern`` (the Gated DeltaProduct one by
+    default; the same modules with other mixer symbols)."""
     return gdp_args(
-        hybrid_layer_pattern=ARCHETYPE,
+        hybrid_layer_pattern=pattern,
         num_layers=8,
         mtp_num_layers=1,
         moe_shortcut_connection=True,
