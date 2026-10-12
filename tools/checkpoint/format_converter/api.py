@@ -238,6 +238,7 @@ _REPLAYED_OPTIONS = {
     "drop_common_keys": frozenset,
     "unit_bytes": int,
     "optimizer": str,
+    "allow_bf16_masters": bool,
     "allow_roots": tuple,
     "max_output_chunk_bytes": int,
     "allow_missing_fp8_extra_state": bool,
@@ -328,6 +329,8 @@ def convert_checkpoint(src: Path, dst: Path, opts: ConvertOptions) -> ConvertRep
             write_atomic(final_dir / name, payload)
         if opts.copy_sidecars:
             copy_sidecars(plan.sidecars, plan.store.iter_dir, final_dir)
+        for name, payload in plan.extra_files.items():
+            write_atomic(final_dir / name, payload)
         if plan.manifest is not None:
             digest = hashlib.sha256((final_dir / METADATA_FILE).read_bytes()).hexdigest()
             record = plan.manifest.for_output(digest).to_json()

@@ -109,9 +109,6 @@ FC_R21 = "FC-R21"
 type than fp32, where Megatron-FSDP keeps its fp32 main copy (override:
 ``--allow-bf16-masters``)."""
 
-FC_P11 = "FC-P11"
-"""Pending: converting optimizer state from fsdp_dtensor to torch_dist."""
-
 FC_P12 = "FC-P12"
 """Pending: converting optimizer state from torch_dist to fsdp_dtensor."""
 

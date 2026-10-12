@@ -62,8 +62,7 @@ from .names import (
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
-    errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
+    errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor"
 }
 """Every pending-family code and the family it stands for."""
 
@@ -586,7 +585,6 @@ def fused_mla_down_projection(facts: Facts) -> Iterator[Refusal]:
 
 @REGISTRY.detector
 def pending_optimizer(facts: Facts) -> Iterator[Refusal]:
-    """FC-P11 / FC-P12: converting optimizer state (``--optimizer convert``)."""
-    if facts.optimizer == "convert":
-        code = errors.FC_P11 if facts.source == FSDP_DTENSOR else errors.FC_P12
-        yield from _pending(code, ["--optimizer convert"])
+    """FC-P12: converting optimizer state from torch_dist (``--optimizer convert``)."""
+    if facts.optimizer == "convert" and facts.source == TORCH_DIST:
+        yield from _pending(errors.FC_P12, ["--optimizer convert"])

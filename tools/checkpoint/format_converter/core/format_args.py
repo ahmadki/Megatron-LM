@@ -17,6 +17,14 @@ from typing import Any
 WEIGHTS_ONLY_FIELDS: Mapping[str, Any] = {"no_save_optim": True, "no_save_rng": True}
 """Arguments of a store holding model weights only (no optimizer or RNG state)."""
 
+FULLY_RESHARDABLE_FIELDS: Mapping[str, Any] = {
+    "no_save_optim": False,
+    "no_save_rng": True,
+    "dist_ckpt_optim_fully_reshardable": True,
+}
+"""Arguments of a torch_dist store holding model weights and fully reshardable optimizer state
+(no RNG state)."""
+
 FSDP_DTENSOR_FIELDS: Mapping[str, Any] = {"ckpt_format": "fsdp_dtensor", "use_megatron_fsdp": True}
 """Arguments of a Megatron-FSDP v1 fsdp_dtensor store."""
 
@@ -56,6 +64,7 @@ which fsdp_dtensor stores name differently."""
 SANITIZED_FIELDS = frozenset(
     {
         *WEIGHTS_ONLY_FIELDS,
+        *FULLY_RESHARDABLE_FIELDS,
         *FSDP_DTENSOR_FIELDS,
         *SINGLE_STAGE_FIELDS,
         *PATTERN_FIELDS,
@@ -65,4 +74,4 @@ SANITIZED_FIELDS = frozenset(
         EXPERT_FORM_FIELD,
     }
 )
-"""Every argument field a weights-only conversion may change."""
+"""Every argument field a conversion may change."""

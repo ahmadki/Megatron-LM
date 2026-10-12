@@ -249,7 +249,9 @@ class PlanOptions:
         max_host_bytes: Host-memory budget of the whole conversion
             (default: 0.8 x ``MemAvailable``).
         optimizer: ``drop`` optimizer state (weights only) or ``convert`` it
-            (cross-format only; not supported yet).
+            (fsdp_dtensor to torch_dist only).
+        allow_bf16_masters: With ``--optimizer convert``, take trainable
+            tensors stored narrower than fp32 as their masters (upcast exactly).
         allow_roots: Top-level model key prefixes (without the trailing dot)
             to convert as identity although the rules do not know them.
         max_output_chunk_bytes: Largest chunk of an fsdp_dtensor output tensor.
@@ -286,6 +288,7 @@ class PlanOptions:
     writer_threads: int = DEFAULT_WRITER_THREADS
     max_host_bytes: int | None = None
     optimizer: str = "drop"
+    allow_bf16_masters: bool = False
     allow_roots: tuple[str, ...] = ()
     max_output_chunk_bytes: int = DEFAULT_MAX_OUTPUT_CHUNK_BYTES
     allow_missing_fp8_extra_state: bool = False
@@ -313,6 +316,11 @@ class PlanOptions:
         self._check_torch_dist_layout()
         if self.optimizer not in OPTIMIZER_CHOICES:
             raise UsageError(f"--optimizer must be one of {', '.join(OPTIMIZER_CHOICES)}")
+        if self.allow_bf16_masters and self.optimizer != "convert":
+            raise UsageError(
+                "--allow-bf16-masters applies to converted optimizer state",
+                hint="add --optimizer convert, or drop --allow-bf16-masters",
+            )
         roots = tuple(sorted({root.rstrip(".") for root in self.allow_roots}))
         if any(not root for root in roots):
             raise UsageError("--allow-root needs a non-empty key prefix")
@@ -351,6 +359,7 @@ class PlanOptions:
             "unit_bytes": self.unit_bytes,
             "writer_threads": self.writer_threads,
             "optimizer": self.optimizer,
+            "allow_bf16_masters": self.allow_bf16_masters,
             "allow_roots": list(self.allow_roots),
             "max_output_chunk_bytes": self.max_output_chunk_bytes,
             "allow_missing_fp8_extra_state": self.allow_missing_fp8_extra_state,

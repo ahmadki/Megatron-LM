@@ -76,7 +76,7 @@ before anything is read, with a pending code:
 
 | Code | Family |
 |---|---|
-| `FC-P11`, `FC-P12` | optimizer state (`--optimizer convert`) |
+| `FC-P12` | optimizer state from `torch_dist` (`--optimizer convert`) |
 
 A `torch_dist` source may have been saved with any tensor-, pipeline- or
 data-parallel layout: its keys are global, and every stored chunk is read into
@@ -707,8 +707,9 @@ directory, the target iteration and the tracker is ever changed.
 
 ## Limitations and Non-Claims
 
-- **Weights only.** Optimizer state is not converted yet (`FC-P11`,
-  `FC-P12`); resume with `--no-load-optim`.
+- **Optimizer state one way.** `--optimizer convert` converts the optimizer
+  state of an `fsdp_dtensor` store into `torch_dist`; the other way it is not
+  converted yet (`FC-P12`): resume with `--no-load-optim`.
 - **Fused multi-latent attention and Megatron-FSDP.** On current Megatron, a
   Megatron-FSDP job with `--mla-down-proj-fusion` and fp32 parameters cannot
   build its checkpoint state dict (`handle_mla_down_proj_in_state_dict` looks

@@ -104,6 +104,7 @@ def test_output_fields_cover_what_shapes_the_output():
         "unit_bytes": 4 * 2**30,
         "writer_threads": 4,
         "optimizer": "drop",
+        "allow_bf16_masters": False,
         "allow_roots": [],
         "max_output_chunk_bytes": 2**30,
         "allow_missing_fp8_extra_state": False,

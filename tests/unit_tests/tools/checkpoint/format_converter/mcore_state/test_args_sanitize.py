@@ -132,3 +132,24 @@ def test_torch_dist_arguments_without_a_manifest():
         "use_megatron_fsdp": (True, False),
         "no_save_optim": (False, True),
     }
+
+
+def test_torch_dist_arguments_of_a_store_with_optimizer_state():
+    """The store holds fully reshardable optimizer state and no RNG state; a manifest's record of
+    those fields is never restored."""
+    fsdp_args = argparse.Namespace(
+        ckpt_format="fsdp_dtensor",
+        use_megatron_fsdp=True,
+        no_save_optim=None,
+        no_save_rng=False,
+        dist_ckpt_optim_fully_reshardable=False,
+    )
+    restore = {"no_save_optim": True, "dist_ckpt_optim_fully_reshardable": False}
+    result = sanitize_for_torch_dist(fsdp_args, restore, optimizer=True)
+    assert result.changes == {
+        "ckpt_format": ("fsdp_dtensor", "torch_dist"),
+        "use_megatron_fsdp": (True, False),
+        "no_save_optim": (None, False),
+        "no_save_rng": (False, True),
+        "dist_ckpt_optim_fully_reshardable": (False, True),
+    }

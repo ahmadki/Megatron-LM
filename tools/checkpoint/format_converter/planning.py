@@ -16,11 +16,15 @@ Two kinds of conversion are planned here, both weights only:
   rerun state are dropped, and the common state is rewritten for the target
   format with its args sanitized (and, converting back, what the source's
   conversion manifest recorded restored). The plan carries the manifest the
-  converted store gets.
+  converted store gets. With ``--optimizer convert``, an fsdp_dtensor
+  source's optimizer and scheduler state is converted too
+  (``optimizer_plan.py``).
 
 Every refusal, and the host-memory preflight, happens here, before any tensor
 is read. A dry run (``plan``) reads nothing but the metadata and the common
-state: byte items are sized from the metadata, and a common state that only
+state (and, with ``--optimizer convert``, the parameter-group and scheduler
+byte items of the optimizer state, one per parameter and hyperparameter): byte
+items are otherwise sized from the metadata, and a common state that only
 Megatron's codec can decode (FC-E01 on a host without Megatron) is decoded with
 stubs, so the plan is still complete; ``convert`` needs the real codec.
 """
@@ -93,10 +97,19 @@ from .mcore_state.args_sanitize import (
     sanitize_weights_only,
 )
 from .mcore_state.common_state import CodecMode, DecodedCommon, auto_mode, decode, encode
+from .optimizer_plan import (
+    CONTENT_METADATA_FLAGS,
+    OPTIMIZER_SECTIONS,
+    PARAM_GROUP_MAP,
+    OptimizerPlan,
+    plan_optimizer,
+)
 from .options import PlanOptions
 from .sidecars import SidecarPlan, plan_sidecars
 
 KEEP, DROP, REWRITE, CONVERT = "keep", "drop", "rewrite", "convert"
+CONVERT_OPTIMIZER = "convert"
+"""``--optimizer`` value that converts optimizer state."""
 CONTENT_METADATA = "content_metadata"
 
 _LOGGER = logging.getLogger(__name__)
@@ -187,6 +200,10 @@ class ConversionPlan:
         claims: Source model tensors claimed per rule (cross-format conversions).
         manifest: The manifest the converted store gets (cross-format
             conversions), without the output digest.
+        optimizer: What the conversion of the optimizer state planned
+            (``--optimizer convert``).
+        extra_files: Files the converted store gets beside its data files, by
+            name (the parameter-group map of converted optimizer state).
     """
 
     store: Store
@@ -203,6 +220,8 @@ class ConversionPlan:
     context: ArchContext | None = None
     claims: dict[str, int] = field(default_factory=dict)
     manifest: Manifest | None = None
+    optimizer: dict[str, Any] | None = None
+    extra_files: dict[str, bytes] = field(default_factory=dict)
 
     def fingerprint(self, target: PublishTarget) -> str:
         """Identity of this conversion into ``target`` (staging is resumed only on a match).
@@ -269,6 +288,8 @@ class ConversionPlan:
         if self.context is not None:
             summary["derivations"] = self.context.derivation_log()
             summary["claims"] = dict(self.claims)
+        if self.optimizer is not None:
+            summary["optimizer"] = dict(self.optimizer)
         return summary
 
 
@@ -403,8 +424,10 @@ def _plan_rewrite(
 def _plan_cross_format(
     store: Store, detection: Detection, opts: PlanOptions, *, dry_run: bool
 ) -> ConversionPlan:
-    """Plan a weights-only conversion of ``store`` into the other format."""
+    """Plan a conversion of ``store`` into the other format (with ``--optimizer convert``, of its
+    optimizer state too)."""
     source, target = _adapter(detection.fmt), _adapter(opts.to_format)
+    convert_optimizer = opts.optimizer == CONVERT_OPTIMIZER
     view = store.view
     sections = source.sections(view)
     reader = SourceReader(view, max_item_bytes=opts.max_unit_bytes_hard)
@@ -445,35 +468,71 @@ def _plan_cross_format(
         fsdp_etp=opts.fsdp_etp,
         target_swiglu=opts.target_swiglu,
         fsdp_gpt_mtp_inner_name=opts.fsdp_gpt_mtp_inner_name,
+        convert_optimizer=convert_optimizer,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:
         _LOGGER.warning("%s", warning)
-    model_plan = plan_model(
-        ctx,
-        model,
-        target,
-        rules=REGISTRY.rules_for(ctx),
-        max_chunk_bytes=opts.max_output_chunk_bytes,
+    optimizer = None
+    if convert_optimizer:
+        optimizer = plan_optimizer(
+            view,
+            sections,
+            model,
+            ctx,
+            TorchDistAdapter(),
+            reader=reader,
+            mode=decoded.mode,
+            rules=REGISTRY.rules_for(ctx),
+            max_chunk_bytes=opts.max_output_chunk_bytes,
+            allow_bf16_masters=opts.allow_bf16_masters,
+        )
+        pieces, claims = optimizer.pieces, optimizer.claims
+    else:
+        model_plan = plan_model(
+            ctx,
+            model,
+            target,
+            rules=REGISTRY.rules_for(ctx),
+            max_chunk_bytes=opts.max_output_chunk_bytes,
+        )
+        pieces, claims = model_plan.pieces, model_plan.claims
+    common, dropped_common, content_metadata = _cross_format_common(
+        decoded.state, ctx, opts, optimizer
     )
-    common, dropped_common, content_metadata = _cross_format_common(decoded.state, ctx, opts)
-    common, sanitized = _sanitize(common, _cross_format_sanitizer(ctx))
+    common, sanitized = _sanitize(
+        common, _cross_format_sanitizer(ctx, optimizer=optimizer is not None)
+    )
     common_plan, common_pieces = _encode_common(
         common, raw, decoded, target, dropped_common, sanitized, consulted=args.consumed
     )
+    converted = {Section.MODEL}
+    if optimizer is not None:
+        converted |= OPTIMIZER_SECTIONS | {Section.SCHEDULER}
     plan = _finish(
         store,
         detection,
         target,
         opts,
-        list(model_plan.pieces),
+        list(pieces),
         common_pieces,
         common_plan,
         plan_sidecars(view, writes_manifest=True),
-        _section_actions(store, source.fmt, frozenset(), frozenset({Section.MODEL})),
+        _section_actions(store, source.fmt, frozenset(), frozenset(converted)),
     )
-    manifest = _manifest(plan, ctx, content_metadata)
-    return dataclasses.replace(plan, context=ctx, claims=model_plan.claims, manifest=manifest)
+    return dataclasses.replace(
+        plan,
+        context=ctx,
+        claims=claims,
+        manifest=_manifest(plan, ctx, content_metadata),
+        optimizer=None if optimizer is None else optimizer.summary,
+        extra_files={} if optimizer is None else _optimizer_files(optimizer),
+    )
+
+
+def _optimizer_files(optimizer: OptimizerPlan) -> dict[str, bytes]:
+    """The parameter-group map of a store with converted optimizer state."""
+    return {PARAM_GROUP_MAP: json.dumps(optimizer.group_map, indent=2).encode()}
 
 
 def _manifest(plan: ConversionPlan, ctx: ArchContext, content_metadata: dict[str, Any]) -> Manifest:
@@ -533,7 +592,10 @@ def _warn_lost_fp8_state(ctx: ArchContext, sections: Mapping[str, Section]) -> N
 
 
 def _cross_format_common(
-    common: Mapping[str, Any], ctx: ArchContext, opts: PlanOptions
+    common: Mapping[str, Any],
+    ctx: ArchContext,
+    opts: PlanOptions,
+    optimizer: OptimizerPlan | None = None,
 ) -> tuple[dict[str, Any], tuple[str, ...], dict[str, Any]]:
     """The target's common dict, the dropped keys and the ``content_metadata`` record.
 
@@ -541,11 +603,13 @@ def _cross_format_common(
     stores (``content_metadata`` goes to the manifest), and every item the
     fsdp_dtensor loader requires must be there; fsdp_dtensor to torch_dist
     keeps its items and gets the context's ``content_metadata`` (restored
-    from the source's manifest). ``--drop-common-key`` applies in both
-    directions.
+    from the source's manifest), and with converted ``optimizer`` state its
+    parameter groups, scheduler and the fully reshardable flags in
+    ``content_metadata``. ``--drop-common-key`` applies in both directions.
 
     Raises:
-        UsageError: ``--drop-common-key`` names a key the loader requires.
+        UsageError: ``--drop-common-key`` names a key the loader requires (or
+            ``content_metadata`` with converted optimizer state).
         RefusedError: The source's common state lacks an item the
             fsdp_dtensor loader requires (FC-R13).
     """
@@ -565,7 +629,16 @@ def _cross_format_common(
         dropped = tuple(sorted(set(common) - set(kept)))
         return kept, dropped, _content_metadata_record(rewrite.kept)
     kept, dropped = dict(rewrite.kept), set(rewrite.dropped)
-    if ctx.td_content_metadata is not None:
+    if optimizer is not None:
+        if CONTENT_METADATA in opts.drop_common_keys:
+            raise UsageError(
+                f"--optimizer convert writes {CONTENT_METADATA}, which tells Megatron to load the "
+                "optimizer state as fully reshardable",
+                hint=f"drop --drop-common-key {CONTENT_METADATA}",
+            )
+        kept.update(optimizer.common)
+        kept[CONTENT_METADATA] = {**(ctx.td_content_metadata or {}), **CONTENT_METADATA_FLAGS}
+    elif ctx.td_content_metadata is not None:
         kept[CONTENT_METADATA] = dict(ctx.td_content_metadata)
     elif ctx.manifest is not None and ctx.manifest.content_metadata["present"]:
         dropped.add(CONTENT_METADATA)  # --drop-common-key content_metadata
@@ -593,8 +666,11 @@ def _content_metadata_record(common: Mapping[str, Any]) -> dict[str, Any]:
     return {"present": True, "value": value}
 
 
-def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], SanitizedArgs]:
-    """The args sanitation of the target format (restoring the source manifest's originals)."""
+def _cross_format_sanitizer(
+    ctx: ArchContext, *, optimizer: bool
+) -> Callable[[argparse.Namespace], SanitizedArgs]:
+    """The args sanitation of the target format (restoring the source manifest's originals; a
+    torch_dist target with converted ``optimizer`` state says it holds that state)."""
     if ctx.target[0] == FSDP_DTENSOR:
         grouped_gemm = None if ctx.experts is None else ctx.experts.grouped_gemm
         return lambda args: sanitize_for_fsdp_dtensor(
@@ -605,7 +681,7 @@ def _cross_format_sanitizer(ctx: ArchContext) -> Callable[[argparse.Namespace], 
             glu_args=ctx.fsdp_glu_args,
         )
     restore = {} if ctx.manifest is None else ctx.manifest.original_args()
-    return lambda args: sanitize_for_torch_dist(args, restore)
+    return lambda args: sanitize_for_torch_dist(args, restore, optimizer=optimizer)
 
 
 def _sanitize(

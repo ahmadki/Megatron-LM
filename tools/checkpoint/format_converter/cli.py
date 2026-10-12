@@ -320,8 +320,15 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "--optimizer",
         choices=OPTIMIZER_CHOICES,
         default="drop",
-        help="drop: write model weights only (default); convert: convert optimizer state "
-        "(not supported yet, refused with FC-P11/FC-P12)",
+        help="drop: write model weights only (default); convert: convert optimizer and "
+        "scheduler state too (fsdp_dtensor to torch_dist; torch_dist to fsdp_dtensor is refused "
+        "with FC-P12)",
+    )
+    parser.add_argument(
+        "--allow-bf16-masters",
+        action="store_true",
+        help="with --optimizer convert, take trained parameters stored narrower than fp32 in "
+        "the fsdp_dtensor model section as their fp32 masters (upcast exactly; FC-R21 otherwise)",
     )
     parser.add_argument(
         "--allow-root",
@@ -460,6 +467,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "iteration": args.iteration,
         "drop_common_keys": frozenset(args.drop_common_key),
         "optimizer": args.optimizer,
+        "allow_bf16_masters": args.allow_bf16_masters,
         "allow_roots": tuple(args.allow_root),
         "allow_missing_fp8_extra_state": args.allow_missing_fp8_extra_state,
         "ignore_manifest": args.ignore_manifest,

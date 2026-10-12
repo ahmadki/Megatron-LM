@@ -319,12 +319,12 @@ CASES = {
         facts(args=MLA, keys=FUSED_MLA, **TO_TORCH_DIST),
     ),
     "R08 fused mla down projection in torch_dist": (errors.FC_R08, facts(args=MLA, keys=FUSED_MLA)),
-    "P11 optimizer": (
-        errors.FC_P11,
-        facts(source=FSDP_DTENSOR, target=TORCH_DIST, optimizer="convert"),
-    ),
     "P12 optimizer": (errors.FC_P12, facts(optimizer="convert")),
 }
+
+
+def test_optimizer_state_from_fsdp_dtensor_passes_the_fence():
+    assert codes(facts(source=FSDP_DTENSOR, target=TORCH_DIST, optimizer="convert")) == []
 
 
 @pytest.mark.parametrize("case", sorted(CASES))
@@ -659,16 +659,16 @@ def test_refusals_carry_the_evidence():
 
 
 def test_several_refusals_form_one_error():
-    pending = Refusal(errors.FC_P11, "optimizer", hint="later")
+    pending = Refusal(errors.FC_P12, "optimizer", hint="later")
     permanent = Refusal(errors.FC_R20, "symbol D", hint="no")
     ambiguous = Refusal(errors.FC_A05, "from", hint="drop --from")
     error = refusal_error([pending, ambiguous, permanent])
     assert isinstance(error, RefusedError) and error.exit_code == errors.ExitCode.REFUSED
-    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P11)
+    assert error.codes == (errors.FC_R20, errors.FC_A05, errors.FC_P12)
     assert error.format().splitlines() == [
         "FC-R20: symbol D hint: no",
         "FC-A05: from hint: drop --from",
-        "FC-P11: optimizer hint: later",
+        "FC-P12: optimizer hint: later",
     ]
     assert isinstance(refusal_error([ambiguous]), AmbiguousError)
     with pytest.raises(errors.InternalError):

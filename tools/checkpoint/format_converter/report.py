@@ -118,7 +118,8 @@ def render_plan(plan: Mapping[str, Any]) -> str:
     lines = [
         f"source:     {source['iter_dir']} ({source['format']}, {source['dialect']}), "
         f"iteration {source['iteration'] if source['iteration'] is not None else 'unknown'}",
-        f"target:     {target['format']} ({target['dialect']}), model weights only",
+        f"target:     {target['format']} ({target['dialect']}), model weights "
+        + ("and optimizer state" if "optimizer" in plan else "only"),
     ]
     for index, derivation in enumerate(plan.get("derivations", ())):
         label = "derived:" if index == 0 else ""
@@ -129,6 +130,13 @@ def render_plan(plan: Mapping[str, Any]) -> str:
     if "claims" in plan:
         claims = ", ".join(f"{rule} {count}" for rule, count in plan["claims"].items())
         lines.append(f"rules:      model tensors claimed: {claims or 'none'}")
+    if "optimizer" in plan:
+        optimizer = plan["optimizer"]
+        groups = " + ".join(str(count) for count in optimizer["param_groups"])
+        lines.append(
+            f"optimizer:  masters and moments of {optimizer['parameters']} parameter tensors, "
+            f"{groups} parameter groups, {optimizer['dropped_steps']} per-parameter steps dropped"
+        )
     lines.append(f"sections:   {'section':<16} {'action':<8} {'keys':>8}  {'tensor bytes':>12}")
     for section in plan["sections"]:
         size = format_bytes(section["tensor_bytes"]) if section["tensor_bytes"] else "-"

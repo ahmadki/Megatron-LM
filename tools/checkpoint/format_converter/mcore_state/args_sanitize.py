@@ -21,7 +21,9 @@ arguments must therefore describe the store:
 * torch_dist: ``ckpt_format='torch_dist'``, no ``use_megatron_fsdp``; values
   a previous conversion recorded in its manifest are restored, except that
   ``no_save_optim`` and ``no_save_rng`` are never cleared for a store without
-  that state.
+  that state; a store with fully reshardable optimizer state has
+  ``no_save_optim`` cleared and ``dist_ckpt_optim_fully_reshardable`` set (its
+  RNG state is never converted).
 
 Only attributes the arguments already have are changed, and every change is
 reported as ``{field: (old, new)}``. The field values are in ``core/format_args.py``.
@@ -39,6 +41,7 @@ from ..core.args_view import ArgsView
 from ..core.format_args import (
     EXPERT_FORM_FIELD,
     FSDP_DTENSOR_FIELDS,
+    FULLY_RESHARDABLE_FIELDS,
     PACK_ETP_FIELDS,
     PACK_TP_FIELDS,
     PATTERN_FIELDS,
@@ -136,22 +139,27 @@ def _pack_fields(view: ArgsView, fields: tuple[str, str], size: int | None) -> d
 
 
 def sanitize_for_torch_dist(
-    args: argparse.Namespace, restore: Mapping[str, Any] | None = None
+    args: argparse.Namespace, restore: Mapping[str, Any] | None = None, *, optimizer: bool = False
 ) -> SanitizedArgs:
-    """Arguments of a weights-only torch_dist store written from an fsdp_dtensor checkpoint.
+    """Arguments of a torch_dist store written from an fsdp_dtensor checkpoint.
 
     Args:
         args: The fsdp_dtensor store's arguments.
         restore: Original values recorded by the conversion that produced the
-            fsdp_dtensor store (its manifest); ``no_save_optim`` and
-            ``no_save_rng`` are not restored.
+            fsdp_dtensor store (its manifest); the fields that say what the
+            store holds (``no_save_optim``, ``no_save_rng``,
+            ``dist_ckpt_optim_fully_reshardable``) are not restored.
+        optimizer: The store holds fully reshardable optimizer state (else
+            model weights only).
 
     Raises:
         IntegrityError: ``args`` is not a Namespace.
         InternalError: A field to change holds a non-primitive value.
     """
-    restored = {k: v for k, v in (restore or {}).items() if k not in WEIGHTS_ONLY_FIELDS}
-    return _apply(args, {**TORCH_DIST_FIELDS, **restored, **WEIGHTS_ONLY_FIELDS})
+    holds = FULLY_RESHARDABLE_FIELDS if optimizer else WEIGHTS_ONLY_FIELDS
+    kept = {*WEIGHTS_ONLY_FIELDS, *FULLY_RESHARDABLE_FIELDS}
+    restored = {k: v for k, v in (restore or {}).items() if k not in kept}
+    return _apply(args, {**TORCH_DIST_FIELDS, **restored, **holds})
 
 
 def _apply(args: argparse.Namespace, targets: Mapping[str, Any]) -> SanitizedArgs:

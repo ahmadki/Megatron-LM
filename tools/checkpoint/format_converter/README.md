@@ -190,9 +190,11 @@ missing from either side, shapes and dtypes (every mode), and SHA-256 values
 
 ### `plan` and `convert`
 
-`convert` writes model weights only; optimizer, scheduler, RNG and rerun state
-are dropped and reported (converting optimizer state lands later:
-`--optimizer convert` is refused with `FC-P11`/`FC-P12`).
+`convert` writes model weights only by default; optimizer, scheduler, RNG and
+rerun state are dropped and reported. `--optimizer convert` also converts the
+optimizer and scheduler state of an `fsdp_dtensor` store into fully
+reshardable `torch_dist` state (from `torch_dist` it is refused with
+`FC-P12`).
 
 #### Between `torch_dist` and `fsdp_dtensor`
 
@@ -601,7 +603,9 @@ run resumes when the same command is run again.
 `plan SRC --to torch_dist` prints the same decisions (sections kept and dropped,
 the common state, sidecars, units, the memory and disk estimates) from the
 metadata and the common state (byte items are sized from the metadata, not
-read). It exits 3 when `convert` would be refused and 8 when the conversion
+read, except that with `--optimizer convert` it also reads the parameter-group
+and scheduler byte items, `optimizer.param_to_group_meta.*` and
+`opt_param_scheduler.*`). It exits 3 when `convert` would be refused and 8 when the conversion
 exceeds the memory budgets, without writing anything; free disk space is
 checked by `convert`, which knows the destination.
 
@@ -623,7 +627,8 @@ codec) and still reports everything.
 | `--max-unit-bytes-hard SIZE` | largest memory one unit may need, else exit 8 (default 0.6 x `MemAvailable` / workers) |
 | `--writer-threads N` | data files written per unit (default 4) |
 | `--max-host-bytes SIZE` | host-memory budget of the whole conversion, else exit 8 (default 0.8 x `MemAvailable`) |
-| `--optimizer {drop,convert}` | `drop` optimizer state (default); `convert` is not supported yet (`FC-P11`, `FC-P12`) |
+| `--optimizer {drop,convert}` | `drop` optimizer state (default); `convert` it too: `fsdp_dtensor` to `torch_dist` only (`FC-P12` the other way) |
+| `--allow-bf16-masters` | with `--optimizer convert`, take trained parameters an `fsdp_dtensor` model section stores narrower than fp32 as their fp32 masters, upcast exactly (`FC-R21` otherwise) |
 | `--allow-root PREFIX` | convert model keys under this unknown top-level prefix unchanged (repeatable; cross-format) |
 | `--block-layout PREFIX=stacked\|per_layer` | store the block `PREFIX` of a `torch_dist` target stacked over its layers or one layer per key (repeatable; `fsdp_dtensor` source only) |
 | `--torch-dist-layout {native,per-layer}` | `per-layer` stores every `TransformerBlock` of a `torch_dist` target one layer per key and marks it in the `content_metadata`; `native` as Megatron would (default; `fsdp_dtensor` source only) |
@@ -691,7 +696,6 @@ arguments and the model keys before any tensor is read.
 | `FC-R19` | `fsdp_dtensor` store with split fused-projection sub-keys (`in_proj`/`conv1d` `.weight.<part>`) |
 | `FC-R20` | layer types no rule is verified for: hybrid layer symbols `D`, `C`, `H`, `W` (or unknown ones), or an `experimental_attention_variant` other than the Gated DeltaNet ones; or an `fsdp_dtensor` SwiGLU half (`linear_fc1.weight_w`) without its pair, of another shape than its pair, or stored beside the whole tensor |
 | `FC-R21` | `--optimizer convert` of an `fsdp_dtensor` store whose model section holds a parameter with optimizer state in a narrower type than fp32 (its master, which Megatron-FSDP keeps in fp32); `--allow-bf16-masters` takes it as the master, upcast exactly |
-| `FC-P11` | pending: converting optimizer state from `fsdp_dtensor` to `torch_dist` |
 | `FC-P12` | pending: converting optimizer state from `torch_dist` to `fsdp_dtensor` |
 | `FC-A01` | converting to `fsdp_dtensor`, the store packs fused tensors per tensor-parallel rank (gated `linear_fc1` it keeps fused, per expert tensor-parallel rank for routed experts; Gated DeltaProduct, Mamba-2 and Gated DeltaNet `in_proj` and `conv1d`), and the source was saved at a (expert) tensor-parallel size above 1, or the store packs routed experts' tensors and `--fsdp-tp` is not the source's tensor-parallel size (a job at that size runs its experts at it unless it sets `--expert-tensor-parallel-size`): pass `--fsdp-tp N` (`--fsdp-etp N`) with the size of the job that will load it |
 | `FC-A02` | converting to `torch_dist`, a layer list of an unknown kind (not the language model's decoder or `vision_model.decoder`), whose layout depends on its module: pass `--block-layout PREFIX=stacked` or `=per_layer` |
