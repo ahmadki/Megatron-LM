@@ -59,18 +59,20 @@ checkpoints (`FC-R13`).
 | Model family | `torch_dist` to `fsdp_dtensor` | `fsdp_dtensor` to `torch_dist` | Optimizer state | Tensor parallelism | Tested by |
 |---|---|---|---|---|---|
 | Hybrid attention and MLP layers (`--hybrid-layer-pattern` with `*` and `-`) | yes | yes | dropped | any source size; the output holds full tensors | synthetic stores; real-save chain at TP 1 and 2 |
-| GPT with dense MLP layers (plain or gated, see gated MLPs below; mixture-of-experts below; no MTP or MLA; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
+| GPT with dense MLP layers (plain or gated, see gated MLPs below; mixture-of-experts, multi-token prediction and multi-latent attention below; `TransformerBlock` decoder, stacked or per layer in `torch_dist`) | yes | yes | dropped | as above | synthetic stores; stacking predicate pinned to Megatron; real-save chain at TP 1 and 2 |
 | Vision-language models in the LLaVA layout (a GPT or hybrid language model above, a vision encoder `vision_model.decoder`, a projection) | yes | yes | dropped | as above | synthetic stores; real-save chain of a tiny LLaVA (GPT language model, CLIP encoder) at TP 1 and 2; hybrid language model on synthetic stores only |
 | Mixture-of-experts layers of the models above (GPT `TransformerBlock` layers, hybrid symbol `E`): routed experts, plain or gated, grouped (`TEGroupedMLP`) or sequential (`SequentialMLP`), with the router and its buffers, shared experts and latent projections | yes | yes | dropped | as above; any expert-parallel size, except grouped expert biases (`FC-R05`) | synthetic stores; expert naming pinned to Megatron-FSDP's; real-save chains of a GPT mixture-of-experts model at expert-parallel sizes 1 and 2 and of a hybrid `*E*E` model |
 | Gated MLPs of the models above (`--swiglu`, `--quick-geglu`, a gated vision encoder or projection): the `linear_fc1` of dense MLPs, shared experts and routed experts, split into SwiGLU halves or kept fused as Megatron-FSDP stores them | yes | yes | dropped | SwiGLU halves: as above; an `fsdp_dtensor` store with fused gated `linear_fc1` is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`, `--fsdp-etp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against halves and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4, expert tensor-parallel size 2); the SwiGLU split predicate pinned to Megatron-FSDP's; the rank-major pack pinned to live Megatron-FSDP models at TP 2 and expert TP 2; real-save chains of a GEGLU GPT at TP 2 and of a LLaVA whose vision encoder is gated under a plain language model (TP 1 and 2); real saves of a SwiGLU GPT (TP 1 and 2) and a SwiGLU mixture-of-experts GPT with shared experts at expert-parallel size 2, whose converted stores hold a Megatron-FSDP save's keys and whose Megatron-FSDP saves convert back and load strictly (see [Limitations](#limitations-and-non-claims)) |
 | Shortcut-connected mixture-of-experts layers of hybrid models (`--moe-shortcut-connection`: each `E` paired with the layer before it into one module, see [Hybrid layer lists](#hybrid-layer-lists)) | yes | yes | dropped | as above | synthetic stores; the grouping pinned to Megatron's `group_layers_into_shortcut_blocks` on edge patterns; a live shortcut model's `torch_dist` keys pinned to its state-dict names; a real `torch_dist` save converted and compared with what Megatron-FSDP's save handlers make of the live model; that handler output converted back, loaded strictly and compared parameter for parameter; the round trip against the source. Current Megatron refuses `--moe-shortcut-connection` with Megatron-FSDP, so no current Megatron job loads such an `fsdp_dtensor` store (see [Limitations](#limitations-and-non-claims)) |
 | Hybrid multi-token prediction (the `/` parts of `--hybrid-layer-pattern`, or the legacy `--mtp-hybrid-override-pattern`; with `--mtp-use-repeated-layer` too), including its mixture-of-experts and shortcut-connected layers | yes | yes | dropped | as above | synthetic stores; the inner layer name pinned to Megatron's; real-save chains of hybrid models with two MTP depths, MTP layers with experts, and one repeated MTP layer |
+| GPT multi-token prediction (`--mtp-num-layers` without a hybrid layer pattern; with `--mtp-use-repeated-layer` too), including MTP layers with experts or multi-latent attention; also legacy Megatron-FSDP stores that name the inner layer `mtp_model_layer`, see [GPT multi-token prediction](#gpt-multi-token-prediction) | yes | yes | dropped | as above | synthetic stores (both names, routed experts in the MTP layer, contract D round trips); the inner-layer names pinned to Megatron's (source scan); real-save chains of a GPT with two MTP layers at TP 1 (TP 2 extended); one repeated GPT MTP layer on a synthetic store; a real `torch_dist` save converted with `--fsdp-gpt-mtp-inner-name mtp_model_layer`, whose store holds a real Megatron-FSDP save's keys renamed by hand, converted back and loaded strictly |
+| Multi-latent attention (`--multi-latent-attention`, with or without `--mla-down-proj-fusion`): GPT layers and hybrid symbol `+` (in shortcut-connected pairs and multi-token prediction layers too), see [Multi-latent attention](#multi-latent-attention) | yes | yes | dropped | as above | synthetic stores (a stacked GPT with and without fusion, `+-*+`, a `+E-+/+E` shortcut-MoE hybrid); the unfused names Megatron saves in both formats pinned (source scan); a real-save chain of an MLA GPT at TP 1 (TP 2 extended); real saves of a fused MLA GPT with MTP layers, whose converted store holds a bf16 Megatron-FSDP save's keys and whose Megatron-FSDP save converts back and loads strictly (see [Limitations](#limitations-and-non-claims)) |
 | Gated DeltaProduct mixers of hybrid models (symbol `M` with `--spec megatron.core.models.hybrid.hybrid_layer_specs gated_delta_product_stack_spec`, or its alias `gdp_stack_spec`): the fused `in_proj` and `conv1d` weights and biases of every mixer, in shortcut-connected pairs and multi-token prediction layers too, see [Gated DeltaProduct mixers](#gated-deltaproduct-mixers) | yes | yes | dropped | an `fsdp_dtensor` store is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`; see [Tensor parallelism](#tensor-parallelism)); current Megatron-FSDP jobs hold these mixers at TP 1 only (see [Limitations](#limitations-and-non-claims)) | synthetic stores against parts and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4, with biases) and a vision-language store of every family above; the parts pinned to Megatron's split helpers for 1 to 3 Householder steps; a real TP 2 mixer's fused tensors pinned to the rank-major pack of its own `torch_dist` parts; a real model's `torch_dist` keys and state-dict names at TP 1 and 2; a real-save chain at TP 1; a real TP 2 `torch_dist` save converted with `--fsdp-tp 2`, whose store holds the model's rank-major tensors, converted back and loaded strictly |
 | Mamba-2 mixers of hybrid models (symbol `M` with the default stack spec, `hybrid_stack_spec` or its alias `mamba_stack_spec`): the fused `in_proj` weight and the convolution's weight and bias of every mixer, in shortcut-connected pairs and multi-token prediction layers too, see [Mamba-2 mixers](#mamba-2-mixers) | yes | yes | dropped | an `fsdp_dtensor` store is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against parts and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4; heads from `mamba_num_heads` or from `hidden_size`; a store saved before the mixer owned its convolution) and a vision-language store of every family above, each failing under converters that swap two parts, slice the parts' concatenation by rank or misname the convolution; the parts and names pinned to `MambaMixer.sharded_state_dict` (source scan) and to a real mixer's split factories at TP 1 and 2; a real TP 2 mixer's fused tensors pinned to the rank-major pack of its own `torch_dist` parts; a real model's `torch_dist` keys and state-dict names at TP 1 and 2; real-save chains of `M*-` and `M*E` at TP 1 (and `M*-` at TP 2 with `--fsdp-tp 2`, extended) |
 | Gated DeltaNet layers (`GatedDeltaNet`, and `GatedDeltaNet2` with `--experimental-attention-variant gdn2`): symbol `G` of hybrid models (with either stack spec; in shortcut-connected pairs and multi-token prediction layers too), and the linear-attention layers of GPT models (`--experimental-attention-variant gdn` or `gdn2` with `--linear-attention-freq`): the fused `in_proj` weight and the convolution's weight and bias of every layer, see [Gated DeltaNet layers](#gated-deltanet-layers) | yes | yes | dropped | an `fsdp_dtensor` store is packed per tensor-parallel rank and loads only at that size (`--fsdp-tp`; see [Tensor parallelism](#tensor-parallelism)) | synthetic stores against parts and rank-major packs built by hand (tensor-parallel sizes 1, 2 and 4; both variants; a hybrid of Gated DeltaProduct mixers and Gated DeltaNets; GPT linear attention; a whole `in_proj.bias` at equal and other pack sizes) and a vision-language store of every family above, failing under converters that swap two parts or slice the parts' concatenation by rank, and refused under one that takes either variant for the other; the parts, per-head sizes and variant choice pinned to `GatedDeltaNet`, `GatedDeltaNet2` and the hybrid stack (source scan) and to real modules' split factories at TP 1 and 2; real TP 2 modules' fused tensors pinned to the rank-major pack of their own `torch_dist` parts, and a real whole `in_proj.bias` to their ranks' local biases; real hybrid and GPT models' `torch_dist` keys and state-dict names at TP 1 and 2; real-save chains of `G*-` (both variants) and a linear-attention GPT at TP 1 (at TP 2 with `--fsdp-tp 2`, `G*E` and a Gated DeltaNet 2 GPT, extended) |
 
-Model families that later versions add are refused before anything is read,
-with a pending-family code:
+Every model family above is converted; what later versions add is refused
+before anything is read, with a pending code:
 
 | Code | Family |
 |---|---|
@@ -242,7 +244,8 @@ only) and numbered like the decoder from position 0, shortcut pairs included.
 `args.mtp_num_layers` must agree with the pattern, and MTP layers that the
 arguments do not have are refused (`FC-R11`). MTP layers are built with the
 language model's configuration, so their MLPs must be gated exactly as the
-decoder's are.
+decoder's are. A `transformer_layer` key in a hybrid model's MTP layers is
+refused (`FC-R09`).
 
 ### Mixture-of-experts layers
 
@@ -484,6 +487,48 @@ then holds the ranks' local biases one after the other, as `fsdp_dtensor`
 does. It is copied as is when `--fsdp-tp` is the source's tensor-parallel
 size, and refused otherwise (`FC-R10`).
 
+### GPT multi-token prediction
+
+A GPT model's MTP layers (`--mtp-num-layers` without a hybrid layer pattern)
+are stored under `mtp.layers.<d>`, one per depth (one with
+`--mtp-use-repeated-layer`), never stacked, each with its `enorm`, `hnorm`,
+`eh_proj` and `final_layernorm` and one inner `TransformerLayer`. The live
+module of that layer is `mtp_model_layer`, but Megatron stores it as
+`transformer_layer` in both formats (`MultiTokenPredictionLayer.sharded_state_dict`
+and Megatron-FSDP's `handle_mtp_in_state_dict` rename it on save and load), so
+it converts unchanged, its experts and gated MLPs as the decoder's are.
+
+Megatron-FSDP saved the live name before `handle_mtp_in_state_dict` existed.
+Such a store is read under it only when it is detected: the arguments have no
+hybrid layer pattern, its MTP layers' inner keys are all under
+`mtp_model_layer` (none under `transformer_layer`) and hold a single layer.
+`torch_dist` then gets `transformer_layer`; `plan` and `convert` warn, and the
+`gpt_mtp_inner_layer` derivation (also in the manifest) records each format's
+name. `--fsdp-gpt-mtp-inner-name mtp_model_layer` writes that legacy name, for
+Megatron-FSDP versions older than the handler only (current ones load only
+`transformer_layer`); without GPT MTP layers it has no effect. A store with
+both names, `mtp_model_layer` in a GPT `torch_dist` store, or an inner layer
+list under GPT arguments is refused (`FC-R09`).
+
+### Multi-latent attention
+
+Multi-latent attention (`--multi-latent-attention`; hybrid symbol `+`) is
+stored under the same names in both formats: `input_layernorm`, and under
+`self_attention` the `linear_q_down_proj` (or `linear_q_proj` without a q LoRA
+rank), `linear_q_up_proj`, `linear_kv_down_proj`, `linear_kv_up_proj` and
+`linear_proj` weights (the up-projections' `layer_norm_weight` with
+`--qk-layernorm`), all full tensors, so it converts unchanged. With
+`--mla-down-proj-fusion` the live model holds one `linear_qkv_down_proj` that
+also absorbs the input layer norm, but both formats store it unfused
+(`FusedMLASelfAttention.sharded_state_dict` and the fused layer specs' key
+maps for `torch_dist`, `handle_mla_down_proj_in_state_dict` for
+Megatron-FSDP): a store converts the same whether the job that saved it or
+the one that loads it fuses. A store holding the fused live name (a
+Megatron-FSDP store saved before that handler, or a `torch_dist` store, which
+Megatron never writes so) is refused (`FC-R08`). To convert such a legacy
+Megatron-FSDP store, load it with the Megatron version that saved it, in a
+job with `--mla-down-proj-fusion`, save it as `torch_dist` and convert that.
+
 ### Vision-language models
 
 A model whose keys are under `language_model.`, `vision_model.` and
@@ -622,7 +667,7 @@ condition of every code.
 | `FC-R05` | grouped expert biases in `fsdp_dtensor` with expert parallelism (Megatron-FSDP keeps their expert-parallel-local indices) |
 | `FC-R06` | grouped tensor parallelism (weight rematerialization, or more weight shards than tensor-parallel ranks) |
 | `FC-R07` | an FP8 delayed-scaling model converted to `torch_dist` (`--allow-missing-fp8-extra-state` writes it without the scaling state) |
-| `FC-R08` | multi-latent attention's fused down-projection stored under its live name `linear_qkv_down_proj` (a Megatron-FSDP store saved before Megatron stored it unfused) |
+| `FC-R08` | multi-latent attention's fused down-projection stored under its live name `linear_qkv_down_proj` (a Megatron-FSDP store saved before Megatron stored it unfused, or a `torch_dist` store, which Megatron never writes so) |
 | `FC-R09` | the inner layers of multi-token prediction layers under names no save of the model gives them (both `transformer_layer` and `mtp_model_layer` for GPT MTP layers, `mtp_model_layer` in a GPT `torch_dist` store, `transformer_layer` in a hybrid model) |
 | `FC-R10` | a tensor packed per tensor-parallel rank whose parts do not divide by the tensor-parallel size, or whose pack size the manifest records otherwise; a padded vocabulary that does not divide by `--fsdp-tp`; a state-space mixer whose family the names, the spec and the widths do not tell alike, whose dimensions the arguments do not give, whose `torch_dist` parts are not its family's, whose `A_log`, `dt_bias`, `D` or `norm.weight` is one rank's shard, or whose convolution is stored under both its names; a Gated DeltaNet layer whose variant the names, `--experimental-attention-variant` and the widths do not tell alike, or whose `A_log` or `dt_bias` is one rank's shard; a Gated DeltaNet in a GPT decoder where `--experimental-attention-variant` and `--linear-attention-freq` build none; a Mamba-2 or Gated DeltaNet `in_proj.bias` stored whole in `torch_dist` converted with `--fsdp-tp` other than the source's tensor-parallel size |
 | `FC-R11` | layer indices or layer tensors that contradict the hybrid layer pattern, or a pattern whose shortcut-MoE layers Megatron cannot group |
@@ -662,9 +707,21 @@ directory, the target iteration and the tracker is ever changed.
 
 - **Weights only.** Optimizer state is not converted yet (`FC-P11`,
   `FC-P12`); resume with `--no-load-optim`.
-- **Pending families.** GPT multi-token prediction and multi-latent attention
-  are refused until the versions that add them (see the
-  [Support Matrix](#support-matrix)).
+- **Fused multi-latent attention and Megatron-FSDP.** On current Megatron, a
+  Megatron-FSDP job with `--mla-down-proj-fusion` and fp32 parameters cannot
+  build its checkpoint state dict (`handle_mla_down_proj_in_state_dict` looks
+  its parameters up under one `module.` level too many without
+  `Float16Module`), as for SwiGLU below: its `fsdp_dtensor` stores are
+  checked against a bf16 job's real saves (keys, shapes, dtypes) and its
+  saves convert to `torch_dist` and load strictly.
+- **Legacy names.** Megatron-FSDP stores that hold GPT MTP layers under
+  `mtp_model_layer` are converted (see
+  [GPT multi-token prediction](#gpt-multi-token-prediction)); those that hold
+  multi-latent attention's fused `linear_qkv_down_proj` are refused
+  (`FC-R08`), as no such store is available to check against.
+- **Multi-latent attention in hybrid models.** Hybrid `+` layers (also `+E`
+  shortcut pairs) are checked on synthetic stores and against the names in
+  Megatron's hybrid layer specs, but not yet against a real save.
 - **Tensor-parallel-bound `fsdp_dtensor` stores.** A store with fused gated
   `linear_fc1`, Gated DeltaProduct or Mamba-2 mixers or Gated DeltaNet layers
   loads right only at the tensor-parallel sizes it was packed at, and the
