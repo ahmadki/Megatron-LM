@@ -4,13 +4,19 @@
 
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 from tools.checkpoint.format_converter import errors
+from tools.checkpoint.format_converter.core.args_view import ArgsView
 from tools.checkpoint.format_converter.core.param_groups import (
     ParamGroup,
+    chained_groups,
     identifier,
+    optimizer_common_state,
     rebuild_param_groups,
+    uses_expert_process_groups,
 )
 from tools.checkpoint.format_converter.errors import RefusedError
 
@@ -69,3 +75,70 @@ def test_groups_that_share_an_identifier_are_refused():
     assert refusal.keys == ("a.weight", "b.weight")
     assert refusal.message.startswith("parameter groups that differ in lr share the identifier")
     assert "max_lr=0.001" in refusal.message
+
+
+def _args(**fields) -> ArgsView:
+    return ArgsView(argparse.Namespace(**fields))
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({}, False),
+        ({"tensor_model_parallel_size": 2}, False),  # the expert size follows it
+        ({"expert_model_parallel_size": 2}, True),
+        ({"tensor_model_parallel_size": 2, "expert_tensor_parallel_size": 1}, True),
+        ({"tensor_model_parallel_size": 2, "expert_tensor_parallel_size": 2}, False),
+        ({"expert_gtp_weight_remat_size": 2}, True),
+        ({"gtp_weight_remat_size": 2, "expert_gtp_weight_remat_size": 2}, False),
+    ],
+)
+def test_routed_experts_use_the_expert_process_groups_as_megatron_decides(fields, expected):
+    assert uses_expert_process_groups(_args(**fields)) is expected
+
+
+EXPERT_FC1 = "decoder.layers.0.mlp.experts.linear_fc1.weight3"
+SHARED_FC1 = "decoder.layers.0.mlp.shared_experts.linear_fc1.weight"
+
+
+def test_expert_parallel_groups_get_an_optimizer_of_their_own():
+    dense, no_decay = ParamGroup(DECAY, (SHARED_FC1,)), ParamGroup(NO_DECAY, ("b",))
+    experts = ParamGroup(EXPERT, (EXPERT_FC1,))
+    chained = chained_groups([dense, experts, no_decay], _args(expert_model_parallel_size=2))
+    assert chained == ((dense, no_decay), (experts,))
+    assert optimizer_common_state(chained) == {
+        0: {
+            "optimizer": {"param_groups": [DECAY, NO_DECAY]},
+            "param_state_sharding_type": "fully_reshardable",
+        },
+        1: {
+            "optimizer": {"param_groups": [EXPERT]},
+            "param_state_sharding_type": "fully_reshardable",
+        },
+    }
+
+
+def test_without_expert_process_groups_one_optimizer_holds_every_group():
+    groups = [ParamGroup(DECAY, (EXPERT_FC1, SHARED_FC1)), ParamGroup(NO_DECAY, ("b",))]
+    chained = chained_groups(groups, _args())
+    assert chained == (tuple(groups),)
+    assert optimizer_common_state(chained) == {
+        "optimizer": {"param_groups": [DECAY, NO_DECAY]},
+        "param_state_sharding_type": "fully_reshardable",
+    }
+
+
+@pytest.mark.parametrize(
+    ("groups", "fields", "wrong"),
+    [
+        ([ParamGroup(EXPERT, (EXPERT_FC1,))], {}, (EXPERT_FC1,)),
+        ([ParamGroup(DECAY, (EXPERT_FC1,))], {"expert_model_parallel_size": 2}, (EXPERT_FC1,)),
+        ([ParamGroup(EXPERT, (SHARED_FC1,))], {"expert_model_parallel_size": 2}, (SHARED_FC1,)),
+    ],
+)
+def test_groups_that_contradict_the_arguments_are_refused(groups, fields, wrong):
+    with pytest.raises(RefusedError) as caught:
+        chained_groups(groups, _args(**fields))
+    refusal = caught.value.refusal
+    assert (refusal.code, refusal.keys) == (errors.FC_R13, wrong)
+    assert "set is_expert_parallel otherwise than a job of the store's arguments" in refusal.message

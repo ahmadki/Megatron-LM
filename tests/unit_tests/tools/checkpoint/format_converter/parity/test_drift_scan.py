@@ -35,6 +35,19 @@ MEGATRON_CORE = REPO_ROOT / "megatron" / "core"
 OPTIMIZER = MEGATRON_CORE / "optimizer" / "optimizer.py"
 DISTRIB_OPTIMIZER = MEGATRON_CORE / "optimizer" / "distrib_optimizer.py"
 PARAM_SCHEDULER = MEGATRON_CORE / "optimizer_param_scheduler.py"
+EXPERT_PROCESS_GROUP_LAYERS = (
+    MEGATRON_CORE / "extensions" / "transformer_engine.py",
+    MEGATRON_CORE / "tensor_parallel" / "layers.py",
+)
+"""The linear layers that decide whether a routed expert's parameters use the expert process
+groups (``use_expert_pgs``), mirrored by ``uses_expert_process_groups``."""
+EXPERT_PROCESS_GROUP_CONDITIONS = frozenset(
+    {
+        "expert_model_parallel_size > 1",
+        "expert_tensor_parallel_size != tensor_model_parallel_size",
+        "expert_gtp_weight_remat_size != gtp_weight_remat_size",
+    }
+)
 TRANSFORMER_MODULE = MEGATRON_CORE / "transformer" / "module.py"
 KEEP_FP32_MARK = "mark_keep_in_fp32"
 ARGUMENT_UTILS = REPO_ROOT / "megatron" / "training" / "argument_utils.py"
@@ -457,3 +470,52 @@ def test_the_parameter_group_identifier_keys_are_the_mirrored_ones():
     ), "Megatron identifies parameter groups by other keys; review core/param_groups.py"
     make_needed = ast.unparse(_definition(_module(DISTRIB_OPTIMIZER), "make_needed_groups"))
     assert f"f'{ALIAS_PREFIX}{{key}}'" in make_needed and "value = None" in make_needed
+
+
+def _condition(node: ast.AST, expert_parallel: str) -> str:
+    """``node`` with every attribute chain cut to its last name (``self.config.x`` is ``x``), and
+    ``self.expert_parallel`` replaced by what the layer assigns it (``expert_parallel``)."""
+    if isinstance(node, ast.Attribute) and node.attr == "expert_parallel":
+        return expert_parallel
+    if isinstance(node, ast.Compare):
+        parts = [node.left, *node.comparators]
+        names = [p.attr if isinstance(p, ast.Attribute) else ast.unparse(p) for p in parts]
+        ops = [
+            ast.unparse(ast.Compare(ast.Name("a"), [op], [ast.Name("b")]))[2:-2] for op in node.ops
+        ]
+        return " ".join(name for pair in zip(names, ops + [""]) for name in pair if name)
+    return ast.unparse(node)
+
+
+def test_the_expert_process_group_predicate_is_the_mirrored_one():
+    """Every layer's ``use_expert_pgs`` is (an expert layer and) one of the mirrored conditions."""
+    found = 0
+    for path in EXPERT_PROCESS_GROUP_LAYERS:
+        tree = _module(path)
+        parallel = [
+            _condition(node.value, "")
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "attr", None) == "expert_parallel" for t in node.targets)
+        ]
+        assert set(parallel) <= {"expert_model_parallel_size > 1"}, path
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Assign)
+                and any(getattr(t, "id", None) == "use_expert_pgs" for t in node.targets)
+            ):
+                continue
+            value = node.value
+            if isinstance(value, ast.BoolOp) and isinstance(value.op, ast.And):
+                assert ast.unparse(value.values[0]).endswith("is_expert"), ast.unparse(value)
+                value = value.values[1]
+            assert isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or), path
+            conditions = {
+                _condition(operand, "expert_model_parallel_size > 1") for operand in value.values
+            }
+            assert conditions == EXPERT_PROCESS_GROUP_CONDITIONS, (
+                f"{path.name}:{node.lineno} decides use_expert_pgs otherwise; review "
+                "uses_expert_process_groups in core/param_groups.py"
+            )
+            found += 1
+    assert found >= 2
