@@ -66,7 +66,10 @@ from ..errors import InternalError, Refusal, UsageError
 from .args_view import ArgsView
 from .hybrid_pattern import HybridPattern, family_mismatch, group_modules, hybrid_pattern_of
 from .keys import (
+    INPUT_LAYERNORM,
     LAYER_SEGMENT,
+    MLA_DOWN_PROJ,
+    MLA_FUSED_DOWN_PROJ,
     KeyGrammarError,
     innermost_layer_key,
     join_layer_key,
@@ -467,6 +470,28 @@ def gpt_mtp_live_name(name: str) -> str:
     its inner ``transformer_layer`` is ``mtp_model_layer`` in the live model; other names are
     unchanged (hybrid MTP layers keep their names, so this applies to GPT MTP layers only)."""
     return _rename_module(name, GPT_MTP_INNER_LAYER, MTP_INNER_LAYER) or name
+
+
+def fused_mla_live_name(name: str, *, absorbs_norm: bool) -> str:
+    """The live (``named_parameters``) name of ``name``, a stored model name, in a model built
+    with ``--mla-down-proj-fusion``.
+
+    ``FusedMLASelfAttention`` holds multi-latent attention's q and kv
+    down-projections in one module, ``linear_qkv_down_proj``, which both
+    formats store unfused (``linear_q_down_proj``, ``linear_kv_down_proj``);
+    on the Transformer Engine GPT layer spec it also absorbs the layer's input
+    layer norm as its ``layer_norm_<leaf>``, stored as
+    ``input_layernorm.<leaf>`` (``absorbs_norm``: ``name``'s layer is such a
+    layer). Other names are unchanged.
+    """
+    match = MLA_DOWN_PROJ.fullmatch(name)
+    if match is not None:
+        return f"{match.group('attention')}.{MLA_FUSED_DOWN_PROJ}.{match.group('leaf')}"
+    match = INPUT_LAYERNORM.fullmatch(name)
+    if match is not None and absorbs_norm:
+        layer, leaf = match.group("layer"), match.group("leaf")
+        return f"{layer}.self_attention.{MLA_FUSED_DOWN_PROJ}.layer_norm_{leaf}"
+    return name
 
 
 def _gpt_mtp_renames(facts: BlockFacts) -> tuple[ModuleRename, ...]:

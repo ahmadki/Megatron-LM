@@ -511,6 +511,17 @@ layer's ``input_layernorm``."""
 FUSED_MLA_DOWN_PROJ_KEY = re.compile(r"(?:^|\.)self_attention\." + MLA_FUSED_DOWN_PROJ + r"\.")
 """A tensor of the fused down-projection of multi-latent attention under its live name."""
 
+MLA_DOWN_PROJ = re.compile(
+    r"(?P<attention>(?:.+\.)?self_attention)\.linear_(?:q|kv)_down_proj\.(?P<leaf>[^.]+)"
+)
+"""A tensor of multi-latent attention's q or kv down-projection under its stored (unfused) name;
+``attention`` is the attention module's path."""
+
+INPUT_LAYERNORM = re.compile(r"(?P<layer>.+)\.input_layernorm\.(?P<leaf>weight|bias)")
+"""A layer's input layer norm (``<layer>.input_layernorm.<leaf>``), which the fused down-projection
+of multi-latent attention absorbs as its ``layer_norm_<leaf>`` on the Transformer Engine GPT
+layer spec."""
+
 
 @dataclass(frozen=True, slots=True)
 class LayerFamily:

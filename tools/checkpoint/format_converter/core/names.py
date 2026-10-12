@@ -22,6 +22,10 @@ FSDP_MODEL_PREFIX = "model.module."
 FSDP_OPTIMIZER_STATE = "optimizer.state."
 """Prefix of optimizer-state keys in Megatron-FSDP v1 stores (``module.`` levels follow)."""
 
+FSDP_GROUP_META = "optimizer.param_to_group_meta."
+"""Prefix of the parameter-group byte items of Megatron-FSDP v1 stores (``module.`` levels
+follow)."""
+
 STACKED = "stacked"
 """torch_dist block layout: one key per tensor, the layers along a new first axis."""
 
@@ -76,3 +80,7 @@ under."""
 FSDP_GPT_MTP_INNER_NAMES = MTP_INNER_LAYERS
 """Values of ``--fsdp-gpt-mtp-inner-name``: what an fsdp_dtensor target names a GPT multi-token
 prediction layer's inner layer (``transformer_layer`` by default, as current Megatron does)."""
+
+MOMENTS = ("exp_avg", "exp_avg_sq")
+"""Adam's moments: the per-parameter optimizer state both formats store, one tensor per parameter
+and moment, laid out as the parameter itself."""

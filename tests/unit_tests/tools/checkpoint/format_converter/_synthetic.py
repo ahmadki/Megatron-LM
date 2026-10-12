@@ -253,10 +253,14 @@ def write_fsdp_store(
     common_aliases: Mapping[Any, tuple[str, str]] | None = None,
     extra_byte_items: Mapping[str, bytes] | None = None,
     extra_tensors: Mapping[str, torch.Tensor] | None = None,
+    planner_paths: Mapping[str, tuple[str, ...]] | None = None,
 ) -> Path:
     """An fsdp_dtensor-like store: ``prefix`` + fqn keys and top-level common byte items.
 
-    ``extra_tensors`` are stored under their own keys (optimizer or RNG state).
+    ``extra_tensors`` are stored under their own keys (optimizer or RNG state);
+    ``planner_paths`` replace the planner paths of the keys they name (every
+    other tensor gets ``('model', <key without 'model.'>)``, every byte item
+    ``(<key>,)``).
     """
     common = {
         "args": args if args is not None else default_args(ckpt_format="fsdp_dtensor"),
@@ -270,9 +274,41 @@ def write_fsdp_store(
     keyed_grids = {prefix + fqn: grid for fqn, grid in (grids or {}).items()}
     planner_data = {key: ("model", key[len("model.") :]) for key in keyed}
     planner_data.update({key: (key,) for key in byte_items})
+    planner_data.update(planner_paths or {})
     return write_store(
         iter_dir, keyed, grids=keyed_grids, byte_items=byte_items, planner_data=planner_data
     )
+
+
+def fsdp_optimizer_items(
+    state: Mapping[str, Mapping[str, torch.Tensor]],
+    group_meta: Mapping[str, Mapping[str, Any]],
+    depth: str,
+) -> tuple[dict[str, torch.Tensor], dict[str, bytes], dict[str, tuple[str, ...]]]:
+    """The keys a Megatron-FSDP v1 save gives optimizer state, as DCP flattens its state dict.
+
+    Args:
+        state: The state tensors of each parameter (model key without
+            ``model.module.``) by leaf (``exp_avg``, ...).
+        group_meta: The hyperparameters of each parameter's group, by live name.
+        depth: The ``module.`` levels before every name.
+
+    Returns:
+        The tensors, the byte items (``torch.save`` of each value) and their
+        planner paths ``('optimizer', 'state'|'param_to_group_meta', <depth><name>, <leaf>)``.
+    """
+    tensors, byte_items, paths = {}, {}, {}
+    for name, leaves in state.items():
+        for leaf, tensor in leaves.items():
+            path = ("optimizer", "state", depth + name, leaf)
+            tensors[".".join(path)] = tensor
+            paths[".".join(path)] = path
+    for name, hparams in group_meta.items():
+        for leaf, value in hparams.items():
+            path = ("optimizer", "param_to_group_meta", depth + name, leaf)
+            byte_items[".".join(path)] = torch_save_bytes(value)
+            paths[".".join(path)] = path
+    return tensors, byte_items, paths
 
 
 def write_tracker(root: Path, value: int | str) -> Path:

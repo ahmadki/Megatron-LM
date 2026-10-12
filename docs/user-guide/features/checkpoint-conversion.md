@@ -674,6 +674,7 @@ condition of every code.
 | `FC-R12` | inconsistently stacked layers, non-contiguous layer indices (or expert indices of an `fsdp_dtensor` store), layers that differ where they would be stacked, or gated MLPs that contradict the arguments (`--swiglu`, `--quick-geglu`) or one another |
 | `FC-R13` | an unknown layout, key, top-level module, byte item or common-state key |
 | `FC-R14` | the legacy N-D reformulated layout (load with current Megatron and save again) |
+| `FC-R16` | `--optimizer convert` of optimizer state that is not Adam's (moments other than `exp_avg` and `exp_avg_sq`) |
 | `FC-R17` | a store saved with `singleton_local_shards` (its `content_metadata` says so, or its keys show it: experts saved one key per expert, gated `linear_fc1` saved as SwiGLU halves) |
 | `FC-R18` | a ModelOpt state |
 | `FC-R19` | an `fsdp_dtensor` store with split fused-projection keys |

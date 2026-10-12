@@ -87,6 +87,10 @@ FC_R13 = "FC-R13"
 FC_R14 = "FC-R14"
 """Model tensors are stored in the legacy N-D reformulated layout (``mcore_data``)."""
 
+FC_R16 = "FC-R16"
+"""The optimizer state is not Adam's (moments other than ``exp_avg`` and ``exp_avg_sq``, or another
+``args.optimizer``), or keeps per-parameter steps its parameter groups do not record."""
+
 FC_R17 = "FC-R17"
 """The checkpoint was saved with ``singleton_local_shards``."""
 
