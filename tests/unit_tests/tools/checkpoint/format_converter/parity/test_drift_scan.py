@@ -17,7 +17,8 @@ import pytest
 
 from tools.checkpoint.format_converter.core.format_args import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
-from tools.checkpoint.format_converter.core.keys import MTP_INNER_LAYER, SWIGLU_KEYS
+from tools.checkpoint.format_converter.core.keys import SWIGLU_KEYS
+from tools.checkpoint.format_converter.core.names import MTP_INNER_LAYER
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 
 from .._harness import REPO_ROOT

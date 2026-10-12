@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Names of the supported checkpoint formats, their dialects, the fsdp_dtensor key envelope,
-the torch_dist block layouts, the fsdp_dtensor names of routed experts and the SwiGLU choice.
+the torch_dist block layouts, the fsdp_dtensor names of routed experts, the SwiGLU choice and the
+names of a multi-token prediction layer's inner layer.
 
 This module imports nothing, so the command line can validate format flags
 without importing torch.
@@ -58,3 +59,20 @@ AUTO_SWIGLU, SWIGLU_ON, SWIGLU_OFF = "auto", "on", "off"
 TARGET_SWIGLU = (AUTO_SWIGLU, SWIGLU_ON, SWIGLU_OFF)
 """Values of ``--target-swiglu``: whether the job that loads an fsdp_dtensor target sets
 ``--swiglu`` (``auto``: as the source's arguments say)."""
+
+GPT_MTP_INNER_LAYER = "transformer_layer"
+"""The name both formats store the inner layer of a GPT multi-token prediction layer under
+(``MTP_INNER_LAYER_CHECKPOINT_NAME`` of ``fsdp_dtensor_checkpoint.py``, pinned by a test)."""
+
+MTP_INNER_LAYER = "mtp_model_layer"
+"""The live name of a multi-token prediction layer's inner layer (``MTP_INNER_LAYER`` of
+``fsdp_dtensor_checkpoint.py``, pinned by a test): a hybrid one's is stored under it in both
+formats, a GPT one's only by Megatron-FSDP saves older than ``handle_mtp_in_state_dict``."""
+
+MTP_INNER_LAYERS = (GPT_MTP_INNER_LAYER, MTP_INNER_LAYER)
+"""Every name a store of either format holds a multi-token prediction layer's inner layer
+under."""
+
+FSDP_GPT_MTP_INNER_NAMES = MTP_INNER_LAYERS
+"""Values of ``--fsdp-gpt-mtp-inner-name``: what an fsdp_dtensor target names a GPT multi-token
+prediction layer's inner layer (``transformer_layer`` by default, as current Megatron does)."""

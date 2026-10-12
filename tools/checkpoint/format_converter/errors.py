@@ -58,6 +58,11 @@ FC_R06 = "FC-R06"
 FC_R07 = "FC-R07"
 """A torch_dist target would lose FP8 delayed-scaling state that its loader requires."""
 
+FC_R09 = "FC-R09"
+"""The inner layers of multi-token prediction layers are stored under names no save of the model
+gives them (both GPT names in one store, the live name in torch_dist, ``transformer_layer`` in a
+hybrid model)."""
+
 FC_R10 = "FC-R10"
 """A tensor packed per tensor-parallel rank (rank-major) cannot be laid out consistently: its
 parts do not divide by the pack size, or the pack size a store's arguments give contradicts its
@@ -91,7 +96,7 @@ FC_R20 = "FC-R20"
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
 FC_P10 = "FC-P10"
-"""Pending: GPT multi-token prediction or multi-latent attention."""
+"""Pending: multi-latent attention."""
 
 FC_P11 = "FC-P11"
 """Pending: converting optimizer state from fsdp_dtensor to torch_dist."""

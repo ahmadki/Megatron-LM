@@ -30,10 +30,12 @@ from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
 from .blocks import (
+    MTP_BLOCK,
     TRANSFORMER_BLOCK,
     BlockFacts,
     BlockLayout,
     classify_blocks,
+    is_gpt_mtp,
     language_model_blocks,
 )
 from .dtype_policy import DtypePolicy
@@ -52,6 +54,8 @@ from .names import (
     FSDP_DTENSOR,
     FSDP_MODEL_PREFIX,
     FSDP_OPTIMIZER_STATE,
+    GPT_MTP_INNER_LAYER,
+    MTP_INNER_LAYER,
     PER_LAYER,
     SWIGLU_ON,
     TORCH_DIST,
@@ -253,6 +257,7 @@ def build_arch_context(
     fsdp_tp: int | None = None,
     fsdp_etp: int | None = None,
     target_swiglu: str = AUTO_SWIGLU,
+    fsdp_gpt_mtp_inner_name: str = GPT_MTP_INNER_LAYER,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -281,6 +286,8 @@ def build_arch_context(
             fused tensors at (``--fsdp-etp``; likewise).
         target_swiglu: Whether the job that loads an fsdp_dtensor target sets
             ``--swiglu`` (``--target-swiglu``: ``auto``, ``on`` or ``off``).
+        fsdp_gpt_mtp_inner_name: What an fsdp_dtensor target names the inner
+            layer of GPT MTP layers (``--fsdp-gpt-mtp-inner-name``).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
@@ -326,13 +333,16 @@ def build_arch_context(
         direction, manifest, log, dropped=drop_content_metadata, per_layer=per_layer
     )
     requested = dict(block_layouts or {})
-    facts = BlockFacts(args, source, model, content_metadata, requested, per_layer)
+    facts = BlockFacts(
+        args, source, model, content_metadata, requested, per_layer, fsdp_gpt_mtp_inner_name
+    )
     log.append(_language_model(facts))
     blocks = classify_blocks(facts, default=transformer_block)
     log.extend(
         Derivation(f"{BLOCK_FIELD}{block.prefix}", _block_summary(block), block.evidence)
         for block in blocks
     )
+    mtp_warnings = _gpt_mtp_inner_layer(blocks, args, fsdp_gpt_mtp_inner_name, log)
     if direction == FSDP_TO_TD:
         _check_recorded_layouts(blocks, manifest, requested, per_layer=per_layer)
     experts, evidence = expert_layout(args, model, source, expert_naming)
@@ -351,6 +361,7 @@ def build_arch_context(
         requested_layout_warnings(facts, blocks)
         + grouped_bias_warnings(experts, model, source)
         + shortcut_warnings(args, target)
+        + mtp_warnings
     )
     rank_major = [fc1 for fc1 in glu.fc1s.values() if fc1.packed]
     rank_major += list(mixers.projections.values())
@@ -526,6 +537,31 @@ def _recorded_layouts(manifest: Manifest) -> dict[str, str]:
             if isinstance(value.get("td_layout"), str):
                 layouts[name[len(BLOCK_FIELD) :]] = value["td_layout"]
     return layouts
+
+
+def _gpt_mtp_inner_layer(
+    blocks: Sequence[BlockLayout], args: ArgsView, requested: str, log: list[Derivation]
+) -> list[str]:
+    """Log how each format names the inner layer of the model's GPT MTP layers, if it has any;
+    the warnings of a format that stores it under the live name, or of ``requested``
+    (``--fsdp-gpt-mtp-inner-name``) without such layers."""
+    mtp = [block for block in blocks if block.kind == MTP_BLOCK]
+    if not mtp or not is_gpt_mtp(args):
+        if requested == GPT_MTP_INNER_LAYER:
+            return []
+        return [
+            f"--fsdp-gpt-mtp-inner-name {requested} has no effect: the model has no GPT MTP layer"
+        ]
+    (block,) = mtp
+    names = {fmt: block.stored_name(GPT_MTP_INNER_LAYER, fmt) for fmt in (TORCH_DIST, FSDP_DTENSOR)}
+    reasons = [rename.reason for rename in block.renames]
+    evidence = "; ".join(reasons) or (
+        f"Megatron stores the inner layer of a GPT MTP layer (live name {MTP_INNER_LAYER}) as "
+        f"{GPT_MTP_INNER_LAYER} in both formats (MultiTokenPredictionLayer.sharded_state_dict, "
+        "handle_mtp_in_state_dict)"
+    )
+    log.append(Derivation("gpt_mtp_inner_layer", names, evidence))
+    return reasons
 
 
 def _block_summary(block: BlockLayout) -> dict[str, Any]:

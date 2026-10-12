@@ -36,6 +36,7 @@ RESUME_CHOICES = ("auto", "never")
 TORCH_DIST_LAYOUTS = ("native", "per-layer")
 EXPERT_NAMINGS = ("auto", "grouped", "sequential")
 TARGET_SWIGLU = ("auto", "on", "off")
+FSDP_GPT_MTP_INNER_NAMES = ("transformer_layer", "mtp_model_layer")
 MAX_PRINTED_FINDINGS = 20
 
 _PACKAGE_LOGGER = __name__.rpartition(".")[0]
@@ -388,6 +389,16 @@ def _add_conversion_arguments(parser: argparse.ArgumentParser) -> None:
         "the job, and the store's arguments record it",
     )
     parser.add_argument(
+        "--fsdp-gpt-mtp-inner-name",
+        choices=FSDP_GPT_MTP_INNER_NAMES,
+        default="transformer_layer",
+        help="torch_dist to fsdp_dtensor: the name the store gives the inner layer of GPT "
+        "multi-token prediction layers: transformer_layer, which current Megatron-FSDP saves "
+        "and loads (default), or the live name mtp_model_layer, only for Megatron-FSDP versions "
+        "older than handle_mtp_in_state_dict (an fsdp_dtensor source is read under the name it "
+        "holds)",
+    )
+    parser.add_argument(
         "--fsdp-tp",
         type=int,
         metavar="N",
@@ -458,6 +469,7 @@ def _plan_options(args: argparse.Namespace) -> dict[str, Any]:
         "fsdp_tp": args.fsdp_tp,
         "fsdp_etp": args.fsdp_etp,
         "target_swiglu": args.target_swiglu,
+        "fsdp_gpt_mtp_inner_name": args.fsdp_gpt_mtp_inner_name,
     }
     for name in (
         "workers",

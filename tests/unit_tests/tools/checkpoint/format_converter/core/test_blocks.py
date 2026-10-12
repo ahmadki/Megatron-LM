@@ -16,7 +16,10 @@ from tools.checkpoint.format_converter.core.blocks import (
     BlockFacts,
     BlockLayout,
     classify_blocks,
+    gpt_mtp_live_name,
+    is_gpt_mtp,
     language_model_prefix,
+    mtp_inner_keys,
     take_census,
 )
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
@@ -392,6 +395,87 @@ def test_gpt_mtp_depths_are_one_layer_each():
     )
     assert (block.prefix, block.kind, block.dense_to_td) == ("mtp", "mtp_block", (0, 1))
     assert block.evidence == "args.mtp_num_layers=2"
+
+
+GPT_MTP_ARGS = _args(hybrid_layer_pattern=None, mtp_num_layers=1)
+LIVE_INNER = {
+    key: _entry(key)
+    for key in ("mtp.layers.0.eh_proj.weight", "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight")
+}
+"""A GPT MTP layer whose inner layer is stored under the live name (a legacy Megatron-FSDP save)."""
+
+
+def test_a_legacy_fsdp_gpt_mtp_store_is_read_under_the_live_name():
+    (block,) = classify_blocks_of(GPT_MTP_ARGS, LIVE_INNER, FSDP_DTENSOR)
+    (rename,) = block.renames
+    assert (rename.fmt, rename.logical, rename.stored) == (
+        FSDP_DTENSOR,
+        "transformer_layer",
+        "mtp_model_layer",
+    )
+    assert rename.reason == (
+        "the fsdp_dtensor source stores the inner layer of its GPT MTP layers (1 key) under the "
+        "live name mtp_model_layer, as Megatron-FSDP saved it before handle_mtp_in_state_dict; "
+        "torch_dist stores it as transformer_layer"
+    )
+
+
+def test_gpt_mtp_inner_layers_are_renamed_only_where_a_format_holds_the_live_name():
+    current = {
+        key: _entry(key) for key in ("mtp.layers.0.transformer_layer.mlp.linear_fc1.weight",)
+    }
+    for fmt in (TORCH_DIST, FSDP_DTENSOR):
+        (block,) = classify_blocks_of(GPT_MTP_ARGS, current, fmt)
+        assert block.renames == ()
+    asked = BlockFacts(GPT_MTP_ARGS, TORCH_DIST, current, fsdp_gpt_mtp_inner_name="mtp_model_layer")
+    (block,) = classify_blocks(asked, default=transformer_block)
+    (rename,) = block.renames
+    assert (rename.fmt, rename.stored) == (FSDP_DTENSOR, "mtp_model_layer")
+    assert rename.reason.startswith("--fsdp-gpt-mtp-inner-name mtp_model_layer: ")
+
+
+def test_hybrid_mtp_inner_layers_are_never_renamed():
+    model = {**_module_keys({0: "*", 1: "-"}), **_mtp_keys(0, {0: "*"})}
+    for fmt in (TORCH_DIST, FSDP_DTENSOR):
+        blocks = classify_blocks(
+            BlockFacts(_mtp_args("*-/*"), fmt, model, fsdp_gpt_mtp_inner_name="mtp_model_layer"),
+            default=transformer_block,
+        )
+        assert all(block.renames == () for block in blocks)
+
+
+def test_mtp_inner_keys_name_each_inner_layer():
+    keys = mtp_inner_keys(
+        [
+            "mtp.layers.0.eh_proj.weight",
+            "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight",
+            "language_model.mtp.layers.1.mtp_model_layer.layers.0.mlp.linear_fc1.weight",
+            "decoder.layers.0.mtp_model_layer.weight",
+        ]
+    )
+    assert [(key.key.split(".")[0], key.name, key.layer_list) for key in keys] == [
+        ("language_model", "mtp_model_layer", True),
+        ("mtp", "transformer_layer", False),
+    ]
+
+
+def test_mtp_layers_are_gpt_ones_exactly_without_a_hybrid_layer_pattern():
+    assert is_gpt_mtp(_args(num_layers=2, mtp_num_layers=1))
+    assert not is_gpt_mtp(_mtp_args("*-/*"))
+    assert not is_gpt_mtp(_args(hybrid_override_pattern="*-", num_layers=2, mtp_num_layers=1))
+
+
+@pytest.mark.parametrize(
+    ("name", "live"),
+    [
+        ("transformer_layer.mlp.linear_fc1.weight", "mtp_model_layer.mlp.linear_fc1.weight"),
+        ("transformer_layer", "mtp_model_layer"),
+        ("eh_proj.weight", "eh_proj.weight"),
+        ("transformer_layers.x", "transformer_layers.x"),
+    ],
+)
+def test_the_live_name_of_a_gpt_mtp_inner_layer_is_mtp_model_layer(name, live):
+    assert gpt_mtp_live_name(name) == live
 
 
 @pytest.mark.parametrize(

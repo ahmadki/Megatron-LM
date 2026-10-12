@@ -797,6 +797,45 @@ def hybrid_mtp_tensors(
     return tensors
 
 
+def gpt_mtp_tensors(
+    depths: int,
+    *,
+    inner: str = "transformer_layer",
+    prefix: str = "mtp",
+    experts: int = 0,
+    hidden: int = 8,
+    ffn: int = 16,
+) -> dict[str, torch.Tensor]:
+    """The ``depths`` multi-token prediction layers of a GPT model under ``prefix``: each with its
+    norms and projection, and its inner ``TransformerLayer`` (see :func:`transformer_layers`)
+    under ``inner``; with ``experts``, its MLP is a mixture-of-experts layer (grouped
+    fsdp_dtensor expert names, see :func:`moe_layer_tensors`)."""
+    tensors = {}
+    layers = transformer_layers(prefix, depths, hidden, ffn, seed=55)
+    del layers[f"{prefix}.final_layernorm.weight"]
+    for key, tensor in layers.items():
+        depth, name = key[len(f"{prefix}.layers.") :].split(".", 1)
+        if experts and name.startswith("mlp."):
+            continue
+        tensors[f"{prefix}.layers.{depth}.{inner}.{name}"] = tensor
+    for depth in range(depths):
+        head = f"{prefix}.layers.{depth}"
+        generator = torch.Generator().manual_seed(2000 + depth)
+        for name, shape in {
+            "enorm.weight": (hidden,),
+            "hnorm.weight": (hidden,),
+            "eh_proj.weight": (hidden, 2 * hidden),
+            "final_layernorm.weight": (hidden,),
+        }.items():
+            value = torch.randn(shape, generator=generator)
+            tensors[f"{head}.{name}"] = value if name.endswith("norm.weight") else value.bfloat16()
+        if experts:
+            tensors.update(
+                moe_layer_tensors(f"{head}.{inner}", experts, hidden, bias=True, seed=3000 + depth)
+            )
+    return tensors
+
+
 def gdp_mixer_tensors(
     mixer: str,
     *,

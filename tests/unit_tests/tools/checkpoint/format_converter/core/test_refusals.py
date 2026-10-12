@@ -138,6 +138,13 @@ FSDP_MIXER = {
 }
 """A mixer's fused projections as fsdp_dtensor stores them: Gated DeltaProduct's, or a legacy
 Mamba-2 store's (the spec tells)."""
+GPT_MTP = {**GPT_ARGS, "mtp_num_layers": 1}
+"""A GPT model with one multi-token prediction layer."""
+CURRENT_MTP = {"mtp.layers.0.transformer_layer.mlp.linear_fc1.weight": (F, H)}
+LIVE_MTP = {"mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight": (3 * H, H)}
+"""Inner-layer keys of an MTP layer under the name both formats store (``transformer_layer``) and
+under the live name (``mtp_model_layer``, a legacy Megatron-FSDP store's)."""
+TO_TORCH_DIST = {"source": FSDP_DTENSOR, "target": TORCH_DIST}
 FSDP_SWIGLU_KEYS = {
     **{f"decoder.layers.{layer}.mlp.linear_fc1.weight": None for layer in (1, 3)},
     **{
@@ -276,7 +283,23 @@ CASES = {
         errors.FC_R03,
         facts(args={"spec": ["my_package.specs", "gdp_stack_spec"]}),
     ),
-    "P10 gpt mtp": (errors.FC_P10, facts(args={**GPT_ARGS, "mtp_num_layers": 1})),
+    "R09 both gpt mtp names": (
+        errors.FC_R09,
+        facts(args=GPT_MTP, keys={**CURRENT_MTP, **LIVE_MTP}, **TO_TORCH_DIST),
+    ),
+    "R09 live gpt mtp name in torch_dist": (errors.FC_R09, facts(args=GPT_MTP, keys=LIVE_MTP)),
+    "R09 gpt mtp inner layer list": (
+        errors.FC_R09,
+        facts(
+            args=GPT_MTP,
+            keys={"mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight": (F, H)},
+            **TO_TORCH_DIST,
+        ),
+    ),
+    "R09 gpt mtp name in a hybrid model": (
+        errors.FC_R09,
+        facts(args={"hybrid_layer_pattern": "*-*-/-", "mtp_num_layers": 1}, keys=CURRENT_MTP),
+    ),
     "P10 mla": (errors.FC_P10, facts(args={"multi_latent_attention": True})),
     "P10 symbol": (errors.FC_P10, facts(args={"hybrid_layer_pattern": "+-+-"})),
     "P11 optimizer": (
@@ -320,10 +343,64 @@ def test_every_detector_code_has_a_case():
         errors.FC_R05,
         errors.FC_R06,
         errors.FC_R07,
+        errors.FC_R09,
         errors.FC_R13,
         errors.FC_R17,
         errors.FC_R20,
     }
+
+
+@pytest.mark.parametrize("source", [TORCH_DIST, FSDP_DTENSOR])
+def test_gpt_mtp_models_pass(source):
+    """A GPT MTP layer's inner layer is ``transformer_layer`` in both formats."""
+    target = TORCH_DIST if source == FSDP_DTENSOR else FSDP_DTENSOR
+    mtp = {**CURRENT_MTP, "mtp.layers.0.eh_proj.weight": (H, 2 * H)}
+    assert codes(facts(args=GPT_MTP, keys=mtp, source=source, target=target)) == []
+    vlm = {f"language_model.{key}": shape for key, shape in mtp.items()}
+    assert codes(facts(args=GPT_MTP, keys=vlm, source=source, target=target)) == []
+
+
+def test_a_legacy_fsdp_gpt_mtp_store_passes():
+    """Megatron-FSDP stored the live name ``mtp_model_layer`` before handle_mtp_in_state_dict."""
+    assert codes(facts(args=GPT_MTP, keys=LIVE_MTP, **TO_TORCH_DIST)) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        (
+            "R09 both gpt mtp names",
+            "the store holds the inner layer of its GPT MTP layers under both transformer_layer "
+            "and mtp_model_layer; a Megatron save uses one of them (2 model key(s) such as "
+            "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight)",
+        ),
+        (
+            "R09 live gpt mtp name in torch_dist",
+            "torch_dist stores the inner layer of GPT MTP layers as transformer_layer "
+            "(MultiTokenPredictionLayer.sharded_state_dict renames the live mtp_model_layer), but "
+            "the arguments are without a hybrid layer pattern (GPT MTP layers) and the store "
+            "holds mtp_model_layer keys (1 model key(s) such as "
+            "mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight)",
+        ),
+        (
+            "R09 gpt mtp inner layer list",
+            "the arguments are without a hybrid layer pattern (GPT MTP layers), whose inner layer "
+            "is a single layer, but the store holds an inner layer list, as a hybrid model's MTP "
+            "layers do (1 model key(s) such as "
+            "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight)",
+        ),
+        (
+            "R09 gpt mtp name in a hybrid model",
+            "a hybrid model's MTP layers hold their inner layer list as mtp_model_layer.layers.<j> "
+            "in both formats, but the store holds transformer_layer keys (1 model key(s) such as "
+            "mtp.layers.0.transformer_layer.mlp.linear_fc1.weight)",
+        ),
+    ],
+)
+def test_mtp_inner_layer_refusals_name_the_keys(case, message):
+    (refusal,) = detect_refusals(CASES[case][1])
+    assert refusal.message == message
+    assert refusal.keys and all(".mtp." in f".{key}" for key in refusal.keys)
 
 
 @pytest.mark.parametrize("variant", [None, "gdn", "gdn2", "gated_delta_net"])
@@ -519,10 +596,9 @@ def test_mixers_pass_the_fence(args, keys, source):
 
 
 def test_refusals_carry_the_evidence():
-    (refusal,) = detect_refusals(facts(args={**GPT_ARGS, "mtp_num_layers": 2}))
+    (refusal,) = detect_refusals(facts(args={"multi_latent_attention": True}))
     assert refusal.message == (
-        "not supported yet: GPT multi-token prediction and multi-latent attention "
-        "(args.mtp_num_layers=2 without a hybrid layer pattern)"
+        "not supported yet: multi-latent attention (args.multi_latent_attention=True)"
     )
     (refusal,) = detect_refusals(CASES["R05 grouped biases for fsdp"][1])
     assert refusal.message == (

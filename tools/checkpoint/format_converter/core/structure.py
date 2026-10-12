@@ -13,7 +13,10 @@ slice per (layer, expert), ``[l:l+1, e:e+1, ...]``, whose logical tensor has
 one expert's shape. Keys outside every block keep their path. An fsdp_dtensor
 SwiGLU half (``linear_fc1.weight_w``) is the id of that part of the fused
 tensor, and so is a torch_dist part of a fused projection
-(``mixer.in_proj.weight.V0``). :func:`compose` is the inverse for the target
+(``mixer.in_proj.weight.V0``). A module of a block's layers that the format
+stores under another name than its logical one (a legacy Megatron-FSDP
+store's GPT MTP ``mtp_model_layer``) gets its logical name
+(``transformer_layer``), and back. :func:`compose` is the inverse for the target
 format: it places each
 layer of a block that torch_dist stores stacked at ``[l:l+1, ...]`` of the
 stacked tensor ``<block>.layers.<name>``, and each expert at its index of the
@@ -88,7 +91,9 @@ def decompose(
     by_prefix = {block.prefix: block for block in blocks}
     layer_key = attribute_layer_key(relative, by_prefix)
     block = None if layer_key is None else by_prefix[layer_key.block]
-    name = relative if layer_key is None else layer_key.inner
+    name = (
+        relative if block is None or layer_key is None else block.logical_name(layer_key.inner, fmt)
+    )
     name, part = split_factory_part(name) if fmt == TORCH_DIST else split_glu_half(name)
     expert = split_expert_name(name, fmt)
     path, leaf = (expert.path, expert.leaf) if expert is not None else split_leaf(name)
@@ -194,7 +199,9 @@ def compose(
             raise InternalError(f"{lid} names an unknown block")
         stored = block.stored_index(lid.layer, fmt)
         stacked = fmt == TORCH_DIST and block.stacked
-        key = join_layer_key(block.prefix, None if stacked else stored, name)
+        key = join_layer_key(
+            block.prefix, None if stacked else stored, block.stored_name(name, fmt)
+        )
         if stacked:
             leading.append((stored, block.num_modules))
     if expert_axis is not None:

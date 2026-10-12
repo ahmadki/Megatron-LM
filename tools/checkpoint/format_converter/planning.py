@@ -44,7 +44,14 @@ from . import __version__, errors
 from .core.args_view import ArgsView
 from .core.context import ArchContext, build_arch_context
 from .core.manifest import MANIFEST_FILE, Manifest
-from .core.names import AUTO_EXPERT_NAMING, AUTO_SWIGLU, FSDP_DTENSOR, PER_LAYER_LAYOUT, TORCH_DIST
+from .core.names import (
+    AUTO_EXPERT_NAMING,
+    AUTO_SWIGLU,
+    FSDP_DTENSOR,
+    GPT_MTP_INNER_LAYER,
+    PER_LAYER_LAYOUT,
+    TORCH_DIST,
+)
 from .core.planner import plan_model
 from .core.refusals import Facts, detect_refusals
 from .core.registry import REGISTRY
@@ -327,6 +334,7 @@ def _refuse_fsdp_target_flags(opts: PlanOptions) -> None:
             ("--fsdp-tp", opts.fsdp_tp is not None),
             ("--fsdp-etp", opts.fsdp_etp is not None),
             ("--target-swiglu", opts.target_swiglu != AUTO_SWIGLU),
+            ("--fsdp-gpt-mtp-inner-name", opts.fsdp_gpt_mtp_inner_name != GPT_MTP_INNER_LAYER),
         )
         if given
     ]
@@ -436,6 +444,7 @@ def _plan_cross_format(
         fsdp_tp=opts.fsdp_tp,
         fsdp_etp=opts.fsdp_etp,
         target_swiglu=opts.target_swiglu,
+        fsdp_gpt_mtp_inner_name=opts.fsdp_gpt_mtp_inner_name,
     )
     _warn_lost_fp8_state(ctx, sections)
     for warning in ctx.warnings:

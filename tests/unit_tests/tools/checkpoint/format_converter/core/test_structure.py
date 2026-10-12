@@ -7,7 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tools.checkpoint.format_converter.core.blocks import BlockLayout
+from tools.checkpoint.format_converter.core.blocks import BlockLayout, ModuleRename
 from tools.checkpoint.format_converter.core.experts import ExpertLayout
 from tools.checkpoint.format_converter.core.keys import KeyGrammarError
 from tools.checkpoint.format_converter.core.logical import LogicalId, LogicalSlice, OutputSlice
@@ -421,3 +421,37 @@ def test_fsdp_dtensor_names_are_never_parts_of_fused_projections():
     assert decompose_one(whole, [HYBRID], TORCH_DIST) == LogicalId(
         "decoder", 0, "mixer.in_proj", "weight"
     )
+
+
+LEGACY_MTP = BlockLayout(
+    "mtp",
+    "mtp_block",
+    2,
+    "per_layer",
+    (0, 1),
+    None,
+    "",
+    (ModuleRename(FSDP_DTENSOR, "transformer_layer", "mtp_model_layer", "legacy"),),
+)
+"""A GPT MTP block whose fsdp_dtensor side names the inner layer by its live name."""
+
+
+def test_a_renamed_module_has_its_logical_name_in_every_format():
+    lid = LogicalId("mtp", 1, "transformer_layer.self_attention.linear_qkv", "weight")
+    fsdp = "mtp.layers.1.mtp_model_layer.self_attention.linear_qkv.weight"
+    torch_dist = "mtp.layers.1.transformer_layer.self_attention.linear_qkv.weight"
+    assert decompose_one(fsdp, [LEGACY_MTP], FSDP_DTENSOR) == lid
+    assert decompose_one(torch_dist, [LEGACY_MTP], TORCH_DIST) == lid
+    assert compose(lid, (4,), [LEGACY_MTP], FSDP_DTENSOR).key == fsdp
+    assert compose(lid, (4,), [LEGACY_MTP], TORCH_DIST).key == torch_dist
+
+
+def test_only_the_renamed_module_is_renamed():
+    """The layer's own tensors and modules whose names merely start alike keep their names."""
+    for name in ("eh_proj.weight", "mtp_model_layer_norm.weight"):
+        key = f"mtp.layers.0.{name}"
+        lid = decompose_one(key, [LEGACY_MTP], FSDP_DTENSOR)
+        assert lid.name == name
+        assert compose(lid, (4,), [LEGACY_MTP], FSDP_DTENSOR).key == key
+    assert LEGACY_MTP.stored_name("transformer_layer", FSDP_DTENSOR) == "mtp_model_layer"
+    assert LEGACY_MTP.logical_name("mtp_model_layer", TORCH_DIST) == "mtp_model_layer"

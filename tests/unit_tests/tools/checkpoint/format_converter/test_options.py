@@ -11,6 +11,7 @@ import pytest
 from tools.checkpoint.format_converter import cli, options
 from tools.checkpoint.format_converter.core.names import (
     EXPERT_NAMINGS,
+    FSDP_GPT_MTP_INNER_NAMES,
     TARGET_SWIGLU,
     TORCH_DIST_LAYOUTS,
 )
@@ -113,6 +114,7 @@ def test_output_fields_cover_what_shapes_the_output():
         "fsdp_tp": None,
         "fsdp_etp": None,
         "target_swiglu": "auto",
+        "fsdp_gpt_mtp_inner_name": "transformer_layer",
         "copy_sidecars": True,
     }
 
@@ -122,6 +124,14 @@ def test_target_swiglu_is_validated():
     assert options.PlanOptions(target_swiglu="on").output_fields()["target_swiglu"] == "on"
     with pytest.raises(UsageError, match="must be one of auto, on, off"):
         options.PlanOptions(target_swiglu="yes")
+
+
+def test_the_fsdp_gpt_mtp_inner_name_is_validated():
+    assert cli.FSDP_GPT_MTP_INNER_NAMES == FSDP_GPT_MTP_INNER_NAMES
+    named = options.PlanOptions(fsdp_gpt_mtp_inner_name="mtp_model_layer")
+    assert named.output_fields()["fsdp_gpt_mtp_inner_name"] == "mtp_model_layer"
+    with pytest.raises(UsageError, match="must be one of transformer_layer, mtp_model_layer"):
+        options.PlanOptions(fsdp_gpt_mtp_inner_name="layer")
 
 
 @pytest.mark.parametrize("flag", ["fsdp_tp", "fsdp_etp"])

@@ -33,7 +33,7 @@ from .. import errors
 from ..engine.metadata import TensorEntry
 from ..errors import Refusal
 from .args_view import ArgsView
-from .blocks import LANGUAGE_MODEL, MTP, SINGLE_ROOTS, VLM_ROOTS
+from .blocks import SINGLE_ROOTS, VLM_ROOTS, MtpInnerKey, is_gpt_mtp, mtp_inner_keys
 from .experts import built_expert_form
 from .hybrid_pattern import LAYER_SYMBOLS, hybrid_pattern_of
 from .keys import (
@@ -41,7 +41,6 @@ from .keys import (
     FUSED_MIXER,
     GLU_HALF,
     GROUPED_EXPERT_BIAS,
-    LAYER_SEGMENT,
     LEGACY_GROUPED_EXPERTS,
     MLA_PARAM,
     SINGLE_GROUPED_EXPERTS,
@@ -51,18 +50,22 @@ from .keys import (
     root_of,
 )
 from .mixers import GDN_VARIANTS, GDP_SPEC_NAMES, HYBRID_SPEC_MODULES, spec_name
-from .names import AUTO_EXPERT_NAMING, FSDP_DTENSOR, GROUPED, TORCH_DIST
+from .names import (
+    AUTO_EXPERT_NAMING,
+    FSDP_DTENSOR,
+    GPT_MTP_INNER_LAYER,
+    GROUPED,
+    MTP_INNER_LAYER,
+    TORCH_DIST,
+)
 from .registry import REGISTRY, Allowlist, Sentinel
 
 PENDING_FAMILIES: Mapping[str, str] = {
-    errors.FC_P10: "GPT multi-token prediction and multi-latent attention",
+    errors.FC_P10: "multi-latent attention",
     errors.FC_P11: "optimizer state from fsdp_dtensor to torch_dist",
     errors.FC_P12: "optimizer state from torch_dist to fsdp_dtensor",
 }
 """Every pending-family code and the family it stands for."""
-
-MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
-"""Block prefixes of multi-token prediction."""
 
 PENDING_SYMBOLS = frozenset("+")
 """Hybrid layer symbols of pending families (MLA)."""
@@ -350,16 +353,6 @@ def unverified_layers(facts: Facts) -> Iterator[Refusal]:
         )
 
 
-def _block_heads(blocks: tuple[str, ...]) -> tuple[str, ...]:
-    """The key prefixes of the layer lists of ``blocks``."""
-    return tuple(block + LAYER_SEGMENT for block in blocks)
-
-
-def _mtp_keys(facts: Facts) -> tuple[str, ...]:
-    """Keys of multi-token prediction layers."""
-    return tuple(key for key in sorted(facts.model) if key.startswith(_block_heads(MTP_BLOCKS)))
-
-
 def _key_evidence(keys: tuple[str, ...]) -> list[str]:
     return [f"{len(keys)} model key(s) such as {keys[0]}"] if keys else []
 
@@ -499,15 +492,72 @@ def singleton_local_shards(facts: Facts) -> Iterator[Refusal]:
 
 
 @REGISTRY.detector
-def pending_gpt_mtp_and_mla(facts: Facts) -> Iterator[Refusal]:
-    """FC-P10: GPT multi-token prediction and multi-latent attention."""
+def mtp_inner_layer_names(facts: Facts) -> Iterator[Refusal]:
+    """FC-R09: the inner layers of multi-token prediction layers under names that no Megatron
+    save of the arguments' model in the source's format gives them.
+
+    A hybrid MTP layer's inner layer list is ``mtp_model_layer.layers.<j>`` in
+    both formats. A GPT MTP layer's single inner layer is ``transformer_layer``
+    in both, except in Megatron-FSDP stores saved before
+    ``handle_mtp_in_state_dict``, which hold the live name ``mtp_model_layer``
+    (converted as such, ``core/blocks.py``); one store never holds both.
+    """
+    keys = mtp_inner_keys(facts.model)
+    if not keys:
+        return
+    found = _mtp_inner_name_refusal(facts, keys)
+    if found is not None:
+        wrong, message = found
+        yield Refusal(
+            errors.FC_R09,
+            f"{message} ({len(wrong)} model key(s) such as {wrong[0]})",
+            keys=wrong,
+            hint="check that the arguments belong to this checkpoint and that it holds one save",
+        )
+
+
+def _mtp_inner_name_refusal(
+    facts: Facts, keys: list[MtpInnerKey]
+) -> tuple[tuple[str, ...], str] | None:
+    """The keys of MTP inner layers that contradict the arguments or the source format, and why."""
+
+    def named(name: str) -> tuple[str, ...]:
+        return tuple(key.key for key in keys if key.name == name)
+
+    current, live = named(GPT_MTP_INNER_LAYER), named(MTP_INNER_LAYER)
+    if not is_gpt_mtp(facts.args):
+        why = (
+            f"a hybrid model's MTP layers hold their inner layer list as {MTP_INNER_LAYER}"
+            f".layers.<j> in both formats, but the store holds {GPT_MTP_INNER_LAYER} keys"
+        )
+        return (current, why) if current else None
+    gpt = "without a hybrid layer pattern (GPT MTP layers)"
+    listed = tuple(key.key for key in keys if key.layer_list)
+    if listed:
+        return listed, (
+            f"the arguments are {gpt}, whose inner layer is a single layer, but the store holds "
+            "an inner layer list, as a hybrid model's MTP layers do"
+        )
+    if current and live:
+        return current + live, (
+            "the store holds the inner layer of its GPT MTP layers under both "
+            f"{GPT_MTP_INNER_LAYER} and {MTP_INNER_LAYER}; a Megatron save uses one of them"
+        )
+    if facts.source == TORCH_DIST and live:
+        return live, (
+            f"torch_dist stores the inner layer of GPT MTP layers as {GPT_MTP_INNER_LAYER} "
+            "(MultiTokenPredictionLayer.sharded_state_dict renames the live "
+            f"{MTP_INNER_LAYER}), but the arguments are {gpt} and the store holds "
+            f"{MTP_INNER_LAYER} keys"
+        )
+    return None
+
+
+@REGISTRY.detector
+def pending_multi_latent_attention(facts: Facts) -> Iterator[Refusal]:
+    """FC-P10: multi-latent attention."""
     evidence = []
     keys = facts.keys_matching(MLA_PARAM)
-    if hybrid_pattern_of(facts.args) is None:
-        depths = facts.args.get("mtp_num_layers", None)
-        if depths:
-            evidence.append(f"args.mtp_num_layers={depths} without a hybrid layer pattern")
-        keys += _mtp_keys(facts)
     if facts.args.get("multi_latent_attention", False):
         evidence.append("args.multi_latent_attention=True")
     if "+" in _symbols(facts):

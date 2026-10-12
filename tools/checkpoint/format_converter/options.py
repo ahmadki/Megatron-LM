@@ -17,6 +17,8 @@ from .core.names import (
     AUTO_SWIGLU,
     EXPERT_NAMINGS,
     FORMATS,
+    FSDP_GPT_MTP_INNER_NAMES,
+    GPT_MTP_INNER_LAYER,
     NATIVE_LAYOUT,
     PER_LAYER_LAYOUT,
     STACKED,
@@ -268,6 +270,10 @@ class PlanOptions:
             experts' fused tensors at (likewise).
         target_swiglu: Whether the job that loads an fsdp_dtensor target sets
             ``--swiglu``: ``auto`` (as the source's arguments say), ``on`` or ``off``.
+        fsdp_gpt_mtp_inner_name: What an fsdp_dtensor target names the inner
+            layer of GPT MTP layers: ``transformer_layer`` (as current Megatron
+            does) or ``mtp_model_layer`` (for Megatron-FSDP versions older than
+            ``handle_mtp_in_state_dict``).
     """
 
     to_format: str = TORCH_DIST
@@ -290,6 +296,7 @@ class PlanOptions:
     fsdp_tp: int | None = None
     fsdp_etp: int | None = None
     target_swiglu: str = AUTO_SWIGLU
+    fsdp_gpt_mtp_inner_name: str = GPT_MTP_INNER_LAYER
 
     def __post_init__(self) -> None:
         if self.to_format not in FORMATS:
@@ -298,6 +305,10 @@ class PlanOptions:
             raise UsageError(f"--expert-naming must be one of {', '.join(EXPERT_NAMINGS)}")
         if self.target_swiglu not in TARGET_SWIGLU:
             raise UsageError(f"--target-swiglu must be one of {', '.join(TARGET_SWIGLU)}")
+        if self.fsdp_gpt_mtp_inner_name not in FSDP_GPT_MTP_INNER_NAMES:
+            raise UsageError(
+                f"--fsdp-gpt-mtp-inner-name must be one of {', '.join(FSDP_GPT_MTP_INNER_NAMES)}"
+            )
         object.__setattr__(self, "block_layouts", _block_layouts(self.block_layouts))
         self._check_torch_dist_layout()
         if self.optimizer not in OPTIMIZER_CHOICES:
@@ -350,6 +361,7 @@ class PlanOptions:
             "fsdp_tp": self.fsdp_tp,
             "fsdp_etp": self.fsdp_etp,
             "target_swiglu": self.target_swiglu,
+            "fsdp_gpt_mtp_inner_name": self.fsdp_gpt_mtp_inner_name,
         }
 
     def _check_torch_dist_layout(self) -> None:

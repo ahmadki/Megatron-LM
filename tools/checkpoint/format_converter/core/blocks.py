@@ -34,7 +34,12 @@ Kinds of blocks:
 * ``mtp_block``: the multi-token prediction block (``mtp``), one layer per
   depth (a single layer that serves every depth with
   ``--mtp-use-repeated-layer``), numbered identically in both formats and
-  never stacked.
+  never stacked. A GPT MTP layer holds a single inner layer, which both
+  formats store as ``transformer_layer`` (Megatron renames the live
+  ``mtp_model_layer`` on save and load); a Megatron-FSDP store saved before
+  that rename holds the live name, which the block records as a
+  :class:`ModuleRename` of the fsdp_dtensor side (so does
+  ``--fsdp-gpt-mtp-inner-name mtp_model_layer`` for an fsdp_dtensor target).
 * ``hybrid_mtp_inner``: the inner model of a hybrid multi-token prediction
   layer, ``mtp.layers.<d>.mtp_model_layer`` (the same name in both formats), a
   ``HybridStack`` of the pattern's MTP part numbered like the decoder from
@@ -62,14 +67,22 @@ from .args_view import ArgsView
 from .hybrid_pattern import HybridPattern, family_mismatch, group_modules, hybrid_pattern_of
 from .keys import (
     LAYER_SEGMENT,
-    MTP_INNER_LAYER,
     KeyGrammarError,
     innermost_layer_key,
     join_layer_key,
     root_of,
     split_layer_key,
 )
-from .names import FSDP_DTENSOR, PER_LAYER, STACKED, TD_LAYOUTS, TORCH_DIST
+from .names import (
+    FSDP_DTENSOR,
+    GPT_MTP_INNER_LAYER,
+    MTP_INNER_LAYER,
+    MTP_INNER_LAYERS,
+    PER_LAYER,
+    STACKED,
+    TD_LAYOUTS,
+    TORCH_DIST,
+)
 from .registry import REGISTRY
 
 HYBRID_STACK = "hybrid_stack"
@@ -84,6 +97,10 @@ DECODER = "decoder"
 """The language model's decoder, under the language model's prefix."""
 
 LANGUAGE_MODEL = "language_model"
+MTP_BLOCKS = (MTP, f"{LANGUAGE_MODEL}.{MTP}")
+"""Prefixes of the multi-token prediction block: a single-root model's and a vision-language
+model's."""
+
 SINGLE_ROOTS = frozenset({"embedding", DECODER, "output_layer", MTP})
 """Top-level modules of a single-root (GPT or hybrid) model."""
 
@@ -92,6 +109,30 @@ VLM_ROOTS = frozenset({LANGUAGE_MODEL, "vision_model", "vision_projection"})
 
 VISION_DECODER = "vision_model.decoder"
 """The vision encoder's ``TransformerBlock`` in a vision-language model."""
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleRename:
+    """A module of a block's layers that one format stores under another name than its logical one.
+
+    Attributes:
+        fmt: The format that stores the module renamed.
+        logical: The module's name in logical ids (and in the other format).
+        stored: The module's name in the keys of ``fmt``.
+        reason: Why ``fmt`` stores it so (the plan's evidence, and a warning).
+    """
+
+    fmt: str
+    logical: str
+    stored: str
+    reason: str
+
+
+def _rename_module(name: str, old: str, new: str) -> str | None:
+    """``name`` (inside a layer) with its leading module ``old`` named ``new``, if it is in it."""
+    if name == old or name.startswith(old + "."):
+        return new + name[len(old) :]
+    return None
 
 
 @dataclass(frozen=True)
@@ -108,6 +149,8 @@ class BlockLayout:
         dense_to_td: The torch_dist layer index of each module (dense order).
         symbols: The hybrid pattern symbol(s) of each module, if known.
         evidence: What the layout was derived from.
+        renames: Modules of the layers that a format stores under another
+            name than their logical one.
 
     Raises:
         InternalError: ``dense_to_td`` does not have one distinct index per
@@ -121,6 +164,7 @@ class BlockLayout:
     dense_to_td: tuple[int, ...]
     symbols: tuple[str, ...] | None
     evidence: str
+    renames: tuple[ModuleRename, ...] = ()
 
     def __post_init__(self) -> None:
         if len(self.dense_to_td) != self.num_modules or len(set(self.dense_to_td)) != len(
@@ -164,6 +208,22 @@ class BlockLayout:
     def stored_index(self, dense: int, fmt: str) -> int:
         """The index a store of format ``fmt`` holds the dense layer ``dense`` under."""
         return self.stored_indices(fmt)[dense]
+
+    def logical_name(self, name: str, fmt: str) -> str:
+        """The logical name of ``name``, a name inside a layer of a store of format ``fmt``."""
+        for rename in self.renames:
+            renamed = _rename_module(name, rename.stored, rename.logical)
+            if rename.fmt == fmt and renamed is not None:
+                return renamed
+        return name
+
+    def stored_name(self, name: str, fmt: str) -> str:
+        """The name inside a layer a store of format ``fmt`` gives the logical name ``name``."""
+        for rename in self.renames:
+            renamed = _rename_module(name, rename.logical, rename.stored)
+            if rename.fmt == fmt and renamed is not None:
+                return renamed
+        return name
 
     def index_table(self) -> str:
         """Every module's dense index, torch_dist index and symbols: ``0: 0 E, 1: 1 *E, 2: 3 -``."""
@@ -249,6 +309,8 @@ class BlockFacts:
             ``--block-layout`` (fsdp_dtensor sources).
         per_layer: torch_dist stores every TransformerBlock per layer
             (``--torch-dist-layout per-layer``; fsdp_dtensor sources).
+        fsdp_gpt_mtp_inner_name: What fsdp_dtensor names the inner layer of
+            GPT MTP layers (``--fsdp-gpt-mtp-inner-name``; torch_dist sources).
     """
 
     args: ArgsView
@@ -257,6 +319,7 @@ class BlockFacts:
     content_metadata: Mapping[str, Any] | None = None
     layouts: Mapping[str, str] = field(default_factory=dict)
     per_layer: bool = False
+    fsdp_gpt_mtp_inner_name: str = GPT_MTP_INNER_LAYER
 
     @functools.cached_property
     def census(self) -> dict[str, BlockCensus]:
@@ -342,7 +405,8 @@ def multi_token_prediction(facts: BlockFacts) -> Iterator[BlockLayout]:
     hybrid MTP layer's inner model is a ``HybridStack`` of its part of the
     pattern, stored per layer under ``mtp_model_layer.layers.<j>`` in both
     formats (``MultiTokenPredictionLayer.sharded_state_dict`` renames the
-    inner model of GPT MTP layers only).
+    inner model of GPT MTP layers only); a GPT MTP layer's is one layer,
+    stored as ``transformer_layer`` (see :func:`_gpt_mtp_renames`).
 
     Raises:
         RefusedError: ``args.mtp_num_layers`` disagrees with the pattern's MTP
@@ -366,9 +430,12 @@ def multi_token_prediction(facts: BlockFacts) -> Iterator[BlockLayout]:
     if facts.args.get("mtp_use_repeated_layer", False):
         count = 1
         evidence += " with args.mtp_use_repeated_layer=True (one layer serves every depth)"
-    yield BlockLayout(prefix, MTP_BLOCK, count, PER_LAYER, tuple(range(count)), None, evidence)
+    renames = _gpt_mtp_renames(facts) if is_gpt_mtp(facts.args) else ()
+    yield BlockLayout(
+        prefix, MTP_BLOCK, count, PER_LAYER, tuple(range(count)), None, evidence, renames
+    )
     if pattern is None:
-        return  # a GPT MTP layer's inner model is a single layer
+        return  # GPT MTP layers (is_gpt_mtp): the inner model is a single layer
     for depth in range(count):
         symbols = pattern.mtp[depth]
         yield _hybrid_layer_list(
@@ -379,6 +446,97 @@ def multi_token_prediction(facts: BlockFacts) -> Iterator[BlockLayout]:
             f"MTP depth pattern {symbols!r} ({_count(len(symbols), 'layer')})",
             what=f"the hybrid layer list of MTP depth {depth} ({symbols!r})",
         )
+
+
+def is_gpt_mtp(args: ArgsView) -> bool:
+    """Whether the multi-token prediction layers of the arguments' model, if any, are GPT MTP
+    layers (no hybrid layer pattern) rather than hybrid ones.
+
+    The one predicate of the GPT MTP naming policy, which this module keeps
+    whole: a GPT MTP layer holds a single inner ``TransformerLayer``, live
+    name ``mtp_model_layer`` (:func:`gpt_mtp_live_name`), which both formats
+    store as ``transformer_layer`` (:func:`_gpt_mtp_renames` for the legacy
+    exception, :func:`mtp_inner_keys` to find the stored names); a hybrid MTP
+    layer's inner layer list is ``mtp_model_layer`` everywhere.
+    """
+    return hybrid_pattern_of(args) is None
+
+
+def gpt_mtp_live_name(name: str) -> str:
+    """The live (``named_parameters``) name of ``name``, a logical name inside a GPT MTP layer:
+    its inner ``transformer_layer`` is ``mtp_model_layer`` in the live model; other names are
+    unchanged (hybrid MTP layers keep their names, so this applies to GPT MTP layers only)."""
+    return _rename_module(name, GPT_MTP_INNER_LAYER, MTP_INNER_LAYER) or name
+
+
+def _gpt_mtp_renames(facts: BlockFacts) -> tuple[ModuleRename, ...]:
+    """How the fsdp_dtensor side names the inner layer of GPT MTP layers, where it is not
+    ``transformer_layer`` as on current Megatron.
+
+    Megatron stores it as ``transformer_layer`` in both formats, renaming the
+    live ``mtp_model_layer`` on save and load
+    (``MultiTokenPredictionLayer.sharded_state_dict``,
+    ``handle_mtp_in_state_dict``), but Megatron-FSDP saved the live name
+    before ``handle_mtp_in_state_dict`` existed: an fsdp_dtensor source that
+    holds it (and only it, which the refusal fence checks, FC-R09) is read
+    under it, and an fsdp_dtensor target is written under it with
+    ``--fsdp-gpt-mtp-inner-name mtp_model_layer``.
+    """
+    if facts.source == FSDP_DTENSOR:
+        legacy = [key for key in mtp_inner_keys(facts.model) if key.name == MTP_INNER_LAYER]
+        if not legacy:
+            return ()
+        reason = (
+            "the fsdp_dtensor source stores the inner layer of its GPT MTP layers "
+            f"({_count(len(legacy), 'key')}) under the live name {MTP_INNER_LAYER}, as "
+            "Megatron-FSDP saved it before handle_mtp_in_state_dict; torch_dist stores it as "
+            f"{GPT_MTP_INNER_LAYER}"
+        )
+    elif facts.fsdp_gpt_mtp_inner_name == MTP_INNER_LAYER:
+        reason = (
+            f"--fsdp-gpt-mtp-inner-name {MTP_INNER_LAYER}: the fsdp_dtensor target stores the "
+            "inner layer of its GPT MTP layers under the live name, which only Megatron-FSDP "
+            f"versions older than handle_mtp_in_state_dict load ({GPT_MTP_INNER_LAYER} otherwise)"
+        )
+    else:
+        return ()
+    return (ModuleRename(FSDP_DTENSOR, GPT_MTP_INNER_LAYER, MTP_INNER_LAYER, reason),)
+
+
+@dataclass(frozen=True, slots=True)
+class MtpInnerKey:
+    """A model key under the inner layer of a multi-token prediction layer.
+
+    Attributes:
+        key: The model-relative key.
+        name: The inner layer's name (``transformer_layer`` or ``mtp_model_layer``).
+        layer_list: The inner layer holds a layer list (``<name>.layers.``), as a
+            hybrid MTP layer's does.
+    """
+
+    key: str
+    name: str
+    layer_list: bool
+
+
+def mtp_inner_keys(model: Iterable[str]) -> list[MtpInnerKey]:
+    """The keys of ``model`` under the inner layer of a multi-token prediction layer,
+    ``[language_model.]mtp.layers.<d>.<name>.<...>`` with ``name`` ``transformer_layer`` or
+    ``mtp_model_layer`` (sorted; malformed layer segments are left to the planner)."""
+    found = []
+    for key in sorted(model):
+        for block in MTP_BLOCKS:
+            try:
+                layer_key = split_layer_key(key, block)
+            except KeyGrammarError:
+                continue
+            if layer_key is None or layer_key.index is None:
+                continue
+            name = layer_key.inner.partition(".")[0]
+            if name in MTP_INNER_LAYERS:
+                layer_list = layer_key.inner.startswith(name + LAYER_SEGMENT)
+                found.append(MtpInnerKey(key, name, layer_list))
+    return found
 
 
 def _mtp_depths(args: ArgsView, pattern: HybridPattern | None) -> tuple[int, str]:
