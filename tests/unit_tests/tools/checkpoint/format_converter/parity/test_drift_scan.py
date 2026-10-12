@@ -25,12 +25,16 @@ from tools.checkpoint.format_converter.core.keys import (
     SWIGLU_KEYS,
 )
 from tools.checkpoint.format_converter.core.names import GPT_MTP_INNER_LAYER, MTP_INNER_LAYER
+from tools.checkpoint.format_converter.core.param_groups import ALIAS_PREFIX, IDENTIFIER_KEYS
 from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 
 from .._harness import REPO_ROOT
 
 CHECKPOINTING = REPO_ROOT / "megatron" / "training" / "checkpointing.py"
 MEGATRON_CORE = REPO_ROOT / "megatron" / "core"
+OPTIMIZER = MEGATRON_CORE / "optimizer" / "optimizer.py"
+DISTRIB_OPTIMIZER = MEGATRON_CORE / "optimizer" / "distrib_optimizer.py"
+PARAM_SCHEDULER = MEGATRON_CORE / "optimizer_param_scheduler.py"
 TRANSFORMER_MODULE = MEGATRON_CORE / "transformer" / "module.py"
 KEEP_FP32_MARK = "mark_keep_in_fp32"
 ARGUMENT_UTILS = REPO_ROOT / "megatron" / "training" / "argument_utils.py"
@@ -429,3 +433,27 @@ def _mark_line() -> int:
         if isinstance(node, ast.Assign)
     ]
     return node.lineno
+
+
+def test_the_parameter_group_identifier_keys_are_the_mirrored_ones():
+    """``ParamGroupOverride``'s fields, sorted, then the structural flags; read with a ``pre_``
+    alias by the classic loader."""
+    override = _definition(_module(PARAM_SCHEDULER), "ParamGroupOverride")
+    fields = sorted(node.target.id for node in override.body if isinstance(node, ast.AnnAssign))
+    tree = _module(OPTIMIZER)
+    (assigned,) = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "param_group_identifier_keys" for t in node.targets)
+    ]
+    starred, *flags = assigned.elts
+    assert ast.unparse(starred) == "*_param_group_override_keys()"
+    overrides = ast.unparse(_definition(tree, "_param_group_override_keys"))
+    assert "sorted(_ParamGroupOverride.__annotations__.keys())" in overrides
+    assert IDENTIFIER_KEYS == (
+        *fields,
+        *(ast.literal_eval(flag) for flag in flags),
+    ), "Megatron identifies parameter groups by other keys; review core/param_groups.py"
+    make_needed = ast.unparse(_definition(_module(DISTRIB_OPTIMIZER), "make_needed_groups"))
+    assert f"f'{ALIAS_PREFIX}{{key}}'" in make_needed and "value = None" in make_needed

@@ -24,6 +24,7 @@ from tools.checkpoint.format_converter.core.names import (
     STACKED,
     TORCH_DIST,
 )
+from tools.checkpoint.format_converter.core.param_groups import IDENTIFIER_KEYS
 from tools.checkpoint.format_converter.core.refusals import Facts, grouped_tensor_parallel
 from tools.checkpoint.format_converter.core.registry import REGISTRY, Allowlist
 from tools.checkpoint.format_converter.core.stacking import per_layer_reasons
@@ -43,6 +44,7 @@ from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_s
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.hybrid import hybrid_layer_allocation
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_expert_index_from_key
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -278,3 +280,7 @@ def test_the_hybrid_stack_spec_always_builds_grouped_experts():
     assert _experts_module(hybrid_stack_spec.submodules.moe_layer.submodules.mlp) == (
         EXPERT_MODULES[GROUPED]
     )
+
+
+def test_the_parameter_group_identifier_keys_are_megatrons():
+    assert IDENTIFIER_KEYS == param_group_identifier_keys

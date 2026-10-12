@@ -49,6 +49,7 @@ from ..core.keys import (
     split_layer_key,
 )
 from ..core.names import FSDP_GROUP_META, FSDP_OPTIMIZER_STATE, MOMENTS
+from ..core.param_groups import IDENTIFIER_KEYS
 from ..engine.metadata import MetadataView, TensorEntry
 from ..errors import Refusal, refusal_error
 
@@ -72,26 +73,18 @@ KNOWN_HPARAMS = frozenset(
         "capturable",
         "default_config",
         "differentiable",
-        "end_wd",
         "eps",
         "foreach",
         "fused",
-        "is_decoupled_lr",
-        "is_expert_parallel",
         "lr",
-        "lr_mult",
-        "max_lr",
         "maximize",
-        "min_lr",
-        "optimizer",
-        "start_wd",
         STEP,
-        "wd_mult",
         "weight_decay",
+        *IDENTIFIER_KEYS,
     }
 )
 """Hyperparameters a key without a planner path may end with: Adam's (``torch.optim.Adam`` and
-Transformer Engine's ``FusedAdam``) and Megatron's (``_get_param_groups``)."""
+Transformer Engine's ``FusedAdam``) and Megatron's (``_get_param_groups``, the identifier keys)."""
 
 _MODULE_LEVELS = re.compile(r"(?:module\.)*")
 
