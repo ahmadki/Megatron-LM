@@ -107,6 +107,7 @@ def decompose(
         LogicalSlice(
             LogicalId(prefix, layer, path, leaf, index, part),
             entry.key,
+            relative,
             Region(
                 tuple(p for p in (layer_at, index_at) if p is not None) + (0,) * len(rest),
                 (1,) * lead + rest,

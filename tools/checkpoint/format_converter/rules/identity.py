@@ -3,7 +3,7 @@
 """The identity rule: tensors stored the same way in both formats.
 
 It runs last and takes every slice no other rule claimed, except slices whose
-stored key a sentinel of the source format reserves for another rule (those
+model-relative key a sentinel of the source format reserves for another rule (those
 are declined with the sentinel's reason and refused by the planner). Each
 taken slice becomes one output tensor with the same logical id and shape; the
 element type is decided by the conversion's dtype policy.
@@ -36,7 +36,7 @@ class IdentityRule(LeafRule):
         sentinels = REGISTRY.sentinels_for(ctx.source[0])
 
         def unreserved(piece: LogicalSlice) -> bool:
-            reserved = [sentinel for sentinel in sentinels if sentinel.matches(piece.key)]
+            reserved = [sentinel for sentinel in sentinels if sentinel.matches(piece.relative)]
             for sentinel in reserved:
                 pool.decline(piece, f"{sentinel.reason} (owned by {', '.join(sentinel.owners)})")
             return not reserved

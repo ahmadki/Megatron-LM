@@ -127,6 +127,7 @@ def test_a_stacked_tensor_decomposes_into_one_slice_per_layer():
         LogicalSlice(
             LogicalId("decoder", layer, "self_attention.linear_qkv", "weight"),
             key,
+            key,
             Region((layer, 0, 0), (1, 6, 4)),
             torch.float32,
             squeezed=1,
@@ -202,6 +203,7 @@ def test_a_stacked_expert_tensor_decomposes_into_one_slice_per_layer_and_expert(
     assert slices == [
         LogicalSlice(
             LogicalId("decoder", layer, "mlp.experts.linear_fc1", "weight", expert),
+            STACKED_FC1,
             STACKED_FC1,
             Region((layer, expert, 0, 0), (1, 1, 6, 5)),
             torch.bfloat16,

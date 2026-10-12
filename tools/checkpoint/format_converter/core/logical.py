@@ -106,6 +106,8 @@ class LogicalSlice:
     Attributes:
         lid: The logical tensor.
         key: The stored source key (with the format envelope).
+        relative: The model-relative key of the stored tensor (``key`` without
+            its envelope; sentinels match it, whichever section the tensor is in).
         region: The box of ``key`` that holds the logical tensor.
         dtype: Element type of the stored tensor.
         squeezed: Leading size-1 axes of ``region`` the logical tensor does not have.
@@ -116,6 +118,7 @@ class LogicalSlice:
 
     lid: LogicalId
     key: str
+    relative: str
     region: Region
     dtype: torch.dtype
     squeezed: int = 0

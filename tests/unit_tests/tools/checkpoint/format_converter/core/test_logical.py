@@ -64,6 +64,7 @@ def test_slice_shape_is_its_region():
     piece = LogicalSlice(
         QKV,
         "decoder.layers.3.self_attention.linear_qkv.weight",
+        "decoder.layers.3.self_attention.linear_qkv.weight",
         Region((0, 0), (24, 8)),
         torch.bfloat16,
     )

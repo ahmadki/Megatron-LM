@@ -28,7 +28,7 @@ def _context(source: str, target: str):
 
 def _slice(key: str, shape: tuple[int, ...], dtype=torch.bfloat16) -> LogicalSlice:
     path, _, leaf = key.rpartition(".")
-    return LogicalSlice(LogicalId(None, None, path, leaf), key, Region.full(shape), dtype)
+    return LogicalSlice(LogicalId(None, None, path, leaf), key, key, Region.full(shape), dtype)
 
 
 def test_identity_is_registered_last():
@@ -55,6 +55,7 @@ def test_a_layer_of_a_stacked_tensor_is_copied_with_the_layer_shape():
     layer = LogicalSlice(
         lid,
         "decoder.layers.mlp.linear_fc1.weight",
+        "decoder.layers.mlp.linear_fc1.weight",
         Region((1, 0, 0), (1, 16, 8)),
         torch.bfloat16,
         1,
@@ -69,6 +70,7 @@ def test_one_expert_of_an_expert_tensor_is_copied_as_that_experts_tensor():
     lid = LogicalId("decoder", 1, "mlp.experts.linear_fc1", "weight", 3)
     expert = LogicalSlice(
         lid,
+        "decoder.layers.mlp.experts.experts.linear_fc1.weight",
         "decoder.layers.mlp.experts.experts.linear_fc1.weight",
         Region((1, 3, 0, 0), (1, 1, 6, 8)),
         torch.bfloat16,
@@ -111,3 +113,19 @@ def test_sentinels_apply_to_their_source_format_only():
     assert "(owned by glu)" in pool.declined(half.lid)[0]
     pool = LogicalPool([half])
     assert len(list(IdentityRule().claim(pool, _context(TORCH_DIST, FSDP_DTENSOR)))) == 1
+
+
+def test_sentinels_match_the_model_relative_key_of_optimizer_state():
+    # A moment's stored key ends with the moment, but the half it belongs to is the GLU rule's.
+    relative = "decoder.layers.1.mlp.linear_fc1.weight_w"
+    key = f"optimizer.state.module.module.module.{relative}.exp_avg"
+    half = LogicalSlice(
+        LogicalId("decoder", 1, "mlp.linear_fc1", "weight", part="w"),
+        key,
+        relative,
+        Region.full((8, 8)),
+        torch.float32,
+    )
+    pool = LogicalPool([half])
+    assert list(IdentityRule().claim(pool, _context(FSDP_DTENSOR, TORCH_DIST))) == []
+    assert "(owned by glu)" in pool.declined(half.lid)[0]

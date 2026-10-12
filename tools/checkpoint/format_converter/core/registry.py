@@ -65,7 +65,8 @@ class Sentinel:
     Attributes:
         name: Unique name.
         fmt: Source format whose keys the pattern applies to.
-        pattern: Searched in the stored source key.
+        pattern: Searched in the model-relative source key (the stored key
+            without its envelope), so that it applies to a tensor in any section.
         owners: Rules, or refusal codes of pending families, that handle the keys.
         reason: Why identity may not convert them.
     """
@@ -77,7 +78,7 @@ class Sentinel:
     reason: str
 
     def matches(self, key: str) -> bool:
-        """Whether the stored source key ``key`` is reserved by this sentinel."""
+        """Whether the model-relative source key ``key`` is reserved by this sentinel."""
         return self.pattern.search(key) is not None
 
 

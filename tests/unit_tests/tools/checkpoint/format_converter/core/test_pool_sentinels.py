@@ -28,9 +28,8 @@ from .._harness import REPO_ROOT
 
 def _slice(layer: int, leaf: str = "weight") -> LogicalSlice:
     lid = LogicalId("decoder", layer, "mlp.linear_fc1", leaf)
-    return LogicalSlice(
-        lid, f"decoder.layers.{layer}.mlp.linear_fc1.{leaf}", Region((0,), (4,)), torch.float32
-    )
+    key = f"decoder.layers.{layer}.mlp.linear_fc1.{leaf}"
+    return LogicalSlice(lid, key, key, Region((0,), (4,)), torch.float32)
 
 
 def _copy_of(piece: LogicalSlice) -> FamilyInstance:
@@ -77,7 +76,7 @@ def test_declined_slices_keep_their_reasons():
 
 def test_duplicate_logical_ids_are_internal_errors():
     piece = _slice(0)
-    twin = LogicalSlice(piece.lid, "elsewhere", piece.region, piece.dtype)
+    twin = LogicalSlice(piece.lid, "elsewhere", "elsewhere", piece.region, piece.dtype)
     with pytest.raises(InternalError, match="held by both"):
         LogicalPool([piece, twin])
 

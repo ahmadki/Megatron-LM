@@ -68,6 +68,9 @@ REQUIRED_COMMON_KEYS = ("args", "iteration", "checkpoint_version")
 KEPT_SECTIONS = frozenset({Section.MODEL, Section.EXTRA_STATE})
 """Sections a weights-only rewrite copies (the others but the common state are dropped)."""
 
+OPTIMIZER_STATE_PREFIX = "optimizer.state."
+"""Prefix of the fully reshardable optimizer-state keys: ``optimizer.state.<state>.<model key>``."""
+
 _OPTIMIZER_STATE = re.compile(r"^(chained_\d+\.)?optimizer\.state\.")
 _OPTIMIZER = re.compile(r"^(chained_\d+\.)?optimizer\.")
 
@@ -130,6 +133,10 @@ class TorchDistAdapter:
         del dtype, max_chunk_bytes
         return (placed.region,)
 
+    def state_layout(self, state: str) -> OptimizerStateLayout:
+        """The layout of every parameter's fully reshardable optimizer state ``state``."""
+        return OptimizerStateLayout(state)
+
     def read_common_raw(self, reader: SourceReader) -> RawCommon | None:
         """The common state: ``common.pt`` if the store has one (as Megatron reads it), else
         the ``common_state/shard_0_1`` byte item; ``None`` if neither exists.
@@ -179,6 +186,40 @@ class TorchDistAdapter:
             raise IntegrityError(f"{config} holds {declared}, expected {TORCH_DIST_CONFIG}")
         if (iter_dir / LEGACY_COMMON_FILE).exists():
             raise IntegrityError(f"{iter_dir} holds a {LEGACY_COMMON_FILE}, which is never written")
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerStateLayout:
+    """Where a torch_dist store keeps one fully reshardable optimizer state of every parameter.
+
+    ``DistributedOptimizer.sharded_param_state_fully_reshardable`` saves state
+    ``state`` (``param``, the fp32 main parameter, or a moment) of the
+    parameter with model key ``<key>`` as ``optimizer.state.<state>.<key>``,
+    replacing the data of the parameter's sharded tensor: same shape, stacking
+    and split-factory parts, and no ``chained_<i>.`` prefix
+    (``chained_optim_avoid_prefix``). Its chunks follow the model's
+    (:meth:`TorchDistAdapter.output_grid`).
+
+    Attributes:
+        state: The state's name.
+    """
+
+    state: str
+    fmt: ClassVar[str] = TORCH_DIST
+
+    def stored_key(self, relative: str) -> str:
+        """``optimizer.state.<state>.<relative>``."""
+        return f"{OPTIMIZER_STATE_PREFIX}{self.state}.{relative}"
+
+    def planner_path(self, key: str) -> None:
+        """torch_dist stores record no planner paths."""
+        del key
+
+    def output_grid(
+        self, placed: OutputSlice, dtype: torch.dtype, *, max_chunk_bytes: int
+    ) -> tuple[Region, ...]:
+        """The chunks of the parameter's model tensor (one per output)."""
+        return TorchDistAdapter().output_grid(placed, dtype, max_chunk_bytes=max_chunk_bytes)
 
 
 @dataclass(frozen=True)
