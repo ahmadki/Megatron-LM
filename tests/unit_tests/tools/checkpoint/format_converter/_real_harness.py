@@ -29,15 +29,20 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+import pytest
 import torch
 from torch.distributed.tensor import DTensor
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, apply_factories
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -60,6 +65,8 @@ from tests.unit_tests.dist_checkpointing.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 from tools.checkpoint.format_converter.api import convert_checkpoint, verify_checkpoint
+from tools.checkpoint.format_converter.core.keys import EXTRA_STATE
+from tools.checkpoint.format_converter.core.part_layout import PartLayout
 from tools.checkpoint.format_converter.engine.metadata import MetadataView
 from tools.checkpoint.format_converter.options import CompareMode, ConvertOptions, VerifyOptions
 
@@ -73,9 +80,14 @@ __all__ = [
     "build_hybrid",
     "build_llava",
     "build_moe_gpt",
+    "build_linear_attention_gpt",
     "build_te_gpt",
+    "canonical_tensors",
     "convert_store",
     "full_params",
+    "gathered_ranks",
+    "initialize_tensor_parallel",
+    "linear_attention_gpt_provider",
     "live_params",
     "load_weights_only",
     "moe_gpt_provider",
@@ -83,6 +95,7 @@ __all__ = [
     "on_rank_zero",
     "persistent_buffers",
     "randomize_parameters",
+    "rank_major_pack",
     "real_save",
     "resolve_weight_shards",
     "run_bf16_fsdp_chain",
@@ -90,6 +103,7 @@ __all__ = [
     "save_weights_only",
     "set_format",
     "set_moe_format",
+    "sharded_tensors",
     "training_args",
     "verify_store",
 ]
@@ -119,6 +133,66 @@ def nccl_skip_reason() -> str | None:
     if backend != "nccl":
         return f"the default process group is {backend}, not nccl (left by an earlier test?)"
     return None
+
+
+def initialize_tensor_parallel(tp: int) -> None:
+    """Initialize ``tp`` tensor-parallel ranks (no pipeline parallelism), or skip the test when the
+    world does not divide by ``tp`` or :func:`nccl_skip_reason` gives a reason."""
+    if Utils.world_size % tp:
+        pytest.skip(f"needs a world size divisible by tp={tp}")
+    Utils.initialize_model_parallel(tp, 1)
+    reason = nccl_skip_reason()
+    if reason is not None:
+        pytest.skip(reason)
+
+
+def sharded_tensors(sharded_state_dict) -> list[ShardedTensor]:
+    """The sharded tensors of a sharded state dict, split factories applied (no extra state)."""
+    apply_factories(sharded_state_dict)
+    found = []
+    for value in sharded_state_dict.values():
+        for tensor in value if isinstance(value, list) else [value]:
+            if isinstance(tensor, ShardedTensor) and not EXTRA_STATE.search(tensor.key):
+                found.append(tensor)
+    return found
+
+
+def canonical_tensors(tensors: list[ShardedTensor]) -> dict[str, torch.Tensor]:
+    """Every sharded tensor of every tensor-parallel rank placed in its global tensor (a
+    collective)."""
+    mine = [
+        (t.key, tuple(t.global_shape), tuple(t.global_offset), t.data.detach().cpu())
+        for t in tensors
+    ]
+    group = parallel_state.get_tensor_model_parallel_group()
+    everyone: list = [None] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(everyone, mine, group=group)
+    canonical: dict[str, torch.Tensor] = {}
+    for entries in everyone:
+        for key, shape, offset, data in entries:
+            whole = canonical.setdefault(key, torch.full(shape, float("nan"), dtype=data.dtype))
+            index = tuple(slice(o, o + n) for o, n in zip(offset, data.shape))
+            whole[index] = data
+    return canonical
+
+
+def gathered_ranks(local: torch.Tensor) -> torch.Tensor:
+    """The tensor-parallel ranks' local tensors, one after the other (a collective)."""
+    group = parallel_state.get_tensor_model_parallel_group()
+    shards = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size(group))]
+    torch.distributed.all_gather(shards, local.contiguous(), group=group)
+    return torch.cat(shards).cpu()
+
+
+def rank_major_pack(layout: PartLayout, parts: Mapping[str, torch.Tensor], tp: int) -> torch.Tensor:
+    """``parts`` (canonical, by name) placed rank-major at ``tp`` by ``layout``'s map; rows the map
+    leaves out stay NaN."""
+    rest = next(iter(parts.values())).shape[1:]
+    packed = torch.full((layout.fused_rows, *rest), float("nan"))
+    for run in layout.rank_major_map(tp):
+        rows = slice(run.fused_start, run.fused_start + run.rows)
+        packed[rows] = parts[run.part][run.part_start : run.part_start + run.rows]
+    return packed
 
 
 @contextlib.contextmanager
@@ -352,6 +426,31 @@ def te_gpt_provider(
     return model
 
 
+def linear_attention_gpt_provider(
+    pre_process: bool = True, post_process: bool = True, *, seed: int, **kwargs
+) -> GPTModel:
+    """A tiny GPT whose linear-attention layers are Gated DeltaNets (``kwargs`` give the
+    ``experimental_attention_variant``, ``linear_attention_freq`` and ``linear_*`` dimensions),
+    built with the experimental-attention-variant block spec; otherwise as :func:`te_gpt_provider`.
+    """
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+    config = _transformer_config(GPT_LAYERS, HYBRID_HIDDEN, HYBRID_HEADS, **kwargs)
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_transformer_block_with_experimental_attention_variant_spec(
+            config
+        ),
+        vocab_size=HYBRID_VOCAB,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        share_embeddings_and_output_weights=False,
+    )
+    randomize_parameters(model, seed)
+    return model
+
+
 def llava_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -470,6 +569,21 @@ def build_te_gpt(
         tp=tp,
         pp=1,
         initialize_fn=partial(te_gpt_provider, **config),
+        use_megatron_fsdp=use_megatron_fsdp,
+        bf16=bf16,
+    )
+
+
+def build_linear_attention_gpt(
+    seed: int, *, tp: int, use_megatron_fsdp: bool = False, bf16: bool = True, **config
+):
+    """A tiny GPT with Gated DeltaNet linear attention (:func:`linear_attention_gpt_provider`;
+    classic or Megatron-FSDP v1) with its optimizer."""
+    return setup_model_and_optimizer(
+        seed=seed,
+        tp=tp,
+        pp=1,
+        initialize_fn=partial(linear_attention_gpt_provider, **config),
         use_megatron_fsdp=use_megatron_fsdp,
         bf16=bf16,
     )

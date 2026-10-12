@@ -49,8 +49,6 @@ gated_delta_product = pytest.importorskip("megatron.core.ssm.gated_delta_product
 # pylint: disable=wrong-import-position
 from torch.distributed.checkpoint.api import CheckpointException
 
-from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, apply_factories
 from megatron.core.models.hybrid.hybrid_layer_specs import gated_delta_product_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -73,17 +71,21 @@ from .._real_harness import (
     Utils,
     assert_params,
     build_hybrid,
+    canonical_tensors,
     convert_store,
     full_params,
+    gathered_ranks,
     hybrid_provider,
+    initialize_tensor_parallel,
     load_weights_only,
     main_layers,
-    nccl_skip_reason,
     on_rank_zero,
     randomize_parameters,
+    rank_major_pack,
     run_chain,
     save_weights_only,
     set_format,
+    sharded_tensors,
     training_args,
     verify_store,
 )
@@ -116,15 +118,6 @@ IN_PROJ = {
 }
 CONV = {"V0": 32, "V1": 32, "V2": 32, "K0": 16, "K1": 16, "K2": 16, "Q": 16}
 GDP_SPEC = [HYBRID_SPEC_MODULES[0], "gated_delta_product_stack_spec"]
-
-
-def _initialize(tp: int) -> None:
-    if Utils.world_size % tp:
-        pytest.skip(f"needs a world size divisible by tp={tp}")
-    Utils.initialize_model_parallel(tp, 1)
-    reason = nccl_skip_reason()
-    if reason is not None:
-        pytest.skip(reason)
 
 
 def _args(tp: int) -> ArgsView:
@@ -172,7 +165,7 @@ class TestGdpChains:
         Utils.destroy_model_parallel()
 
     def test_gdp_hybrid(self, shared_dir):
-        _initialize(1)
+        initialize_tensor_parallel(1)
         with TempNamedDir(shared_dir / "fc_gdp_tp1") as root:
             findings = run_chain(root, tp=1, build=_build(1), configure=_configure)
         assert findings == {check: [] for check in CHAIN_CHECKS}
@@ -187,14 +180,14 @@ class TestGdpChains:
         "shard); when this passes, run the TP 2 chain",
     )
     def test_gdp_hybrid_through_megatron_fsdp_at_two_ranks(self, shared_dir):
-        _initialize(2)
+        initialize_tensor_parallel(2)
         with TempNamedDir(shared_dir / "fc_gdp_tp2") as root:
             run_chain(root, tp=2, build=_build(2), configure=_configure, options={"fsdp_tp": 2})
 
     def test_a_store_packed_at_two_ranks_holds_the_models_rank_major_tensors(self, shared_dir):
         """The live TP 2 model's fused tensors, its ranks' shards one after the other, are what
         Megatron-FSDP stores; converted back, the store loads strictly into a classic model."""
-        _initialize(2)
+        initialize_tensor_parallel(2)
         with TempNamedDir(shared_dir / "fc_gdp_pack_tp2") as root:
             s1, c1, back = (root / name for name in ("s1", "c1", "back"))
             with training_args(s1, tp=2) as args:
@@ -225,17 +218,6 @@ class TestGdpChains:
         assert findings == []
 
 
-def _sharded_tensors(sharded_state_dict) -> list[ShardedTensor]:
-    """The sharded tensors of a sharded state dict, split factories applied (no extra state)."""
-    apply_factories(sharded_state_dict)
-    found = []
-    for value in sharded_state_dict.values():
-        for tensor in value if isinstance(value, list) else [value]:
-            if isinstance(tensor, ShardedTensor) and not EXTRA_STATE.search(tensor.key):
-                found.append(tensor)
-    return found
-
-
 class TestMegatronKeys:
     """The converter's view of a real Gated DeltaProduct hybrid model's torch_dist keys."""
 
@@ -244,13 +226,13 @@ class TestMegatronKeys:
 
     @pytest.mark.parametrize("tp", [1, 2])
     def test_the_mixers_of_megatrons_keys_and_their_fsdp_dtensor_names(self, tp):
-        _initialize(tp)
+        initialize_tensor_parallel(tp)
         model = hybrid_provider(
             seed=1, pattern=PATTERN, stack_spec=gated_delta_product_stack_spec, **GDP
         )
         census = {
             t.key: TensorEntry(t.key, tuple(t.global_shape), t.dtype, ())
-            for t in _sharded_tensors(model.sharded_state_dict())
+            for t in sharded_tensors(model.sharded_state_dict())
         }
         assert "decoder.layers.2.mixer.in_proj.weight.V2" in census
         ctx = build_arch_context(
@@ -299,33 +281,6 @@ def _mixer(tp_rank_seed: int):
     return mixer
 
 
-def _canonical(tensors: list[ShardedTensor]) -> dict[str, torch.Tensor]:
-    """Every sharded tensor of every tensor-parallel rank placed in its global tensor (a
-    collective)."""
-    mine = [
-        (t.key, tuple(t.global_shape), tuple(t.global_offset), t.data.detach().cpu())
-        for t in tensors
-    ]
-    group = parallel_state.get_tensor_model_parallel_group()
-    everyone: list = [None] * torch.distributed.get_world_size(group)
-    torch.distributed.all_gather_object(everyone, mine, group=group)
-    canonical: dict[str, torch.Tensor] = {}
-    for entries in everyone:
-        for key, shape, offset, data in entries:
-            whole = canonical.setdefault(key, torch.full(shape, float("nan"), dtype=data.dtype))
-            index = tuple(slice(o, o + n) for o, n in zip(offset, data.shape))
-            whole[index] = data
-    return canonical
-
-
-def _gathered(local: torch.Tensor) -> torch.Tensor:
-    """The tensor-parallel ranks' local tensors, one after the other (a collective)."""
-    group = parallel_state.get_tensor_model_parallel_group()
-    shards = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size(group))]
-    torch.distributed.all_gather(shards, local.contiguous(), group=group)
-    return torch.cat(shards).cpu()
-
-
 class TestMegatronPack:
     """A real mixer's fused tensors against the pack of its own torch_dist parts."""
 
@@ -333,21 +288,17 @@ class TestMegatronPack:
         Utils.destroy_model_parallel()
 
     def test_each_ranks_fused_projections_are_its_block_of_the_rank_major_pack(self):
-        _initialize(2)
+        initialize_tensor_parallel(2)
         mixer = _mixer(3)
-        canonical = _canonical(_sharded_tensors(mixer.sharded_state_dict(prefix="mixer.")))
+        canonical = canonical_tensors(sharded_tensors(mixer.sharded_state_dict(prefix="mixer.")))
         assert not any(torch.isnan(t).any() for t in canonical.values() if t.is_floating_point())
         census = {k: TensorEntry(k, tuple(t.shape), t.dtype, ()) for k, t in canonical.items()}
         layout, _ = mixer_layout(_args(2), census, (), TORCH_DIST)
         assert len(layout.projections) == 4  # in_proj and conv1d, weight and bias
         for lid, fused in layout.projections.items():
             parts = {part: canonical[f"{lid.name}.{part}"] for part in fused.parts.parts}
-            rest = next(iter(parts.values())).shape[1:]
-            packed = torch.full((fused.parts.fused_rows, *rest), float("nan"))
-            for run in fused.parts.rank_major_map(2):
-                rows = slice(run.fused_start, run.fused_start + run.rows)
-                packed[rows] = parts[run.part][run.part_start : run.part_start + run.rows]
+            packed = rank_major_pack(fused.parts, parts, 2)
             param = mixer.get_parameter(lid.name.removeprefix("mixer."))
-            assert torch.equal(_gathered(param.detach()).float(), packed.float()), lid
+            assert torch.equal(gathered_ranks(param.detach()).float(), packed.float()), lid
             assert not torch.equal(packed, torch.cat(list(parts.values()))), lid
             assert list(param.partition_sizes) == [size // 2 for size in fused.parts.sizes], lid

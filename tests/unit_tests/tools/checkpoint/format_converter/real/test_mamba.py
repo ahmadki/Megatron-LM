@@ -47,8 +47,6 @@ if not (megatron_available() and torch.cuda.is_available()):
 pytest.importorskip("mamba_ssm")
 
 # pylint: disable=wrong-import-position
-from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, apply_factories
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -70,13 +68,17 @@ from .._real_harness import (
     MOE_CONFIG,
     Utils,
     build_hybrid,
+    canonical_tensors,
+    gathered_ranks,
     hybrid_provider,
+    initialize_tensor_parallel,
     main_layers,
-    nccl_skip_reason,
     randomize_parameters,
+    rank_major_pack,
     run_chain,
     set_format,
     set_moe_format,
+    sharded_tensors,
 )
 
 pytestmark = [pytest.mark.covers("mamba2", "parity"), pytest.mark.covers("mamba2", "real_save")]
@@ -88,15 +90,6 @@ IN_PROJ = {"z": 64, "x": 64, "B": 32, "C": 32, "dt": 8}
 CONV = {"x": 64, "B": 32, "C": 32}
 DEFAULT_HEADS = {"z": 128, "x": 128, "B": 32, "C": 32, "dt": 16}
 """Without mamba_num_heads: d = 2 x 64 = 128 and H = 128 / 8 = 16."""
-
-
-def _initialize(tp: int) -> None:
-    if Utils.world_size % tp:
-        pytest.skip(f"needs a world size divisible by tp={tp}")
-    Utils.initialize_model_parallel(tp, 1)
-    reason = nccl_skip_reason()
-    if reason is not None:
-        pytest.skip(reason)
 
 
 def _args(tp: int, **mamba) -> ArgsView:
@@ -136,7 +129,7 @@ def _configure(args, *, pattern: str, fsdp: bool, bf16: bool = True) -> None:
 
 def _chain(shared_dir, name: str, *, tp: int, pattern: str) -> dict[str, list[str]]:
     """:func:`run_chain` of a tiny Mamba-2 hybrid model of ``pattern`` at ``tp``."""
-    _initialize(tp)
+    initialize_tensor_parallel(tp)
     config = {**MAMBA, **(MOE_CONFIG if "E" in pattern else {})}
     with TempNamedDir(shared_dir / name) as root:
         return run_chain(
@@ -166,17 +159,6 @@ class TestMambaChains:
         assert findings == {check: [] for check in CHAIN_CHECKS}
 
 
-def _sharded_tensors(sharded_state_dict) -> list[ShardedTensor]:
-    """The sharded tensors of a sharded state dict, split factories applied (no extra state)."""
-    apply_factories(sharded_state_dict)
-    found = []
-    for value in sharded_state_dict.values():
-        for tensor in value if isinstance(value, list) else [value]:
-            if isinstance(tensor, ShardedTensor) and not EXTRA_STATE.search(tensor.key):
-                found.append(tensor)
-    return found
-
-
 def _mixer(seed: int) -> MambaMixer:
     """A Mamba-2 mixer of :data:`MAMBA` with distinct values in every parameter (and every
     tensor-parallel shard)."""
@@ -199,33 +181,6 @@ def _mixer(seed: int) -> MambaMixer:
     return mixer
 
 
-def _canonical(tensors: list[ShardedTensor]) -> dict[str, torch.Tensor]:
-    """Every sharded tensor of every tensor-parallel rank placed in its global tensor (a
-    collective)."""
-    mine = [
-        (t.key, tuple(t.global_shape), tuple(t.global_offset), t.data.detach().cpu())
-        for t in tensors
-    ]
-    group = parallel_state.get_tensor_model_parallel_group()
-    everyone: list = [None] * torch.distributed.get_world_size(group)
-    torch.distributed.all_gather_object(everyone, mine, group=group)
-    canonical: dict[str, torch.Tensor] = {}
-    for entries in everyone:
-        for key, shape, offset, data in entries:
-            whole = canonical.setdefault(key, torch.full(shape, float("nan"), dtype=data.dtype))
-            index = tuple(slice(o, o + n) for o, n in zip(offset, data.shape))
-            whole[index] = data
-    return canonical
-
-
-def _gathered(local: torch.Tensor) -> torch.Tensor:
-    """The tensor-parallel ranks' local tensors, one after the other (a collective)."""
-    group = parallel_state.get_tensor_model_parallel_group()
-    shards = [torch.empty_like(local) for _ in range(torch.distributed.get_world_size(group))]
-    torch.distributed.all_gather(shards, local.contiguous(), group=group)
-    return torch.cat(shards).cpu()
-
-
 class TestMegatronFactories:
     """``MambaMixer.sharded_state_dict``'s parts against the converter's layouts."""
 
@@ -234,11 +189,11 @@ class TestMegatronFactories:
 
     @pytest.mark.parametrize("tp", [1, 2])
     def test_the_factories_cut_the_converters_parts(self, tp):
-        _initialize(tp)
+        initialize_tensor_parallel(tp)
         mixer = _mixer(5)
         shapes = {
             t.key: (tuple(t.global_shape), tuple(t.local_shape))
-            for t in _sharded_tensors(mixer.sharded_state_dict(prefix="mixer."))
+            for t in sharded_tensors(mixer.sharded_state_dict(prefix="mixer."))
         }
         census = {
             k: TensorEntry(k, global_shape, torch.bfloat16, ())
@@ -281,12 +236,12 @@ class TestMegatronKeys:
     @pytest.mark.parametrize("heads", [8, None])
     @pytest.mark.parametrize("tp", [1, 2])
     def test_the_mixers_of_megatrons_keys_and_their_fsdp_dtensor_names(self, tp, heads):
-        _initialize(tp)
+        initialize_tensor_parallel(tp)
         mamba = {**MAMBA, "mamba_num_heads": heads}
         model = hybrid_provider(seed=1, pattern=PATTERN, **mamba)
         census = {
             t.key: TensorEntry(t.key, tuple(t.global_shape), t.dtype, ())
-            for t in _sharded_tensors(model.sharded_state_dict())
+            for t in sharded_tensors(model.sharded_state_dict())
         }
         assert "decoder.layers.2.mixer.conv1d.weight.C" in census
         ctx = build_arch_context(
@@ -329,21 +284,17 @@ class TestMegatronPack:
         Utils.destroy_model_parallel()
 
     def test_each_ranks_fused_projections_are_its_block_of_the_rank_major_pack(self):
-        _initialize(2)
+        initialize_tensor_parallel(2)
         mixer = _mixer(3)
-        canonical = _canonical(_sharded_tensors(mixer.sharded_state_dict(prefix="mixer.")))
+        canonical = canonical_tensors(sharded_tensors(mixer.sharded_state_dict(prefix="mixer.")))
         assert not any(torch.isnan(t).any() for t in canonical.values() if t.is_floating_point())
         census = {k: TensorEntry(k, tuple(t.shape), t.dtype, ()) for k, t in canonical.items()}
         layout, _ = mixer_layout(_args(2), census, (), TORCH_DIST)
         assert len(layout.projections) == 3  # in_proj.weight, conv1d weight and bias
         for lid, fused in layout.projections.items():
             param = mixer.get_parameter(fused.target_lid(FSDP_DTENSOR).name.removeprefix("mixer."))
-            live = _gathered(param.detach()).float()
+            live = gathered_ranks(param.detach()).float()
             parts = {part: canonical[f"{lid.name}.{part}"] for part in fused.parts.parts}
-            rest = next(iter(parts.values())).shape[1:]
-            packed = torch.full((fused.parts.fused_rows, *rest), float("nan"))
-            for run in fused.parts.rank_major_map(2):
-                rows = slice(run.fused_start, run.fused_start + run.rows)
-                packed[rows] = parts[run.part][run.part_start : run.part_start + run.rows]
+            packed = rank_major_pack(fused.parts, parts, 2)
             assert torch.equal(live, packed.float()), lid
             assert not torch.equal(packed, torch.cat(list(parts.values()))), lid
