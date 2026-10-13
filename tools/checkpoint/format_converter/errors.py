@@ -104,6 +104,11 @@ FC_R20 = "FC-R20"
 """The model uses a layer type no rule is verified for (hybrid symbol or attention variant), or
 an fsdp_dtensor store holds a SwiGLU half without its pair."""
 
+FC_R21 = "FC-R21"
+"""The model section of an fsdp_dtensor store holds a parameter with optimizer state in a narrower
+type than fp32, where Megatron-FSDP keeps its fp32 main copy (override:
+``--allow-bf16-masters``)."""
+
 FC_P11 = "FC-P11"
 """Pending: converting optimizer state from fsdp_dtensor to torch_dist."""
 

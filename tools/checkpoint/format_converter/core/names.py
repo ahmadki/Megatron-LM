@@ -84,3 +84,7 @@ prediction layer's inner layer (``transformer_layer`` by default, as current Meg
 MOMENTS = ("exp_avg", "exp_avg_sq")
 """Adam's moments: the per-parameter optimizer state both formats store, one tensor per parameter
 and moment, laid out as the parameter itself."""
+
+MAIN_PARAM = "param"
+"""The fully reshardable torch_dist optimizer state that holds a parameter's fp32 main copy (its
+master); Megatron-FSDP keeps the masters as its model section."""

@@ -679,6 +679,7 @@ condition of every code.
 | `FC-R18` | a ModelOpt state |
 | `FC-R19` | an `fsdp_dtensor` store with split fused-projection keys |
 | `FC-R20` | hybrid layer symbols or attention variants no rule is verified for, or a SwiGLU half without its pair |
+| `FC-R21` | `--optimizer convert` of an `fsdp_dtensor` store whose model section holds a trained parameter in a narrower type than fp32 (`--allow-bf16-masters` takes it as the fp32 master) |
 | `FC-A01` | an `fsdp_dtensor` target packs tensors per tensor-parallel rank, and the source's tensor-parallel size is above 1 (`--fsdp-tp`, `--fsdp-etp`), or it packs routed experts' tensors and `--fsdp-tp` is not the source's size (`--fsdp-etp`) |
 | `FC-A02` | a layer list of unknown kind converted to `torch_dist` (`--block-layout`) |
 | `FC-A04` | an `fsdp_dtensor` source names its routed experts otherwise than its arguments build them (`--expert-naming`) |

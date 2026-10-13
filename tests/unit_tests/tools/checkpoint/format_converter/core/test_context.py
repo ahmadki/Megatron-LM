@@ -163,6 +163,21 @@ def test_fsdp_optimizer_depth_follows_the_precision_and_notes_the_keys(fields, k
     assert logged.evidence.endswith(note) and logged.evidence.startswith("params_dtype")
 
 
+@pytest.mark.parametrize(("bf16", "dtype"), [(True, "bfloat16"), (False, "float32")])
+def test_converting_optimizer_state_gives_trained_parameters_masters(bf16, dtype):
+    ctx = build_arch_context(
+        source=FSDP_DTENSOR,
+        target=TORCH_DIST,
+        args=_args(bf16=bf16),
+        model={},
+        convert_optimizer=True,
+    )
+    assert ctx.dtype_policy.value == "masters"
+    (logged,) = [d for d in ctx.derivations if d.field == "dtype_policy"]
+    assert logged.value == "masters"
+    assert f"the master rounded to {dtype} as its model weight" in logged.evidence
+
+
 def test_contradictory_precision_is_refused():
     with pytest.raises(RefusedError) as excinfo:
         build_arch_context(

@@ -258,6 +258,7 @@ def build_arch_context(
     fsdp_etp: int | None = None,
     target_swiglu: str = AUTO_SWIGLU,
     fsdp_gpt_mtp_inner_name: str = GPT_MTP_INNER_LAYER,
+    convert_optimizer: bool = False,
 ) -> ArchContext:
     """Derive the context of converting a ``source`` store into ``target``.
 
@@ -288,6 +289,8 @@ def build_arch_context(
             ``--swiglu`` (``--target-swiglu``: ``auto``, ``on`` or ``off``).
         fsdp_gpt_mtp_inner_name: What an fsdp_dtensor target names the inner
             layer of GPT MTP layers (``--fsdp-gpt-mtp-inner-name``).
+        convert_optimizer: The optimizer state is converted too (``--optimizer
+            convert``): trainable parameters get masters (``DtypePolicy.MASTERS``).
 
     Raises:
         UsageError: ``source`` to ``target`` is not a cross-format direction,
@@ -376,7 +379,7 @@ def build_arch_context(
         Derivation("fsdp_model_prefix", FSDP_MODEL_PREFIX, f"dialect {DIALECTS[FSDP_DTENSOR]}")
     )
     depth = _fsdp_optim_depth(params_dtype, source, optimizer_keys, log)
-    log.append(Derivation("dtype_policy", DtypePolicy.PRESERVE.value, "weights-only conversion"))
+    dtype_policy = _dtype_policy(params_dtype, log, convert_optimizer=convert_optimizer)
     log.append(manifest_log)
     return ArchContext(
         direction=direction,
@@ -399,7 +402,7 @@ def build_arch_context(
         fsdp_glu_args=fsdp_glu_args,
         fsdp_model_prefix=FSDP_MODEL_PREFIX,
         fsdp_optim_depth=depth,
-        dtype_policy=DtypePolicy.PRESERVE,
+        dtype_policy=dtype_policy,
         manifest=manifest,
         derivations=tuple(log),
         warnings=tuple(warnings),
@@ -896,6 +899,29 @@ def _params_dtype(
         )
     )
     return dtype
+
+
+def _dtype_policy(
+    params_dtype: torch.dtype, log: list[Derivation], *, convert_optimizer: bool
+) -> DtypePolicy:
+    """Preserve every dtype, or with optimizer state give trainable parameters masters."""
+    if not convert_optimizer:
+        log.append(
+            Derivation("dtype_policy", DtypePolicy.PRESERVE.value, "weights-only conversion")
+        )
+        return DtypePolicy.PRESERVE
+    dtype = str(params_dtype).removeprefix("torch.")
+    log.append(
+        Derivation(
+            "dtype_policy",
+            DtypePolicy.MASTERS.value,
+            "--optimizer convert: every parameter with optimizer state gets its fp32 master as "
+            f"optimizer.state.param and the master rounded to {dtype} as its model weight (fp32 "
+            "for the parameters Megatron keeps in fp32); frozen parameters and buffers keep "
+            "their dtype",
+        )
+    )
+    return DtypePolicy.MASTERS
 
 
 def _parallel_size(

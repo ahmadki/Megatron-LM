@@ -77,6 +77,21 @@ class ModelPlan:
     outputs: int
 
 
+@dataclass(frozen=True)
+class RuledSection:
+    """What the rules make of a section's source tensors (before compiling).
+
+    Attributes:
+        outputs: The output tensors, in rule order.
+        slices: Every consumed source slice by logical id.
+        claims: Source slices claimed per rule.
+    """
+
+    outputs: tuple[LogicalOutput, ...]
+    slices: Mapping[LogicalId, LogicalSlice]
+    claims: dict[str, int]
+
+
 def plan_model(
     ctx: ArchContext,
     source: Mapping[str, TensorEntry],
@@ -100,6 +115,23 @@ def plan_model(
         InternalError: A rule claimed or consumed slices wrongly, or its
             copies do not cover the sources and outputs exactly.
     """
+    ruled = apply_rules(ctx, source, rules)
+    pieces = compile_outputs(
+        ctx, ruled.outputs, ruled.slices, source, target, max_chunk_bytes=max_chunk_bytes
+    )
+    return ModelPlan(pieces, ruled.claims, len(ruled.outputs))
+
+
+def apply_rules(
+    ctx: ArchContext, source: Mapping[str, TensorEntry], rules: Sequence[LeafRule]
+) -> RuledSection:
+    """Decompose ``source`` and let ``rules`` claim every slice and build the outputs.
+
+    Raises:
+        RefusedError: A source key does not fit the key grammar or the block
+            layouts, or slices are left unclaimed (FC-R13).
+        InternalError: A rule claimed or consumed slices wrongly.
+    """
     pool = LogicalPool(_decompose_all(ctx, source))
     instances: list[FamilyInstance] = []
     for rule in rules:
@@ -115,11 +147,41 @@ def plan_model(
             f"rules claimed {len(unconsumed)} slices they did not consume, e.g. {unconsumed[0].lid}"
         )
     slices = {piece.lid: piece for instance in instances for piece in instance.inputs}
-    outputs = [output for instance in instances for output in instance.outputs]
-    pieces = _compile(ctx, outputs, slices, source, target, max_chunk_bytes)
-    _check_source_coverage(pieces, slices.values(), source)
+    outputs = tuple(output for instance in instances for output in instance.outputs)
+    return RuledSection(outputs, slices, pool.claims())
+
+
+def compile_outputs(
+    ctx: ArchContext,
+    outputs: Sequence[LogicalOutput],
+    slices: Mapping[LogicalId, LogicalSlice],
+    source: Mapping[str, TensorEntry],
+    target: TargetLayout,
+    *,
+    max_chunk_bytes: int,
+    casts: bool = False,
+) -> tuple[Piece, ...]:
+    """Compile ``outputs`` into ``target`` pieces and check they read their sources exactly.
+
+    Args:
+        ctx: The architecture context.
+        outputs: The output tensors.
+        slices: The source slices they consume, by logical id (each one's
+            tensor must be read exactly once).
+        source: The source's tensors by model-relative key.
+        target: The target layout the outputs are written in.
+        max_chunk_bytes: Chunk-size limit passed to the target's grid.
+        casts: The outputs may have another floating-point dtype than their
+            sources (the pieces convert it); otherwise every dtype must match.
+
+    Raises:
+        InternalError: The copies do not read every element of every tensor
+            of ``slices`` exactly once, or do not tile the outputs.
+    """
+    pieces = _compile(ctx, outputs, slices, source, target, max_chunk_bytes, casts)
+    _check_source_coverage(pieces, list(slices.values()), source)
     expected_tensors(pieces)  # every output tensor is tiled exactly by its pieces
-    return ModelPlan(tuple(pieces), pool.claims(), len(outputs))
+    return tuple(pieces)
 
 
 def _decompose_all(ctx: ArchContext, source: Mapping[str, TensorEntry]) -> list[LogicalSlice]:
@@ -160,6 +222,7 @@ def _compile(
     source: Mapping[str, TensorEntry],
     target: TargetLayout,
     max_chunk_bytes: int,
+    casts: bool,
 ) -> list[Piece]:
     entries = {entry.key: entry for entry in source.values()}
     pieces: list[Piece] = []
@@ -170,7 +233,9 @@ def _compile(
         for chunk in target.output_grid(placed, output.dtype, max_chunk_bytes=max_chunk_bytes):
             ops = tuple(_chunk_ops(output, placed, chunk, slices, entries))
             pieces.append(
-                Piece(placed.key, placed.global_shape, output.dtype, chunk, ops, planner_path)
+                Piece(
+                    placed.key, placed.global_shape, output.dtype, chunk, ops, planner_path, casts
+                )
             )
     pieces.sort(key=lambda piece: (piece.key, piece.chunk.offsets))
     return pieces

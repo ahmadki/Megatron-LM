@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from tools.checkpoint.format_converter.core.dtype_policy import KEEP_FP32
 from tools.checkpoint.format_converter.core.format_args import GLU_ARGS
 from tools.checkpoint.format_converter.core.hybrid_pattern import LAYER_SYMBOLS, MTP_SEPARATOR, PIPE
 from tools.checkpoint.format_converter.core.keys import (
@@ -29,6 +30,9 @@ from tools.checkpoint.format_converter.core.refusals import GDN_VARIANTS
 from .._harness import REPO_ROOT
 
 CHECKPOINTING = REPO_ROOT / "megatron" / "training" / "checkpointing.py"
+MEGATRON_CORE = REPO_ROOT / "megatron" / "core"
+TRANSFORMER_MODULE = MEGATRON_CORE / "transformer" / "module.py"
+KEEP_FP32_MARK = "mark_keep_in_fp32"
 ARGUMENT_UTILS = REPO_ROOT / "megatron" / "training" / "argument_utils.py"
 FSDP_DTENSOR_CHECKPOINT = (
     REPO_ROOT / "megatron" / "core" / "transformer" / "fsdp_dtensor_checkpoint.py"
@@ -352,3 +356,76 @@ def test_both_formats_store_fused_mla_unfused():
     for name in MLA_DOWN_PROJS:
         key = f"decoder.layers.0.self_attention.{name}.weight"
         assert LAYER_FAMILIES["+"].pattern.search(key) and not FUSED_MLA_DOWN_PROJ_KEY.search(key)
+
+
+def _self_attribute(node: ast.AST) -> str | None:
+    """``a.b`` for the expression ``self.a.b``, else ``None``."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name) and node.id == "self" and parts:
+        return ".".join(reversed(parts))
+    return None
+
+
+def _marked(owner: str, node: ast.AST) -> tuple[str, str] | None:
+    """``(owner, attribute)`` of a parameter ``node`` marks to keep in fp32, if it marks one:
+    ``mark_keep_in_fp32(self.<attribute>)``, or ``self.<attribute> = mark_keep_in_fp32(...)``.
+    An unresolvable mark gives its source text as the attribute (so the pin fails)."""
+    value = node.value if isinstance(node, (ast.Assign, ast.Expr)) else None
+    if not (isinstance(value, ast.Call) and getattr(value.func, "id", None) == KEEP_FP32_MARK):
+        return None
+    targets = [_self_attribute(t) for t in node.targets] if isinstance(node, ast.Assign) else []
+    attribute = next(filter(None, targets), None) or _self_attribute(value.args[0])
+    return owner, attribute or ast.unparse(node)
+
+
+def test_the_keep_fp32_registry_is_every_parameter_megatron_keeps_in_fp32():
+    """Every ``mark_keep_in_fp32`` target in Megatron Core is in the registry (and only those), and
+    nothing but ``mark_keep_in_fp32`` sets the ``keep_in_fp32`` flag ``Float16Module`` honors."""
+    _module(TRANSFORMER_MODULE)  # skips when Megatron's source is not in this checkout
+    marked, flagged = set(), []
+    for path in sorted(MEGATRON_CORE.rglob("*.py")):
+        source = path.read_text()
+        if "keep_in_fp32" not in source:
+            continue
+        tree = ast.parse(source, str(path))
+        classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+        for cls in classes:
+            marked.update(filter(None, (_marked(cls.name, node) for node in ast.walk(cls))))
+        flagged += [
+            f"{path.relative_to(REPO_ROOT)}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(getattr(t, "attr", None) == "keep_in_fp32" for t in node.targets)
+        ]
+        loose = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == KEEP_FP32_MARK
+        ]
+        in_classes = [
+            node
+            for cls in classes
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == KEEP_FP32_MARK
+        ]
+        assert len(loose) == len(in_classes), f"{path}: a mark outside a class; review KEEP_FP32"
+    assert marked == {(entry.owner, entry.attribute) for entry in KEEP_FP32}, (
+        "Megatron keeps other parameters in fp32 (mark_keep_in_fp32); review KEEP_FP32 in "
+        "core/dtype_policy.py"
+    )
+    assert flagged == [
+        f"{TRANSFORMER_MODULE.relative_to(REPO_ROOT)}:{_mark_line()}"
+    ], "something but mark_keep_in_fp32 sets keep_in_fp32; review KEEP_FP32"
+
+
+def _mark_line() -> int:
+    """The line of ``mark_keep_in_fp32``'s ``tensor.keep_in_fp32 = True``."""
+    (node,) = [
+        node
+        for node in ast.walk(_definition(_module(TRANSFORMER_MODULE), KEEP_FP32_MARK))
+        if isinstance(node, ast.Assign)
+    ]
+    return node.lineno
