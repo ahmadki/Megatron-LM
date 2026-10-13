@@ -216,3 +216,40 @@ def test_dispatch_order_is_largest_first_then_file_order(view):
 def test_budgets_must_be_positive(view):
     with pytest.raises(InternalError, match="unit budgets must be positive"):
         pack_units(_copies(view), [], unit_bytes=0, hard_cap=1)
+
+
+def _cast(piece: Piece, dtype: torch.dtype, key: str) -> Piece:
+    return Piece(key, piece.global_shape, dtype, piece.chunk, piece.ops, cast=True)
+
+
+def test_a_piece_casts_only_when_it_plans_to(view):
+    exact = _whole(view, "w", "w")
+    with pytest.raises(InternalError, match="no cast is planned"):
+        Piece("w16", exact.global_shape, torch.bfloat16, exact.chunk, exact.ops)
+    with pytest.raises(InternalError, match="only floating-point types"):
+        _cast(exact, torch.int32, "wi")
+    assert _cast(exact, torch.bfloat16, "w16").cast
+
+
+def test_a_cast_and_a_copy_of_one_item_share_its_staging_and_run_once(view, tmp_path):
+    """A master and its rounded weight: one unit, one decode, the rounded copy to nearest even."""
+    (chunk,) = view.tensors["big"].chunks
+    exact = _whole(view, "big", "master")
+    rounded = _cast(exact, torch.bfloat16, "weight")
+    (unit,) = pack_units([exact, rounded], [], unit_bytes=1 << 20, hard_cap=1 << 20)
+    assert unit.est_peak_bytes == exact.nbytes + rounded.nbytes + 2 * chunk.nbytes
+    (alone,) = pack_units([rounded], [], unit_bytes=1 << 20, hard_cap=1 << 20)
+    assert alone.est_peak_bytes == rounded.nbytes + 2 * chunk.nbytes  # staged, then decoded
+    target = PublishTarget(tmp_path / "out" / "iter_0000001", None, None)
+    program = packed_program(view, target, [exact, rounded], unit_bytes=1 << 20)
+    (record,) = run_program(program, target, RunOptions()).journal
+    assert record["torch_load_calls"] == record["items_touched"] == 1
+    out = MetadataView.load(target.iter_dir)
+    master, weight = torch.empty(16, 16), torch.empty(16, 16, dtype=torch.bfloat16)
+    SourceReader(out, max_item_bytes=1 << 20).read_into(
+        [
+            ReadReq("master", Region.full((16, 16)), master),
+            ReadReq("weight", Region.full((16, 16)), weight),
+        ]
+    )
+    assert torch.equal(master, BIG) and torch.equal(weight, BIG.bfloat16())

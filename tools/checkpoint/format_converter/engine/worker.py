@@ -6,7 +6,8 @@ A worker claims units in the staged dispatch order and, for each one:
 
 1. allocates one standalone buffer per piece;
 2. reads every copy's source box into its piece buffer with a single batched
-   ``dcp.load`` (each touched stored item is decoded once);
+   ``dcp.load`` (each touched stored item is decoded once), converting the
+   floating-point type where the piece plans a cast;
 3. writes the buffers and byte items as the unit's part store (``*.tmp``);
 4. digests the pieces selected for the post-merge check and commits the unit
    (``DONE`` record, rename, journal line).
@@ -107,10 +108,17 @@ def read_requests(pieces: Sequence[Piece], buffers: Sequence[torch.Tensor]) -> l
     """One read request per copy, targeting the copy's box of its piece buffer.
 
     The box is viewed with the source box's shape (they differ at most in
-    leading size-1 axes, which a view adds or removes without copying).
+    leading size-1 axes, which a view adds or removes without copying). A copy
+    from a source of another type than its piece's converts it (the piece
+    plans the cast).
     """
     return [
-        ReadReq(op.src.key, op.src_region, buffer[op.dst_region.slices()].view(op.src_region.sizes))
+        ReadReq(
+            op.src.key,
+            op.src_region,
+            buffer[op.dst_region.slices()].view(op.src_region.sizes),
+            cast=op.src.dtype != piece.dtype,
+        )
         for piece, buffer in zip(pieces, buffers)
         for op in piece.ops
     ]

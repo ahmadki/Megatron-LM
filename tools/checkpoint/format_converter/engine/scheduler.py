@@ -165,7 +165,15 @@ def _slab(piece: Piece, local: Region) -> Piece:
         source = corresponding(part, op.dst_region, op.src_region)
         ops.append(CopyOp(op.src, source, part.relative_to(local)))
     chunk = Region(tuple(c + o for c, o in zip(piece.chunk.offsets, local.offsets)), local.sizes)
-    return Piece(piece.key, piece.global_shape, piece.dtype, chunk, tuple(ops), piece.planner_path)
+    return Piece(
+        piece.key,
+        piece.global_shape,
+        piece.dtype,
+        chunk,
+        tuple(ops),
+        piece.planner_path,
+        piece.cast,
+    )
 
 
 def _clusters(pieces: Sequence[Piece]) -> list[_Cluster]:
@@ -190,15 +198,22 @@ def _clusters(pieces: Sequence[Piece]) -> list[_Cluster]:
 
 def _cluster(pieces: list[Piece]) -> _Cluster:
     reads: dict[_Item, tuple[StoredChunk, list[Region]]] = {}
+    converted: set[_Item] = set()
     for piece in pieces:
         for op in piece.ops:
             item = (op.src.relative_path, op.src.offset)
             reads.setdefault(item, (op.src, []))[1].append(op.src_region)
+            if op.src.dtype != piece.dtype:
+                converted.add(item)
     chunks = [chunk for chunk, _ in reads.values()]
+    staging = sum(
+        staging_bytes(chunk, regions, converts=item in converted)
+        for item, (chunk, regions) in reads.items()
+    )
     return _Cluster(
         pieces=sorted(pieces, key=lambda p: (p.key, p.chunk.offsets)),
         piece_bytes=sum(p.nbytes for p in pieces),
-        staging=sum(staging_bytes(chunk, regions) for chunk, regions in reads.values()),
+        staging=staging,
         largest=max(chunks, key=lambda c: c.nbytes, default=None),
         read_bytes=sum(chunk.length for chunk in chunks),
         first=min(reads, default=("", 0)),

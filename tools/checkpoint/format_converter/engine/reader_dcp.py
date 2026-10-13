@@ -8,10 +8,11 @@ every touched stored chunk exactly once per batch, the planner below asks for
 exactly one box per touched stored chunk: the bounding box of what the batch
 needs from it, clipped to the chunk.
 
-* If one request needs exactly that box, DCP copies straight into a view of
-  the request's destination (no staging).
+* If one request needs exactly that box in the stored type, DCP copies
+  straight into a view of the request's destination (no staging).
 * Otherwise the box is loaded into a staging buffer (at most the chunk size)
-  and narrow-copied into each destination afterwards.
+  and narrow-copied into each destination afterwards, converting the type of
+  a destination that asks for another one (rounding to nearest even).
 * A request for a whole tensor passes the destination tensor itself.
 
 All requests of a batch are served by a single ``dcp.load`` through a
@@ -93,8 +94,9 @@ def plan_region_load(view: MetadataView, reqs: Sequence[ReadReq]) -> RegionLoadP
     touched: list[StoredChunk] = []
     for key, key_reqs in by_key.items():
         entry = view.tensors[key]
-        if len(key_reqs) == 1 and key_reqs[0].region.is_full(entry.shape):
-            targets[key] = key_reqs[0].dst
+        whole = key_reqs[0]
+        if len(key_reqs) == 1 and whole.region.is_full(entry.shape) and not whole.cast:
+            targets[key] = whole.dst
             touched.extend(c for c in entry.chunks if c.region.numel() > 0)
             continue
         parts: list[tuple[Region, torch.Tensor]] = []
@@ -108,7 +110,8 @@ def plan_region_load(view: MetadataView, reqs: Sequence[ReadReq]) -> RegionLoadP
                 continue
             touched.append(chunk)
             box = bounding_box(overlap for _, overlap in needs)
-            if staging_bytes(chunk, [overlap for _, overlap in needs]) == 0:
+            overlaps = [overlap for _, overlap in needs]
+            if staging_bytes(chunk, overlaps, converts=any(req.cast for req, _ in needs)) == 0:
                 req = needs[0][0]
                 parts.append((box, req.dst[box.relative_to(req.region).slices()]))
                 continue
@@ -125,14 +128,16 @@ def plan_region_load(view: MetadataView, reqs: Sequence[ReadReq]) -> RegionLoadP
     return RegionLoadPlan(targets, tuple(copies), tuple(touched))
 
 
-def staging_bytes(chunk: StoredChunk, overlaps: Sequence[Region]) -> int:
+def staging_bytes(chunk: StoredChunk, overlaps: Sequence[Region], *, converts: bool = False) -> int:
     """Size of the staging buffer a batch needs for one stored chunk.
 
     ``overlaps`` are the parts of the chunk the batch's requests need. A single
-    request is read straight into its destination; several share one staging
-    buffer covering their bounding box, which is copied out after the load.
+    request of the stored type is read straight into its destination; several,
+    or one that converts the type (``converts``), share one staging buffer of
+    the stored type covering their bounding box, which is copied (and so
+    converted) into the destinations after the load.
     """
-    if len(overlaps) <= 1:
+    if len(overlaps) <= 1 and not converts:
         return 0
     return bounding_box(overlaps).numel() * chunk.dtype.itemsize
 

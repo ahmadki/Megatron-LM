@@ -171,7 +171,7 @@ def test_pieces_are_validated():
         Piece("w", (8, 4), torch.float32, full, (CopyOp(_chunk(), top, top),))
     with pytest.raises(InternalError, match="overlap"):
         Piece("w", (8, 4), torch.float32, full, (CopyOp(_chunk(), full, full),) * 2)
-    with pytest.raises(InternalError, match="casts are not supported"):
+    with pytest.raises(InternalError, match="no cast is planned"):
         Piece("w", (8, 4), torch.bfloat16, full, (CopyOp(_chunk(), full, full),))
     with pytest.raises(InternalError, match="outside shape"):
         Piece("w", (4, 4), torch.float32, full, (CopyOp(_chunk(), full, full),))

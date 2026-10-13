@@ -23,7 +23,14 @@ from tools.checkpoint.format_converter.errors import (
     InternalError,
 )
 
-from .._synthetic import alias_dumps, dim0_grid, product_grid, torch_save_bytes, write_store
+from .._synthetic import (
+    alias_dumps,
+    dim0_grid,
+    product_grid,
+    rne_bfloat16,
+    torch_save_bytes,
+    write_store,
+)
 
 W_SHAPE = (10, 4)
 G_SHAPE = (6, 8)
@@ -194,7 +201,13 @@ def test_budget_is_checked_before_reading(store, load_counter):
         (ReadReq("nope", Region((0,), (1,)), torch.empty(1)), "no tensor"),
         (ReadReq("w", Region((8, 0), (4, 4)), torch.empty(4, 4)), "outside shape"),
         (ReadReq("w", Region((0, 0), (2, 4)), torch.empty(4, 2)), "destination"),
-        (ReadReq("w", Region((0, 0), (2, 4)), torch.empty(2, 4, dtype=torch.float64)), "CPU"),
+        (
+            ReadReq("w", Region((0, 0), (2, 4)), torch.empty(2, 4, dtype=torch.float64)),
+            "needs a cast",
+        ),
+        (ReadReq("w", Region((0, 0), (2, 4)), torch.empty(2, 4), cast=True), "is no cast"),
+        (ReadReq("i", Region((0,), (2,)), torch.empty(2), cast=True), "only floating-point"),
+        (ReadReq("w", Region((0, 0), (2, 4)), torch.empty(2, 4, device="meta")), "CPU"),
     ],
 )
 def test_malformed_requests_are_internal_errors(store, req, message):
@@ -258,3 +271,32 @@ def test_warning_filter_is_added_once(store, monkeypatch):
         reader.read_bytes(["blob"])
     assert len(added) == 1
     assert not [w for w in caught if "torch.distributed is" in str(w.message)]
+
+
+def test_a_cast_converts_to_nearest_even_and_reads_once(tmp_path, load_counter):
+    """One stored fp32 item read into an fp32 and a bf16 destination: decoded once, staged."""
+    values = torch.randn(8, 6, generator=torch.Generator().manual_seed(4))
+    values[0, :3] = torch.tensor([1 + 2**-8, 1 + 3 * 2**-8, -(1 + 2**-8)])  # exact ties
+    view = MetadataView.load(
+        write_store(tmp_path / "s", {"x": values}, grids={"x": dim0_grid((8, 6), 4)})
+    )
+    exact = _req("x", Region.full((8, 6)), torch.float32)
+    rounded = ReadReq("x", Region.full((8, 6)), torch.empty(8, 6, dtype=torch.bfloat16), cast=True)
+    plan = reader_dcp.plan_region_load(view, [exact, rounded])
+    assert len(plan.copies) == 4  # every chunk is staged once and copied out twice
+    stats = SourceReader(view, max_item_bytes=1 << 20).read_into([exact, rounded])
+    assert torch.equal(exact.dst, values)
+    expected = rne_bfloat16(values)
+    assert torch.equal(rounded.dst.view(torch.int16), expected.view(torch.int16))
+    assert rounded.dst[0, :3].float().tolist() == [1.0, 1 + 2**-6, -1.0]
+    assert stats.torch_load_calls == stats.items_touched == len(load_counter) == 2
+
+
+def test_a_lone_cast_is_staged(tmp_path):
+    view = MetadataView.load(write_store(tmp_path / "s", {"x": torch.randn(4, 2)}))
+    req = ReadReq("x", Region.full((4, 2)), torch.empty(4, 2, dtype=torch.bfloat16), cast=True)
+    plan = reader_dcp.plan_region_load(view, [req])
+    assert plan.targets["x"] is not req.dst and len(plan.copies) == 1
+    (chunk,) = view.tensors["x"].chunks
+    assert reader_dcp.staging_bytes(chunk, [chunk.region], converts=True) == 4 * 2 * 4
+    assert reader_dcp.staging_bytes(chunk, [chunk.region]) == 0

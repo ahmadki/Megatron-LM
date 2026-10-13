@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemWriter
@@ -125,6 +126,14 @@ def write_store(
             no_dist=True,
         )
     return iter_dir
+
+
+def rne_bfloat16(values: torch.Tensor) -> torch.Tensor:
+    """fp32 values rounded to bfloat16, to nearest even, by integer arithmetic on their bits (an
+    oracle independent of torch's own conversion; finite values only)."""
+    bits = values.contiguous().numpy().view(np.uint32).astype(np.uint64)
+    rounded = ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).astype(np.uint16)
+    return torch.from_numpy(rounded.view(np.int16)).view(torch.bfloat16).reshape(values.shape)
 
 
 def dim0_grid(shape: Sequence[int], rows: int) -> tuple[Region, ...]:

@@ -71,6 +71,14 @@ class Piece:
         ops: Copies that tile the piece exactly (in its local coordinates).
         planner_path: ``Metadata.planner_data`` entry of the key, if the target
             format records one.
+        cast: Copies convert their source's floating-point type to ``dtype``
+            (rounding to nearest even) where the two differ; without it every
+            source has ``dtype``.
+
+    Raises:
+        InternalError: The chunk is outside the tensor, a copy's source has
+            another type without ``cast`` (or either type is not a
+            floating-point type), or the copies do not tile the chunk.
     """
 
     key: str
@@ -79,6 +87,7 @@ class Piece:
     chunk: Region
     ops: tuple[CopyOp, ...]
     planner_path: tuple[str, ...] | None = None
+    cast: bool = False
 
     def __post_init__(self) -> None:
         full = Region.full(self.global_shape)
@@ -87,10 +96,17 @@ class Piece:
                 f"piece of {self.key}: {self.chunk} is outside shape {self.global_shape}"
             )
         for op in self.ops:
-            if op.src.dtype != self.dtype:
+            if op.src.dtype == self.dtype:
+                continue
+            if not self.cast:
                 raise InternalError(
                     f"piece {self.chunk} of {self.key}: copy from {op.src.key} is "
-                    f"{op.src.dtype}, the piece is {self.dtype} (casts are not supported)"
+                    f"{op.src.dtype}, the piece is {self.dtype} (no cast is planned)"
+                )
+            if not (op.src.dtype.is_floating_point and self.dtype.is_floating_point):
+                raise InternalError(
+                    f"piece {self.chunk} of {self.key}: cannot cast {op.src.dtype} from "
+                    f"{op.src.key} to {self.dtype} (only floating-point types are converted)"
                 )
         defect = find_tiling_defect([op.dst_region for op in self.ops], self.chunk.sizes)
         if defect is not None:

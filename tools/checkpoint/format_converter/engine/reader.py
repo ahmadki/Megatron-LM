@@ -33,12 +33,16 @@ class ReadReq:
     Attributes:
         key: Tensor key in the store.
         region: Box to read; must lie inside the tensor.
-        dst: CPU tensor of shape ``region.sizes`` and the stored dtype (may be a view).
+        dst: CPU tensor of shape ``region.sizes`` (may be a view), of the stored
+            dtype unless ``cast``.
+        cast: ``dst`` has another floating-point dtype than the stored one; the
+            values are converted (rounding to nearest even).
     """
 
     key: str
     region: Region
     dst: torch.Tensor
+    cast: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +101,8 @@ class SourceReader:
         Raises:
             BudgetExceeded: A touched stored chunk is larger than ``max_item_bytes``.
             InternalError: A request is malformed (unknown key, box outside the
-                tensor, destination of the wrong shape, dtype or device).
+                tensor, destination of the wrong shape or device, or of another
+                dtype without a floating-point cast).
         """
         for req in reqs:
             self._validate(req)
@@ -127,10 +132,19 @@ class SourceReader:
             raise InternalError(f"{req.key}: {req.region} is outside shape {entry.shape}")
         if tuple(req.dst.shape) != req.region.sizes:
             raise InternalError(f"{req.key}: destination {tuple(req.dst.shape)} != {req.region}")
-        if req.dst.dtype != entry.dtype or req.dst.device.type != "cpu":
+        if req.dst.device.type != "cpu":
             raise InternalError(
-                f"{req.key}: destination must be a CPU {entry.dtype} tensor, "
-                f"got {req.dst.device} {req.dst.dtype}"
+                f"{req.key}: destination must be a CPU tensor, got {req.dst.device}"
+            )
+        if req.cast != (req.dst.dtype != entry.dtype):
+            raise InternalError(
+                f"{req.key}: a {req.dst.dtype} destination of a stored {entry.dtype} tensor "
+                + ("needs a cast" if not req.cast else "is no cast")
+            )
+        if req.cast and not (req.dst.dtype.is_floating_point and entry.dtype.is_floating_point):
+            raise InternalError(
+                f"{req.key}: cannot convert {entry.dtype} to {req.dst.dtype} (only floating-point "
+                "types are converted)"
             )
 
     def _check_budget(self, key: str, offsets: tuple[int, ...], nbytes: int) -> None:
